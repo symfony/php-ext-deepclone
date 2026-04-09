@@ -116,11 +116,17 @@ static zend_always_inline zend_class_entry *dc_register_internal_class_with_flag
  * dc_copy_value (the only recursive walker — dc_copy_array always goes
  * through dc_copy_value) calls this at its entry. No-op on PHP < 8.4
  * (see the header-include block above) or on platforms where
- * ZEND_CHECK_STACK_LIMIT is disabled at configure time. */
+ * ZEND_CHECK_STACK_LIMIT is disabled at configure time.
+ *
+ * Note: on some platforms (e.g. macOS with Homebrew PHP) EG(stack_limit) may
+ * be NULL even when ZEND_CHECK_STACK_LIMIT is defined, because the OS stack
+ * size cannot be determined at runtime. In that case zend_call_stack_overflowed()
+ * always returns false and this guard is a no-op. The manual depth counter in
+ * dc_ctx (checked separately in dc_copy_value) covers that scenario. */
 static zend_always_inline bool dc_check_stack_limit(void)
 {
 #if PHP_VERSION_ID >= 80400 && defined(ZEND_CHECK_STACK_LIMIT)
-	if (UNEXPECTED(zend_call_stack_overflowed(EG(stack_limit)))) {
+	if (UNEXPECTED(EG(stack_limit) != NULL && zend_call_stack_overflowed(EG(stack_limit)))) {
 		zend_call_stack_size_error();
 		return true;
 	}
@@ -228,6 +234,7 @@ struct _dc_ctx {
 	uint32_t       next_obj_id;
 	uint32_t       objects_count;
 	bool           is_static;
+	uint32_t       depth;         /* manual recursion depth counter (fallback when EG(stack_limit) is NULL) */
 
 	/* Output structures built incrementally during traversal */
 	zval           classes;        /* deduped class names */
@@ -255,6 +262,12 @@ struct _dc_ctx {
 #define DC_CI_NOT_INSTANTIABLE 0x20
 #define DC_CI_COMPUTED         0x80
 
+/* Maximum dc_copy_value recursion depth. Acts as a belt-and-suspenders guard
+ * on platforms where EG(stack_limit) is NULL (e.g. macOS Homebrew PHP) and
+ * dc_check_stack_limit() therefore cannot detect stack overflow. Matches PHP's
+ * own serialize nesting limit (PHP_SERIALIZE_NESTING_LIMIT in ext/standard/var.c). */
+#define DC_MAX_DEPTH 512
+
 
 /* ── Helpers ────────────────────────────────────────────────── */
 
@@ -273,6 +286,7 @@ static void dc_ctx_init(dc_ctx *ctx) {
 	ctx->next_obj_id = 0;
 	ctx->objects_count = 0;
 	ctx->is_static = 1;
+	ctx->depth = 0;
 	zend_hash_init(&ctx->scope_cache, 4, NULL, ZVAL_PTR_DTOR, 0);
 	zend_hash_init(&ctx->class_info, 4, NULL, NULL, 0);
 	zend_hash_init(&ctx->proto_cache, 4, NULL, ZVAL_PTR_DTOR, 0);
@@ -749,6 +763,16 @@ static void dc_copy_value(dc_ctx *ctx, zval *src, zval *dst, zval *mask_dst)
 		return;
 	}
 
+	/* Belt-and-suspenders depth guard for platforms where EG(stack_limit) is
+	 * NULL and dc_check_stack_limit() is therefore a no-op (e.g. macOS with
+	 * Homebrew PHP where the OS stack size cannot be determined at runtime).
+	 * Without this, a deeply-nested graph causes a C-stack overflow (segfault). */
+	if (UNEXPECTED(ctx->depth >= DC_MAX_DEPTH)) {
+		zend_throw_error(NULL, "Nesting level too deep - recursive dependency?");
+		return;
+	}
+	++ctx->depth;
+
 	bool is_ref = 0;
 	dc_ref_entry *ref_entry = NULL;
 
@@ -769,6 +793,7 @@ static void dc_copy_value(dc_ctx *ctx, zval *src, zval *dst, zval *mask_dst)
 			ctx->refs[idx].count++;
 			ZVAL_LONG(dst, -(zend_long)(idx + 1));
 			DC_MASK_HARD_REF(mask_dst);
+			--ctx->depth;
 			return;
 		}
 
@@ -805,6 +830,7 @@ static void dc_copy_value(dc_ctx *ctx, zval *src, zval *dst, zval *mask_dst)
 	if (UNEXPECTED(Z_TYPE_P(src) == IS_RESOURCE)) {
 		zend_throw_exception_ex(dc_ce_not_instantiable_exception, 0,
 			"%s resource", zend_rsrc_list_get_rsrc_type(Z_RES_P(src)));
+		--ctx->depth;
 		return;
 	}
 
@@ -916,6 +942,7 @@ handle_value:
 		DC_MASK_HARD_REF(mask_dst);
 		ref_entry->mask_slot = mask_dst;
 	}
+	--ctx->depth;
 }
 
 
