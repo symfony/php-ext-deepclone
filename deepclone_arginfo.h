@@ -1,4 +1,5 @@
-/* This is a generated file, edit deepclone.stub.php instead. */
+/* This is a generated file, edit the .stub.php file instead.
+ * Stub hash: 571596a6888d66145a5b0d1b8391a4fa7d88506d */
 
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_deepclone_to_array, 0, 1, IS_ARRAY, 0)
 	ZEND_ARG_TYPE_INFO(0, value, IS_MIXED, 0)
