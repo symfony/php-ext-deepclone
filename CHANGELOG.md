@@ -5,6 +5,26 @@ All notable changes to this extension will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.1] - 2026-04-10
+
+### Fixed
+
+- Memory leaks on objects with `__unserialize`: spurious `GC_TRY_ADDREF` on
+  arrays transferred (not shared) into the states output.
+- Assertion failure in debug builds: `dc_mask_cleanup` called
+  `zend_hash_apply` on a shared (refcount > 1) mask array. Fixed with
+  `SEPARATE_ARRAY` before iterating.
+
+### Changed
+
+- Replaced `class_list`, `ce_cache`, and `objects` HashTables in
+  `deepclone_from_array()` with flat C arrays for lower overhead.
+- Use `zend_hash_find_known_hash()` for all interned key lookups.
+- Use `DC_MASK_IS_NAMED_CLOSURE()` consistently in `dc_mask_has_closure`.
+- Added Serializable code path test (`deepclone_serializable.phpt`).
+- CI: added PHP debug build job for Zend MM leak detection; enabled
+  ASAN LeakSanitizer (`detect_leaks=1`).
+
 ## [0.1.0] - 2026-04-10
 
 ### Added
