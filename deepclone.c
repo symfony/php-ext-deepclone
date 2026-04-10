@@ -1494,15 +1494,14 @@ static void dc_build_output(dc_ctx *ctx, zval *prepared, zval *top_mask, zval *r
 			ZVAL_LONG(&zid, id);
 			zend_hash_index_add_new(Z_ARRVAL(states), (zend_ulong)e->wakeup, &zid);
 		} else if (e->wakeup < 0) {
+			/* Transfer ownership of props/prop_mask to the states array. */
 			zval state_entry;
 			if (e->prop_mask) {
 				array_init_size(&state_entry, 3);
 				zval zid, zprops, zmask;
 				ZVAL_LONG(&zid, id);
 				ZVAL_ARR(&zprops, e->props);
-				GC_TRY_ADDREF(e->props);
 				ZVAL_ARR(&zmask, e->prop_mask);
-				GC_TRY_ADDREF(e->prop_mask);
 				zend_hash_index_add_new(Z_ARRVAL(state_entry), 0, &zid);
 				zend_hash_index_add_new(Z_ARRVAL(state_entry), 1, &zprops);
 				zend_hash_index_add_new(Z_ARRVAL(state_entry), 2, &zmask);
@@ -1511,7 +1510,6 @@ static void dc_build_output(dc_ctx *ctx, zval *prepared, zval *top_mask, zval *r
 				zval zid, zprops;
 				ZVAL_LONG(&zid, id);
 				ZVAL_ARR(&zprops, e->props);
-				GC_TRY_ADDREF(e->props);
 				zend_hash_index_add_new(Z_ARRVAL(state_entry), 0, &zid);
 				zend_hash_index_add_new(Z_ARRVAL(state_entry), 1, &zprops);
 			}
