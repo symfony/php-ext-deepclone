@@ -143,11 +143,11 @@ jobs:
           ./configure --enable-deepclone
           make -j$(nproc)
 
-      - name: Run tests (leak detection active)
+      - name: Run tests (Zend MM leak detection active)
         env:
           NO_INTERACTION: "1"
           REPORT_EXIT_STATUS: "1"
-        run: make test TESTS="-q --show-diff -m tests/"
+        run: make test TESTS="-q --show-diff tests/"
 
       - name: Show failing test diffs
         if: failure()
