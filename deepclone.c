@@ -394,16 +394,9 @@ static uint8_t dc_get_class_info(dc_ctx *ctx, zend_class_entry *ce)
 		flags |= DC_CI_NOT_INSTANTIABLE;
 	}
 
-	/* Internal classes with C-level state (create_object != NULL):
-	 *   Rule A: final + no serialization API → probe instantiation; reject if it fails.
-	 *   Rule B: non-final + no serialization API → reject.
-	 * Classes declaring __serialize/__unserialize/__sleep/__wakeup are trusted:
-	 * they round-trip via object_init_ex() + __unserialize(), same as PHP's
-	 * own serialize/unserialize.
-	 * Rule A uses a probe instead of an unconditional reject because some final
-	 * internal classes are stateless and fully reconstructable from their PHP-
-	 * visible properties (e.g. MongoDB\BSON\MinKey / MaxKey): object_init_ex()
-	 * succeeds and produces a complete object with no hidden C-level state. */
+	/* Internal classes with create_object and no serialization API:
+	 * final → probe instantiation (stateless classes like BSON\MinKey pass);
+	 * non-final → reject. Classes with __serialize/__unserialize are trusted. */
 	if (ce->type == ZEND_INTERNAL_CLASS
 	 && ce->create_object != NULL
 	 && (ce->ce_flags & ZEND_ACC_FINAL)
