@@ -1809,7 +1809,7 @@ PHP_FUNCTION(deepclone_to_array)
  *   array  nested mask          →  recurse into the array's elements
  *   other  no marker            →  copy value as-is
  */
-static void dc_resolve(zval *value, zval *mask, zval *objects, HashTable *refs, zval *retval)
+static void dc_resolve(zval *value, zval *mask, zval *objects, uint32_t num_objects, HashTable *refs, zval *retval)
 {
 	if (EXPECTED(DC_MASK_IS_OBJ_REF(mask))) {
 		if (UNEXPECTED(Z_TYPE_P(value) != IS_LONG)) {
@@ -1819,11 +1819,11 @@ static void dc_resolve(zval *value, zval *mask, zval *objects, HashTable *refs, 
 		zend_long id = Z_LVAL_P(value);
 		zval *target;
 		if (EXPECTED(id >= 0)) {
-			target = zend_hash_index_find(Z_ARRVAL_P(objects), id);
-			if (UNEXPECTED(!target)) {
+			if (UNEXPECTED((zend_ulong) id >= num_objects)) {
 				zend_value_error("deepclone_from_array(): malformed payload, unknown object id " ZEND_LONG_FMT, id);
 				return;
 			}
+			target = &objects[id];
 		} else {
 			target = zend_hash_index_find(refs, -id);
 			if (UNEXPECTED(!target)) {
@@ -1902,13 +1902,17 @@ static void dc_resolve(zval *value, zval *mask, zval *objects, HashTable *refs, 
 			zend_long id = Z_LVAL_P(zobj);
 			zval *target;
 			if (id >= 0) {
-				target = zend_hash_index_find(Z_ARRVAL_P(objects), id);
+				if ((zend_ulong) id >= num_objects) {
+					zend_value_error("deepclone_from_array(): malformed payload, named-closure references unknown id " ZEND_LONG_FMT, id);
+					return;
+				}
+				target = &objects[id];
 			} else {
 				target = zend_hash_index_find(refs, -id);
-			}
-			if (!target) {
-				zend_value_error("deepclone_from_array(): malformed payload, named-closure references unknown id " ZEND_LONG_FMT, id);
-				return;
+				if (!target) {
+					zend_value_error("deepclone_from_array(): malformed payload, named-closure references unknown id " ZEND_LONG_FMT, id);
+					return;
+				}
 			}
 			ZVAL_COPY(&resolved_obj, target);
 		} else {
@@ -2037,7 +2041,7 @@ static void dc_resolve(zval *value, zval *mask, zval *objects, HashTable *refs, 
 		} else {
 			zval resolved;
 			ZVAL_UNDEF(&resolved);
-			dc_resolve(slot, mval, objects, refs, &resolved);
+			dc_resolve(slot, mval, objects, num_objects, refs, &resolved);
 			if (EG(exception)) {
 				zval_ptr_dtor(&result);
 				return;
@@ -2066,7 +2070,7 @@ static bool dc_mask_has_closure(zval *mask)
 	if (mask == NULL) {
 		return false;
 	}
-	if (Z_TYPE_P(mask) == IS_LONG && Z_LVAL_P(mask) == 0) {
+	if (DC_MASK_IS_NAMED_CLOSURE(mask)) {
 		return true;
 	}
 	if (Z_TYPE_P(mask) != IS_ARRAY) {
@@ -2086,16 +2090,15 @@ PHP_FUNCTION(deepclone_from_array)
 	HashTable *data_ht;
 	HashTable *allowed_ht = NULL;
 	HashTable *allowed_set = NULL;
-	HashTable class_list;
-	HashTable ce_cache;
 	HashTable refs;
-	zval objects;
+	zend_string **class_names = NULL;
+	uint32_t num_classes = 0;
+	zend_class_entry **class_ces = NULL;
+	zval *objects = NULL;
+	uint32_t num_objects = 0;
 	zend_string **obj_classes = NULL;
 	int *obj_wakeups = NULL;
-	bool class_list_inited = false;
-	bool ce_cache_inited = false;
 	bool refs_inited = false;
-	bool objects_inited = false;
 
 	ZEND_PARSE_PARAMETERS_START(1, 2)
 		Z_PARAM_ARRAY_HT(data_ht)
@@ -2104,22 +2107,22 @@ PHP_FUNCTION(deepclone_from_array)
 	ZEND_PARSE_PARAMETERS_END();
 
 	/* Static value: return data['value'] */
-	zval *zvalue = zend_hash_find(data_ht, dc_key_value);
+	zval *zvalue = zend_hash_find_known_hash(data_ht, dc_key_value);
 	if (zvalue) {
 		ZVAL_COPY(return_value, zvalue);
 		return;
 	}
 
 	/* ── Parse and validate the format ─────────── */
-	zval *zclasses     = zend_hash_find(data_ht, dc_key_classes);
-	zval *zobject_meta = zend_hash_find(data_ht, dc_key_object_meta);
-	zval *zprepared    = zend_hash_find(data_ht, dc_key_prepared);
-	zval *zmask        = zend_hash_find(data_ht, dc_key_mask);
-	zval *zproperties  = zend_hash_find(data_ht, dc_key_properties);
-	zval *zresolve     = zend_hash_find(data_ht, dc_key_resolve);
-	zval *zstates      = zend_hash_find(data_ht, dc_key_states);
-	zval *zrefs        = zend_hash_find(data_ht, dc_key_refs);
-	zval *zref_masks   = zend_hash_find(data_ht, dc_key_ref_masks);
+	zval *zclasses     = zend_hash_find_known_hash(data_ht, dc_key_classes);
+	zval *zobject_meta = zend_hash_find_known_hash(data_ht, dc_key_object_meta);
+	zval *zprepared    = zend_hash_find_known_hash(data_ht, dc_key_prepared);
+	zval *zmask        = zend_hash_find_known_hash(data_ht, dc_key_mask);
+	zval *zproperties  = zend_hash_find_known_hash(data_ht, dc_key_properties);
+	zval *zresolve     = zend_hash_find_known_hash(data_ht, dc_key_resolve);
+	zval *zstates      = zend_hash_find_known_hash(data_ht, dc_key_states);
+	zval *zrefs        = zend_hash_find_known_hash(data_ht, dc_key_refs);
+	zval *zref_masks   = zend_hash_find_known_hash(data_ht, dc_key_ref_masks);
 
 	DC_REQUIRE(zclasses,     "deepclone_from_array(): Argument #1 ($data) is missing required \"classes\" key");
 	DC_REQUIRE(zobject_meta, "deepclone_from_array(): Argument #1 ($data) is missing required \"objectMeta\" key");
@@ -2139,24 +2142,26 @@ PHP_FUNCTION(deepclone_from_array)
 	DC_REQUIRE(!zref_masks || Z_TYPE_P(zref_masks) == IS_ARRAY,
 		"deepclone_from_array(): Argument #1 ($data) \"refMasks\" must be of type array, %s given", zend_zval_value_name(zref_masks));
 
-	/* ── Expand class names ────────────────────── */
-	zend_hash_init(&class_list, 4, NULL, NULL, 0);
-	class_list_inited = true;
-	uint32_t num_classes = 0;
-
+	/* ── Expand class names into a flat C array ── */
 	if (Z_TYPE_P(zclasses) == IS_STRING) {
 		if (Z_STRLEN_P(zclasses) > 0) {
-			zend_hash_index_add(&class_list, 0, zclasses);
 			num_classes = 1;
+			class_names = emalloc(sizeof(zend_string *));
+			class_names[0] = Z_STR_P(zclasses);
 		}
 	} else {
-		zval *cls;
-		ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(zclasses), cls) {
-			if (Z_TYPE_P(cls) != IS_STRING) {
-				DC_INVALID("deepclone_from_array(): Argument #1 ($data) \"classes\" entries must be of type string, %s given", zend_zval_value_name(cls));
-			}
-			zend_hash_index_add(&class_list, num_classes++, cls);
-		} ZEND_HASH_FOREACH_END();
+		num_classes = zend_hash_num_elements(Z_ARRVAL_P(zclasses));
+		if (num_classes) {
+			class_names = emalloc(num_classes * sizeof(zend_string *));
+			uint32_t i = 0;
+			zval *cls;
+			ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(zclasses), cls) {
+				if (Z_TYPE_P(cls) != IS_STRING) {
+					DC_INVALID("deepclone_from_array(): Argument #1 ($data) \"classes\" entries must be of type string, %s given", zend_zval_value_name(cls));
+				}
+				class_names[i++] = Z_STR_P(cls);
+			} ZEND_HASH_FOREACH_END();
+		}
 	}
 
 	/* ── Validate allowed classes ──────────────── */
@@ -2167,9 +2172,8 @@ PHP_FUNCTION(deepclone_from_array)
 		}
 
 		for (uint32_t i = 0; i < num_classes; i++) {
-			zval *cls = zend_hash_index_find(&class_list, i);
-			if (!dc_class_allowed(allowed_set, Z_STR_P(cls))) {
-				DC_INVALID("deepclone_from_array(): class \"%s\" is not allowed", ZSTR_VAL(Z_STR_P(cls)));
+			if (!dc_class_allowed(allowed_set, class_names[i])) {
+				DC_INVALID("deepclone_from_array(): class \"%s\" is not allowed", ZSTR_VAL(class_names[i]));
 			}
 		}
 
@@ -2215,9 +2219,7 @@ PHP_FUNCTION(deepclone_from_array)
 		}
 	}
 
-	/* ── Build objectMeta: id → [class_name, wakeup] ── */
-	uint32_t num_objects = 0;
-
+	/* ── Build objectMeta ── */
 	if (Z_TYPE_P(zobject_meta) == IS_LONG) {
 		zend_long n = Z_LVAL_P(zobject_meta);
 		if (n < 0) {
@@ -2236,11 +2238,10 @@ PHP_FUNCTION(deepclone_from_array)
 			if (num_classes < 1) {
 				DC_INVALID("deepclone_from_array(): Argument #1 ($data) \"objectMeta\" references class index 0 but \"classes\" is empty");
 			}
-			zval *cls0 = zend_hash_index_find(&class_list, 0);
 			obj_classes = emalloc(num_objects * sizeof(zend_string *));
 			obj_wakeups = ecalloc(num_objects, sizeof(int));
 			for (uint32_t i = 0; i < num_objects; i++) {
-				obj_classes[i] = Z_STR_P(cls0);
+				obj_classes[i] = class_names[0];
 			}
 		}
 	} else {
@@ -2272,22 +2273,26 @@ PHP_FUNCTION(deepclone_from_array)
 			if (cidx_val < 0 || (zend_ulong) cidx_val >= num_classes) {
 				DC_INVALID("deepclone_from_array(): Argument #1 ($data) \"objectMeta\" entry " ZEND_ULONG_FMT " has out-of-range class index " ZEND_LONG_FMT, id, cidx_val);
 			}
-			zval *cls = zend_hash_index_find(&class_list, cidx_val);
-			obj_classes[id] = Z_STR_P(cls);
+			obj_classes[id] = class_names[cidx_val];
 		} ZEND_HASH_FOREACH_END();
 	}
 
 	/* ── Resolve class entries (once per unique class) ── */
-	zend_hash_init(&ce_cache, num_classes, NULL, NULL, 0);
-	ce_cache_inited = true;
+	if (num_classes) {
+		class_ces = ecalloc(num_classes, sizeof(zend_class_entry *));
+	}
 
 	/* ── Initialize refs early so cleanup can always destroy it safely ── */
 	zend_hash_init(&refs, 4, NULL, ZVAL_PTR_DTOR, 0);
 	refs_inited = true;
 
 	/* ── Create object instances ───────────────── */
-	array_init_size(&objects, num_objects);
-	objects_inited = true;
+	if (num_objects) {
+		objects = emalloc(num_objects * sizeof(zval));
+		for (uint32_t i = 0; i < num_objects; i++) {
+			ZVAL_UNDEF(&objects[i]);
+		}
+	}
 
 	for (uint32_t id = 0; id < num_objects; id++) {
 		zend_string *class_name = obj_classes[id];
@@ -2307,27 +2312,29 @@ PHP_FUNCTION(deepclone_from_array)
 			}
 			PHP_VAR_UNSERIALIZE_DESTROY(var_hash);
 		} else {
-			zval *cached_ce = zend_hash_find(&ce_cache, class_name);
-			zend_class_entry *ce;
-			if (cached_ce) {
-				ce = Z_PTR_P(cached_ce);
-			} else {
-				ce = zend_lookup_class(class_name);
-				if (!ce) {
-					zend_throw_exception_ex(dc_ce_class_not_found_exception, 0,
-						"Class \"%s\" not found.", ZSTR_VAL(class_name));
-					goto cleanup;
+			/* Look up CE, caching by class_id (parallel to class_names). */
+			zend_class_entry *ce = NULL;
+			for (uint32_t ci = 0; ci < num_classes; ci++) {
+				if (class_names[ci] == class_name) {
+					ce = class_ces[ci];
+					if (!ce) {
+						ce = zend_lookup_class(class_name);
+						if (!ce) {
+							zend_throw_exception_ex(dc_ce_class_not_found_exception, 0,
+								"Class \"%s\" not found.", ZSTR_VAL(class_name));
+							goto cleanup;
+						}
+						class_ces[ci] = ce;
+					}
+					break;
 				}
-				zval zce;
-				ZVAL_PTR(&zce, ce);
-				zend_hash_add_new(&ce_cache, class_name, &zce);
 			}
 			if (UNEXPECTED(object_init_ex(&obj_zval, ce) != SUCCESS)) {
 				goto cleanup;
 			}
 		}
 
-		zend_hash_index_add_new(Z_ARRVAL(objects), id, &obj_zval);
+		ZVAL_COPY_VALUE(&objects[id], &obj_zval);
 	}
 
 	/* ── Resolve refs ──────────────────────────── */
@@ -2349,7 +2356,7 @@ PHP_FUNCTION(deepclone_from_array)
 				if (!slot) continue;
 				zval resolved;
 				ZVAL_UNDEF(&resolved);
-				dc_resolve(slot, rmask, &objects, &refs, &resolved);
+				dc_resolve(slot, rmask, objects, num_objects, &refs, &resolved);
 				if (EG(exception)) goto cleanup;
 				/* Write through reference if slot was made into one (by dc_resolve) */
 				if (Z_ISREF_P(slot)) {
@@ -2388,18 +2395,15 @@ PHP_FUNCTION(deepclone_from_array)
 				}
 			}
 
-			/* Get scope class entry for private/protected access (cached) */
-			zval *cached_scope_ce = zend_hash_find(&ce_cache, scope_name);
-			zend_class_entry *scope_ce;
-			if (cached_scope_ce) {
-				scope_ce = Z_PTR_P(cached_scope_ce);
-			} else {
-				scope_ce = zend_lookup_class(scope_name);
-				if (scope_ce) {
-					zval zce;
-					ZVAL_PTR(&zce, scope_ce);
-					zend_hash_add_new(&ce_cache, scope_name, &zce);
+			zend_class_entry *scope_ce = NULL;
+			for (uint32_t ci = 0; ci < num_classes; ci++) {
+				if (zend_string_equals(class_names[ci], scope_name)) {
+					scope_ce = class_ces[ci];
+					break;
 				}
+			}
+			if (!scope_ce) {
+				scope_ce = zend_lookup_class(scope_name);
 			}
 			/* PHP 8.5+ made EG(fake_scope) a const pointer (#19060). The
 			 * shim casts the read so we keep one source for both worlds. */
@@ -2440,14 +2444,14 @@ PHP_FUNCTION(deepclone_from_array)
 				zend_ulong obj_id;
 				zval *prop_val;
 				ZEND_HASH_FOREACH_NUM_KEY_VAL(Z_ARRVAL_P(id_values), obj_id, prop_val) {
-					zval *obj_zval = zend_hash_index_find(Z_ARRVAL(objects), obj_id);
-					if (!obj_zval) continue;
+					if (obj_id >= num_objects) continue;
+					zval *obj_zval = &objects[obj_id];
 
 					zval final_val;
 					zval *marker = resolve_ids ? zend_hash_index_find(resolve_ids, obj_id) : NULL;
 					if (marker) {
 						ZVAL_UNDEF(&final_val);
-						dc_resolve(prop_val, marker, &objects, &refs, &final_val);
+						dc_resolve(prop_val, marker, objects, num_objects, &refs, &final_val);
 						if (EG(exception)) {
 							EG(fake_scope) = old_scope;
 							goto cleanup;
@@ -2493,7 +2497,7 @@ PHP_FUNCTION(deepclone_from_array)
 				if (Z_LVAL_P(zid) < 0 || (zend_ulong) Z_LVAL_P(zid) >= num_objects) {
 					DC_INVALID("deepclone_from_array(): Argument #1 ($data) \"states\" entry references unknown object id " ZEND_LONG_FMT, Z_LVAL_P(zid));
 				}
-				zval *obj_zval = zend_hash_index_find(Z_ARRVAL(objects), Z_LVAL_P(zid));
+				zval *obj_zval = &objects[Z_LVAL_P(zid)];
 				zend_class_entry *unser_ce = Z_OBJCE_P(obj_zval);
 				if (!unser_ce->__unserialize) {
 					DC_INVALID("deepclone_from_array(): Argument #1 ($data) \"states\" entry references object id " ZEND_LONG_FMT " whose class %s has no __unserialize() method", Z_LVAL_P(zid), ZSTR_VAL(unser_ce->name));
@@ -2501,7 +2505,7 @@ PHP_FUNCTION(deepclone_from_array)
 				zval resolved_props;
 				if (smask) {
 					ZVAL_UNDEF(&resolved_props);
-					dc_resolve(sprops, smask, &objects, &refs, &resolved_props);
+					dc_resolve(sprops, smask, objects, num_objects, &refs, &resolved_props);
 					if (EG(exception)) goto cleanup;
 				} else {
 					ZVAL_COPY(&resolved_props, sprops);
@@ -2515,7 +2519,7 @@ PHP_FUNCTION(deepclone_from_array)
 				if (Z_LVAL_P(state) < 0 || (zend_ulong) Z_LVAL_P(state) >= num_objects) {
 					DC_INVALID("deepclone_from_array(): Argument #1 ($data) \"states\" entry references unknown object id " ZEND_LONG_FMT, Z_LVAL_P(state));
 				}
-				zval *obj_zval = zend_hash_index_find(Z_ARRVAL(objects), Z_LVAL_P(state));
+				zval *obj_zval = &objects[Z_LVAL_P(state)];
 				zend_class_entry *wakeup_ce = Z_OBJCE_P(obj_zval);
 				zend_function *wakeup_fn = zend_hash_find_ptr(&wakeup_ce->function_table, ZSTR_KNOWN(ZEND_STR_WAKEUP));
 				if (wakeup_fn) {
@@ -2536,7 +2540,7 @@ PHP_FUNCTION(deepclone_from_array)
 			if ((zend_ulong) id >= num_objects) {
 				DC_INVALID("deepclone_from_array(): Argument #1 ($data) \"prepared\" references unknown object id " ZEND_LONG_FMT, id);
 			}
-			zval *obj = zend_hash_index_find(Z_ARRVAL(objects), id);
+			zval *obj = &objects[id];
 			ZVAL_COPY(return_value, obj);
 		} else {
 			zval *ref = zend_hash_index_find(&refs, -id);
@@ -2546,7 +2550,7 @@ PHP_FUNCTION(deepclone_from_array)
 			ZVAL_COPY(return_value, ref);
 		}
 	} else if (zmask) {
-		dc_resolve(zprepared, zmask, &objects, &refs, return_value);
+		dc_resolve(zprepared, zmask, objects, num_objects, &refs, return_value);
 		if (EG(exception)) goto cleanup;
 	} else {
 		ZVAL_COPY(return_value, zprepared);
@@ -2554,12 +2558,17 @@ PHP_FUNCTION(deepclone_from_array)
 
 cleanup:
 	if (allowed_set) { zend_hash_destroy(allowed_set); efree(allowed_set); }
-	if (ce_cache_inited) zend_hash_destroy(&ce_cache);
-	if (refs_inited)     zend_hash_destroy(&refs);
-	if (objects_inited)  zval_ptr_dtor(&objects);
-	if (obj_classes)     efree(obj_classes);
-	if (obj_wakeups)     efree(obj_wakeups);
-	if (class_list_inited) zend_hash_destroy(&class_list);
+	if (refs_inited) zend_hash_destroy(&refs);
+	if (objects) {
+		for (uint32_t i = 0; i < num_objects; i++) {
+			zval_ptr_dtor(&objects[i]);
+		}
+		efree(objects);
+	}
+	if (obj_classes) efree(obj_classes);
+	if (obj_wakeups) efree(obj_wakeups);
+	if (class_ces)   efree(class_ces);
+	if (class_names) efree(class_names);
 }
 #undef DC_INVALID
 
