@@ -681,6 +681,7 @@ static void dc_mask_cleanup(zval *mask)
 	if (Z_TYPE_P(mask) != IS_ARRAY) {
 		return;
 	}
+	SEPARATE_ARRAY(mask);
 	HashTable *mht = Z_ARRVAL_P(mask);
 	zend_hash_apply(mht, dc_mask_cleanup_apply);
 
