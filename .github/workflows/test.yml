@@ -97,12 +97,57 @@ jobs:
 
       - name: make test
         env:
-          ASAN_OPTIONS: "detect_leaks=0:abort_on_error=1:halt_on_error=1"
+          ASAN_OPTIONS: "detect_leaks=1:abort_on_error=1:halt_on_error=1"
           UBSAN_OPTIONS: "print_stacktrace=1:halt_on_error=1"
           USE_ZEND_ALLOC: "0"
           NO_INTERACTION: "1"
           REPORT_EXIT_STATUS: "1"
         run: make test TESTS="-q --show-diff tests/"
+
+      - name: Show failing test diffs
+        if: failure()
+        run: |
+          for f in tests/*.diff tests/*.out tests/*.log; do
+            [ -e "$f" ] || continue
+            echo "::group::$f"
+            cat "$f"
+            echo "::endgroup::"
+          done
+
+  debug:
+    name: "Linux 8.4 NTS debug build (leak detection)"
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends \
+            build-essential autoconf pkg-config bison re2c \
+            libxml2-dev libsqlite3-dev
+
+      - name: Build PHP 8.4 with --enable-debug
+        run: |
+          curl -sL https://www.php.net/distributions/php-8.4.18.tar.gz | tar xz
+          cd php-8.4.18
+          ./configure --enable-debug --disable-all --enable-cli --enable-reflection --enable-spl --disable-cgi --disable-phpdbg
+          make -j$(nproc)
+          sudo make install
+          php -v
+
+      - name: Build extension
+        run: |
+          phpize
+          ./configure --enable-deepclone
+          make -j$(nproc)
+
+      - name: Run tests (leak detection active)
+        env:
+          NO_INTERACTION: "1"
+          REPORT_EXIT_STATUS: "1"
+        run: make test TESTS="-q --show-diff -m tests/"
 
       - name: Show failing test diffs
         if: failure()
