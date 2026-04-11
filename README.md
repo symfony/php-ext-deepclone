@@ -51,17 +51,66 @@ $json = json_encode($payload);   // safe — no objects in the array
 $clone = deepclone_from_array(json_decode($json, true));
 ```
 
+**Fast object instantiation and hydration.** Create objects and set their
+properties — including private, protected, and readonly ones — without calling
+their constructor, faster than Reflection:
+
+```php
+// Set private properties via scoped array (fastest path)
+$user = deepclone_hydrate(User::class, [
+    User::class => ['id' => 42, 'name' => 'Alice'],
+    AbstractEntity::class => ['createdAt' => new \DateTimeImmutable()],
+]);
+
+// Instantiate from class name with mangled keys (same format as (array) cast)
+$user = deepclone_hydrate(User::class, [], ['name' => 'Alice', 'email' => 'alice@example.com']);
+
+// Hydrate an existing object
+deepclone_hydrate($existingUser, ['User' => ['name' => 'Bob']]);
+```
+
 ## API
 
 ```php
-function deepclone_to_array(mixed $value, ?array $allowedClasses = null): array;
-function deepclone_from_array(array $data, ?array $allowedClasses = null): mixed;
+function deepclone_to_array(mixed $value, ?array $allowed_classes = null): array;
+function deepclone_from_array(array $data, ?array $allowed_classes = null): mixed;
+function deepclone_hydrate(object|string $object_or_class, array $scoped_vars = [], array $mangled_vars = []): object;
 ```
 
-`$allowedClasses` restricts which classes may be serialized or deserialized
+`$allowed_classes` restricts which classes may be serialized or deserialized
 (`null` = allow all, `[]` = allow none). Case-insensitive, matching
 `unserialize()`'s `allowed_classes` option. Closures require `"Closure"` in
 the list.
+
+`deepclone_hydrate()` accepts either an object to hydrate in place or a class
+name to instantiate without calling its constructor. Both `$scoped_vars` and
+`$mangled_vars` can be used together; `$mangled_vars` values are resolved
+and merged into `$scoped_vars` before hydration. PHP `&` references are
+preserved in both.
+
+`$scoped_vars` is the **fastest path** — it writes directly to property
+slots with no key parsing, making it ideal for hot loops. It is keyed by
+declaring class name, each value being an array of property names to values.
+
+`$mangled_vars` accepts the same mangled key format as `(array) $object`
+(`"\0ClassName\0prop"` for private, `"\0*\0prop"` for protected, bare name
+for public/dynamic). It resolves each key to the correct scope automatically,
+which is handy when round-tripping with `(array)` casts.
+
+The special `"\0"` key sets the internal state of SPL classes. In
+`$scoped_vars` it goes inside a scope entry; in `$mangled_vars` it is a
+flat key:
+
+```php
+// Via $scoped_vars:
+$ao = deepclone_hydrate('ArrayObject', ['ArrayObject' => ["\0" => [['x' => 1]]]]);
+
+// Via $mangled_vars:
+$ao = deepclone_hydrate('ArrayObject', [], ["\0" => [['x' => 1], ArrayObject::ARRAY_AS_PROPS]]);
+
+// SplObjectStorage: "\0" => [$obj1, $info1, $obj2, $info2, ...]
+$s = deepclone_hydrate('SplObjectStorage', [], ["\0" => [$obj, 'metadata']]);
+```
 
 ## What it preserves
 
@@ -76,11 +125,11 @@ the list.
 
 ## Error handling
 
-| Exception                            | Thrown by             | When                                                     |
-| ------------------------------------ | --------------------- | -------------------------------------------------------- |
-| `DeepClone\NotInstantiableException` | `deepclone_to_array`  | Resource, anonymous class, `Reflection*`, internal class without serialization support |
-| `DeepClone\ClassNotFoundException`   | `deepclone_from_array`| Payload references a class that doesn't exist            |
-| `ValueError`                         | both                  | Malformed input, or class not in `$allowedClasses`       |
+| Exception                            | Thrown by                                  | When                                                     |
+| ------------------------------------ | ------------------------------------------ | -------------------------------------------------------- |
+| `DeepClone\NotInstantiableException` | `deepclone_to_array`, `deepclone_hydrate`  | Resource, anonymous class, `Reflection*`, internal class without serialization support |
+| `DeepClone\ClassNotFoundException`   | `deepclone_from_array`, `deepclone_hydrate`| Payload/class name references a class that doesn't exist |
+| `ValueError`                         | all three                                  | Malformed input, or class not in `$allowed_classes`      |
 
 Both exception classes extend `\InvalidArgumentException`.
 
@@ -114,9 +163,12 @@ sudo make install
 ## With Symfony
 
 `symfony/var-exporter` and `symfony/polyfill-deepclone` provide the same
-`deepclone_to_array()` / `deepclone_from_array()` functions in pure PHP.
-When this extension is loaded it replaces the polyfill transparently —
-no code change needed, just a 4–5× speedup.
+`deepclone_to_array()`, `deepclone_from_array()`, and `deepclone_hydrate()`
+functions in pure PHP. When this extension is loaded it replaces the polyfill
+transparently — no code change needed.
+
+Symfony's `Hydrator::hydrate()` and `Instantiator::instantiate()` delegate
+directly to `deepclone_hydrate()`, making them thin one-liner wrappers.
 
 ## License
 

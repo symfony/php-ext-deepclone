@@ -11,7 +11,9 @@ namespace DeepClone {
 }
 
 namespace {
-    function deepclone_to_array(mixed $value, ?array $allowedClasses = null): array {}
+    function deepclone_to_array(mixed $value, ?array $allowed_classes = null): array {}
 
-    function deepclone_from_array(array $data, ?array $allowedClasses = null): mixed {}
+    function deepclone_from_array(array $data, ?array $allowed_classes = null): mixed {}
+
+    function deepclone_hydrate(object|string $object_or_class, array $scoped_vars = [], array $mangled_vars = []): object {}
 }

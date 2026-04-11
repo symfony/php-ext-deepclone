@@ -5,6 +5,28 @@ All notable changes to this extension will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-04-12
+
+### Added
+
+- `deepclone_hydrate(object|string $object_or_class, array $scoped_vars = [], array $mangled_vars = []): object` —
+  instantiates a class (or takes an existing object) and sets its properties,
+  including private, protected, and readonly ones. Handles mangled key formats
+  (`"\0ClassName\0prop"`, `"\0*\0prop"`), SPL special cases (ArrayObject,
+  ArrayIterator, SplObjectStorage via `"\0"` key), and preserves PHP `&`
+  references with correct type source tracking for typed properties.
+- Instantiability validation for `deepclone_hydrate`: rejects the same classes
+  as `deepclone_from_array` (abstract, interface, trait, enum, anonymous,
+  Reflector subclasses, internal classes without serialization API). Results
+  are cached per class for zero-cost repeated calls.
+- `ValueError` on invalid input: integer keys in `$mangled_vars`, non-array
+  values in `$scoped_vars`.
+
+### Changed
+
+- All function parameters now use snake_case to follow PHP conventions:
+  `$allowed_classes`, `$object_or_class`, `$scoped_vars`, `$mangled_vars`.
+
 ## [0.1.1] - 2026-04-10
 
 ### Fixed
