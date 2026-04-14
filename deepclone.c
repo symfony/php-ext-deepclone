@@ -1115,8 +1115,9 @@ static void dc_process_object(dc_ctx *ctx, zval *src, zval *dst, zval *mask_dst)
 				}
 			}
 
-			/* Add to props_zval[scope][name] = value (COW) */
-			zval *scope_ht = zend_hash_find(Z_ARRVAL(props_zval), scope_name);
+			/* Add to props_zval[scope][name] = value (COW).
+			 * scope_name is always interned (class entry name). */
+			zval *scope_ht = zend_hash_find_known_hash(Z_ARRVAL(props_zval), scope_name);
 			if (!scope_ht) {
 				zval new_ht;
 				array_init(&new_ht);
@@ -1303,7 +1304,7 @@ done_props:
 	if (sleep_set) {
 		zend_string *missing;
 		ZEND_HASH_FOREACH_STR_KEY(sleep_set, missing) {
-			if (missing && !zend_hash_find_ptr(&ce->properties_info, missing)) {
+			if (missing && !zend_hash_find_known_hash(&ce->properties_info, missing)) {
 				php_error_docref(NULL, E_NOTICE,
 					"serialize(): \"%s\" returned as member variable from __sleep() but does not exist",
 					ZSTR_VAL(missing));
@@ -1348,17 +1349,29 @@ prepare_props:
 				if (Z_TYPE(ctx->properties) == IS_UNDEF) {
 					array_init_size(&ctx->properties, 1);
 				}
-				zval *out_scope = zend_hash_find(Z_ARRVAL(ctx->properties), scope);
+				/* scope is a class name (interned); name's hash is populated
+				 * from the HashTable iteration above. */
+				zval *out_scope = zend_hash_find_known_hash(Z_ARRVAL(ctx->properties), scope);
 				if (!out_scope) {
 					zval new_ht;
 					array_init_size(&new_ht, 4);
 					out_scope = zend_hash_add_new(Z_ARRVAL(ctx->properties), scope, &new_ht);
 				}
-				zval *out_name = zend_hash_find(Z_ARRVAL_P(out_scope), name);
+				zval *out_name = zend_hash_find_known_hash(Z_ARRVAL_P(out_scope), name);
 				if (!out_name) {
 					zval new_ht;
 					array_init_size(&new_ht, 1);
 					out_name = zend_hash_add_new(Z_ARRVAL_P(out_scope), name, &new_ht);
+				}
+
+				/* Fast path: scalar values can't mutate ctx, so no placeholder,
+				 * no recursion, no re-lookup. This covers IS_UNDEF/IS_NULL/
+				 * IS_FALSE/IS_TRUE/IS_LONG/IS_DOUBLE/IS_STRING (not IS_REFERENCE). */
+				if (EXPECTED(Z_TYPE_P(raw_val) <= IS_STRING)) {
+					zval copy;
+					ZVAL_COPY(&copy, raw_val);
+					zend_hash_index_add_new(Z_ARRVAL_P(out_name), entry_id, &copy);
+					continue;
 				}
 
 				/* Reserve a placeholder (IS_NULL, not IS_UNDEF — packed arrays
@@ -1381,8 +1394,8 @@ prepare_props:
 				}
 				dc_mask_cleanup(&mask_slot_zv);
 
-				out_scope = zend_hash_find(Z_ARRVAL(ctx->properties), scope);
-				out_name = zend_hash_find(Z_ARRVAL_P(out_scope), name);
+				out_scope = zend_hash_find_known_hash(Z_ARRVAL(ctx->properties), scope);
+				out_name = zend_hash_find_known_hash(Z_ARRVAL_P(out_scope), name);
 				zval *dst_slot = zend_hash_index_find(Z_ARRVAL_P(out_name), entry_id);
 				ZVAL_COPY_VALUE(dst_slot, &temp_dst);
 
@@ -1390,13 +1403,13 @@ prepare_props:
 					if (Z_TYPE(ctx->resolve) == IS_UNDEF) {
 						array_init_size(&ctx->resolve, 1);
 					}
-					zval *out_rscope = zend_hash_find(Z_ARRVAL(ctx->resolve), scope);
+					zval *out_rscope = zend_hash_find_known_hash(Z_ARRVAL(ctx->resolve), scope);
 					if (!out_rscope) {
 						zval new_ht;
 						array_init_size(&new_ht, 1);
 						out_rscope = zend_hash_add_new(Z_ARRVAL(ctx->resolve), scope, &new_ht);
 					}
-					zval *out_rname = zend_hash_find(Z_ARRVAL_P(out_rscope), name);
+					zval *out_rname = zend_hash_find_known_hash(Z_ARRVAL_P(out_rscope), name);
 					if (!out_rname) {
 						zval new_ht;
 						array_init_size(&new_ht, 1);
@@ -1841,6 +1854,11 @@ static void dc_resolve(zval *value, zval *mask, zval *objects, uint32_t num_obje
 			zend_value_error("deepclone_from_array(): malformed payload, hard-ref value must be of type int, %s given", zend_zval_value_name(value));
 			return;
 		}
+		/* Guard against ZEND_LONG_MIN — negating it is signed-overflow UB. */
+		if (UNEXPECTED(Z_LVAL_P(value) <= ZEND_LONG_MIN || Z_LVAL_P(value) >= 0)) {
+			zend_value_error("deepclone_from_array(): malformed payload, ref id out of range");
+			return;
+		}
 		zend_long rid = -Z_LVAL_P(value);
 		zval *ref_slot = zend_hash_index_find(refs, rid);
 		if (UNEXPECTED(!ref_slot)) {
@@ -1923,38 +1941,35 @@ static void dc_resolve(zval *value, zval *mask, zval *objects, uint32_t num_obje
 		if (is_private) {
 			zend_class_entry *ce = zend_lookup_class(priv_class);
 			if (ce) {
-				zend_string *lcmethod = zend_string_tolower(priv_method);
-				zend_function *func = zend_hash_find_ptr(&ce->function_table, lcmethod);
-				zend_string_release(lcmethod);
+				zend_function *func = zend_hash_find_ptr_lc(&ce->function_table, priv_method);
 				if (func) {
 					zval *this_ptr = (Z_TYPE(resolved_obj) == IS_OBJECT) ? &resolved_obj : NULL;
 					zend_create_fake_closure(retval, func, ce, ce, this_ptr);
 				}
 			}
 		} else {
-			zend_string *lcname = zend_string_tolower(Z_STR_P(zname));
+			zend_string *name = Z_STR_P(zname);
 
 			if (Z_TYPE(resolved_obj) == IS_NULL) {
-				zend_function *func = zend_hash_find_ptr(CG(function_table), lcname);
+				zend_function *func = zend_hash_find_ptr_lc(CG(function_table), name);
 				if (func) {
 					zend_create_fake_closure(retval, func, NULL, NULL, NULL);
 				}
 			} else if (Z_TYPE(resolved_obj) == IS_OBJECT) {
 				zend_class_entry *ce = Z_OBJCE(resolved_obj);
-				zend_function *func = zend_hash_find_ptr(&ce->function_table, lcname);
+				zend_function *func = zend_hash_find_ptr_lc(&ce->function_table, name);
 				if (func) {
 					zend_create_fake_closure(retval, func, ce, ce, &resolved_obj);
 				}
 			} else if (Z_TYPE(resolved_obj) == IS_STRING) {
 				zend_class_entry *ce = zend_lookup_class(Z_STR(resolved_obj));
 				if (ce) {
-					zend_function *func = zend_hash_find_ptr(&ce->function_table, lcname);
+					zend_function *func = zend_hash_find_ptr_lc(&ce->function_table, name);
 					if (func) {
 						zend_create_fake_closure(retval, func, ce, ce, NULL);
 					}
 				}
 			}
-			zend_string_release(lcname);
 		}
 		if (Z_ISUNDEF_P(retval)) {
 			zval_ptr_dtor(&resolved_obj);
@@ -2025,6 +2040,11 @@ static void dc_resolve(zval *value, zval *mask, zval *objects, uint32_t num_obje
 			if (Z_TYPE_P(slot) != IS_LONG) {
 				zval_ptr_dtor(&result);
 				zend_value_error("deepclone_from_array(): malformed payload, hard-ref slot must be of type int, %s given", zend_zval_value_name(slot));
+				return;
+			}
+			if (UNEXPECTED(Z_LVAL_P(slot) <= ZEND_LONG_MIN || Z_LVAL_P(slot) >= 0)) {
+				zval_ptr_dtor(&result);
+				zend_value_error("deepclone_from_array(): malformed payload, ref id out of range");
 				return;
 			}
 			zend_long rid = -Z_LVAL_P(slot);
@@ -2404,7 +2424,11 @@ PHP_FUNCTION(deepclone_from_array)
 				}
 			}
 			if (!scope_ce) {
-				scope_ce = zend_lookup_class(scope_name);
+				/* Look up without triggering autoload — scopes reference
+				 * classes that must already be loaded (they're parents of
+				 * validated objects, or stdClass). Uses the CE cache on
+				 * scope_name for O(1) repeat lookups. */
+				scope_ce = zend_lookup_class_ex(scope_name, NULL, ZEND_FETCH_CLASS_NO_AUTOLOAD);
 			}
 			/* PHP 8.5+ made EG(fake_scope) a const pointer (#19060). The
 			 * shim casts the read so we keep one source for both worlds. */
@@ -2442,6 +2466,20 @@ PHP_FUNCTION(deepclone_from_array)
 					}
 				}
 
+				/* Hoist property_info lookup — same for all object ids in this
+				 * scope+prop combination. Declared property names are interned
+				 * in &scope_ce->properties_info so _known_hash is safe. */
+				zend_property_info *pi = NULL;
+				if (scope_ce && scope_ce != zend_standard_class_def) {
+					zval *zv = zend_hash_find_known_hash(&scope_ce->properties_info, prop_name);
+					if (zv) {
+						zend_property_info *candidate = Z_PTR_P(zv);
+						if (!(candidate->flags & ZEND_ACC_STATIC)) {
+							pi = candidate;
+						}
+					}
+				}
+
 				zend_ulong obj_id;
 				zval *prop_val;
 				ZEND_HASH_FOREACH_NUM_KEY_VAL(Z_ARRVAL_P(id_values), obj_id, prop_val) {
@@ -2463,7 +2501,33 @@ PHP_FUNCTION(deepclone_from_array)
 
 					/* Write property to object */
 					zend_object *obj = Z_OBJ_P(obj_zval);
-					if (obj->ce == zend_standard_class_def) {
+					/* For stdClass-scoped public properties on typed classes,
+					 * look up pi via obj->ce — this also preserves references
+					 * (zend_std_write_property can't accept IS_REFERENCE). */
+					zend_property_info *use_pi = pi;
+					if (!use_pi && obj->ce != zend_standard_class_def) {
+						zval *zv = zend_hash_find_known_hash(&obj->ce->properties_info, prop_name);
+						if (zv) {
+							zend_property_info *candidate = Z_PTR_P(zv);
+							if (!(candidate->flags & ZEND_ACC_STATIC)) {
+								use_pi = candidate;
+							}
+						}
+					}
+					if (EXPECTED(use_pi)) {
+						/* Fast path: direct OBJ_PROP slot write (same as deepclone_hydrate).
+						 * pi->offset is valid on any subclass because inherited slots
+						 * preserve their offsets in the object layout. */
+						zval *slot = OBJ_PROP(obj, use_pi->offset);
+						if (Z_ISREF_P(slot) && ZEND_TYPE_IS_SET(use_pi->type)) {
+							ZEND_REF_DEL_TYPE_SOURCE(Z_REF_P(slot), use_pi);
+						}
+						zval_ptr_dtor(slot);
+						ZVAL_COPY_VALUE(slot, &final_val);
+						if (Z_ISREF_P(slot) && ZEND_TYPE_IS_SET(use_pi->type)) {
+							ZEND_REF_ADD_TYPE_SOURCE(Z_REF_P(slot), use_pi);
+						}
+					} else if (obj->ce == zend_standard_class_def) {
 						if (UNEXPECTED(!obj->properties)) {
 							rebuild_object_properties_internal(obj);
 						}
@@ -2609,13 +2673,9 @@ PHP_FUNCTION(deepclone_hydrate)
 		 * using the same rules as dc_get_class_info / deepclone_from_array.
 		 * User classes always pass; internal classes are checked and cached. */
 		if (UNEXPECTED(ce->type == ZEND_INTERNAL_CLASS)) {
-			static HashTable hydrate_cache;
-			static bool hydrate_cache_inited = false;
-			if (UNEXPECTED(!hydrate_cache_inited)) {
-				zend_hash_init(&hydrate_cache, 8, NULL, NULL, 1);
-				hydrate_cache_inited = true;
-			}
-			zval *cached = zend_hash_find(&hydrate_cache, ce->name);
+			/* Per-thread cache (via module globals). Initialized in GINIT. */
+			HashTable *hydrate_cache = &DC_G(hydrate_cache);
+			zval *cached = zend_hash_find_known_hash(hydrate_cache, ce->name);
 			if (EXPECTED(cached)) {
 				if (UNEXPECTED(!Z_LVAL_P(cached))) {
 					zend_throw_exception_ex(dc_ce_not_instantiable_exception, 0,
@@ -2655,7 +2715,7 @@ PHP_FUNCTION(deepclone_hydrate)
 				}
 				zval zok;
 				ZVAL_LONG(&zok, ok ? 1 : 0);
-				zend_hash_add_new(&hydrate_cache, ce->name, &zok);
+				zend_hash_add_new(hydrate_cache, ce->name, &zok);
 				if (!ok) {
 					zend_throw_exception_ex(dc_ce_not_instantiable_exception, 0,
 						"Class \"%s\" is not instantiable.", ZSTR_VAL(ce->name));
@@ -2800,6 +2860,14 @@ add_to_scope:
 		return;
 	}
 
+	zend_object *obj = Z_OBJ(obj_zval);
+	zend_class_entry *obj_ce = obj->ce;
+
+	/* One-time rebuild for stdClass — avoids the check inside the scope loop. */
+	if (obj_ce == zend_standard_class_def && UNEXPECTED(!obj->properties)) {
+		rebuild_object_properties_internal(obj);
+	}
+
 	zend_string *scope_name;
 	zval *scope_props;
 	ZEND_HASH_FOREACH_STR_KEY_VAL(scoped_props, scope_name, scope_props) {
@@ -2814,16 +2882,15 @@ add_to_scope:
 			return;
 		}
 
-		/* Resolve scope class entry — must be obj->ce, a parent class, or stdClass.
+		/* Resolve scope class entry — must be obj_ce, a parent class, or stdClass.
 		 * No autoloader is triggered; interfaces are not valid scopes. */
-		zend_object *obj = Z_OBJ(obj_zval);
 		zend_class_entry *scope_ce = NULL;
-		if (EXPECTED(zend_string_equals(scope_name, obj->ce->name))) {
-			scope_ce = obj->ce;
+		if (EXPECTED(zend_string_equals(scope_name, obj_ce->name))) {
+			scope_ce = obj_ce;
 		} else if (zend_string_equals(scope_name, ZEND_STANDARD_CLASS_DEF_PTR->name)) {
 			/* stdClass scope = dynamic/public properties, fake_scope stays NULL */
 		} else {
-			zend_class_entry *p = obj->ce->parent;
+			zend_class_entry *p = obj_ce->parent;
 			while (p) {
 				if (zend_string_equals(scope_name, p->name)) {
 					scope_ce = p;
@@ -2833,7 +2900,7 @@ add_to_scope:
 			}
 			if (UNEXPECTED(!scope_ce)) {
 				zend_value_error("deepclone_hydrate(): Argument #2 ($scoped_vars) scope \"%s\" is not a parent of \"%s\"",
-					ZSTR_VAL(scope_name), ZSTR_VAL(obj->ce->name));
+					ZSTR_VAL(scope_name), ZSTR_VAL(obj_ce->name));
 				if (scoped_owned) zval_ptr_dtor(&local_scoped);
 				if (created) zval_ptr_dtor(&obj_zval);
 				return;
@@ -2847,10 +2914,6 @@ add_to_scope:
 #endif
 		if (scope_ce) {
 			EG(fake_scope) = scope_ce;
-		}
-
-		if (obj->ce == zend_standard_class_def && UNEXPECTED(!obj->properties)) {
-			rebuild_object_properties_internal(obj);
 		}
 
 		zend_string *prop_name;
@@ -2869,14 +2932,14 @@ add_to_scope:
 			if (ZSTR_LEN(prop_name) == 1 && ZSTR_VAL(prop_name)[0] == '\0') {
 				if (Z_TYPE_P(prop_val) != IS_ARRAY) continue;
 
-				if (instanceof_function(obj->ce, spl_ce_SplObjectStorage)) {
+				if (instanceof_function(obj_ce, spl_ce_SplObjectStorage)) {
 					/* [$obj1, $info1, $obj2, $info2, ...] → offsetSet(obj, info) */
 					uint32_t count = zend_hash_num_elements(Z_ARRVAL_P(prop_val));
 					for (uint32_t i = 0; i + 1 < count; i += 2) {
 						zval *zkey = zend_hash_index_find(Z_ARRVAL_P(prop_val), i);
 						zval *zinfo = zend_hash_index_find(Z_ARRVAL_P(prop_val), i + 1);
 						if (!zkey || !zinfo) continue;
-						zend_call_method_with_2_params(obj, obj->ce, NULL, "offsetset", NULL, zkey, zinfo);
+						zend_call_method_with_2_params(obj, obj_ce, NULL, "offsetset", NULL, zkey, zinfo);
 						if (UNEXPECTED(EG(exception))) {
 							EG(fake_scope) = old_scope;
 							if (scoped_owned) zval_ptr_dtor(&local_scoped);
@@ -2884,10 +2947,10 @@ add_to_scope:
 							return;
 						}
 					}
-				} else if (instanceof_function(obj->ce, spl_ce_ArrayObject)
-				        || instanceof_function(obj->ce, spl_ce_ArrayIterator)) {
+				} else if (instanceof_function(obj_ce, spl_ce_ArrayObject)
+				        || instanceof_function(obj_ce, spl_ce_ArrayIterator)) {
 					/* [$array, $flags?, $iteratorClass?] — call constructor */
-					zend_function *ctor = obj->ce->constructor;
+					zend_function *ctor = obj_ce->constructor;
 					if (ctor) {
 						uint32_t argc = zend_hash_num_elements(Z_ARRVAL_P(prop_val));
 						if (argc > 3) argc = 3;
@@ -2898,7 +2961,7 @@ add_to_scope:
 						}
 						zval retval;
 						ZVAL_UNDEF(&retval);
-						zend_call_known_function(ctor, obj, obj->ce, &retval, argc, args, NULL);
+						zend_call_known_function(ctor, obj, obj_ce, &retval, argc, args, NULL);
 						zval_ptr_dtor(&retval);
 						if (UNEXPECTED(EG(exception))) {
 							EG(fake_scope) = old_scope;
@@ -2911,7 +2974,7 @@ add_to_scope:
 				continue;
 			}
 
-			if (obj->ce == zend_standard_class_def) {
+			if (obj_ce == zend_standard_class_def) {
 				if (UNEXPECTED(memchr(ZSTR_VAL(prop_name), '\0', ZSTR_LEN(prop_name)) != NULL)) {
 					zend_value_error("deepclone_hydrate(): Argument #2 ($scoped_vars) scope \"%s\" contains an invalid property name; "
 						"use bare property names in $scoped_vars, or pass mangled keys via $mangled_vars",
@@ -2926,10 +2989,14 @@ add_to_scope:
 			} else {
 				/* Try direct property slot write first — declared property names
 				 * are engine-interned and never contain NUL, so a successful
-				 * lookup is a fast-path that skips all validation. */
-				zend_property_info *pi = scope_ce
-					? zend_hash_find_ptr(&scope_ce->properties_info, prop_name)
-					: NULL;
+				 * lookup is a fast-path that skips all validation.
+				 * Use _known_hash: prop_name comes from a HashTable iteration,
+				 * so its hash is already populated. */
+				zend_property_info *pi = NULL;
+				if (scope_ce) {
+					zval *zv = zend_hash_find_known_hash(&scope_ce->properties_info, prop_name);
+					if (zv) pi = Z_PTR_P(zv);
+				}
 				if (EXPECTED(pi) && !(pi->flags & ZEND_ACC_STATIC)) {
 					zval *slot = OBJ_PROP(obj, pi->offset);
 					if (Z_ISREF_P(slot) && ZEND_TYPE_IS_SET(pi->type)) {
@@ -3017,6 +3084,21 @@ static const zend_module_dep deepclone_deps[] = {
 	ZEND_MOD_END
 };
 
+ZEND_DECLARE_MODULE_GLOBALS(deepclone)
+
+static PHP_GINIT_FUNCTION(deepclone)
+{
+#if defined(COMPILE_DL_DEEPCLONE) && defined(ZTS)
+	ZEND_TSRMLS_CACHE_UPDATE();
+#endif
+	zend_hash_init(&deepclone_globals->hydrate_cache, 8, NULL, NULL, 1);
+}
+
+static PHP_GSHUTDOWN_FUNCTION(deepclone)
+{
+	zend_hash_destroy(&deepclone_globals->hydrate_cache);
+}
+
 PHP_MINFO_FUNCTION(deepclone)
 {
 	php_info_print_table_start();
@@ -3037,9 +3119,16 @@ zend_module_entry deepclone_module_entry = {
 	NULL, /* RSHUTDOWN */
 	PHP_MINFO(deepclone),
 	PHP_DEEPCLONE_VERSION,
-	STANDARD_MODULE_PROPERTIES
+	PHP_MODULE_GLOBALS(deepclone),
+	PHP_GINIT(deepclone),
+	PHP_GSHUTDOWN(deepclone),
+	NULL, /* post-deactivate */
+	STANDARD_MODULE_PROPERTIES_EX
 };
 
 #ifdef COMPILE_DL_DEEPCLONE
+# ifdef ZTS
+ZEND_TSRMLS_CACHE_DEFINE()
+# endif
 ZEND_GET_MODULE(deepclone)
 #endif
