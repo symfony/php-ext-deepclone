@@ -1,16 +1,38 @@
 /*
- * deepclone extension: native acceleration for Symfony's DeepCloner format.
+ * deepclone extension: deep-clones any serializable PHP value while
+ * preserving copy-on-write for strings and arrays — resulting in lower
+ * memory usage and better performance than unserialize(serialize()).
  *
- *   function deepclone_to_array(mixed $value): array
+ * Works by converting the value graph to a pure-array representation (only
+ * scalars and nested arrays, no objects) and back. This array form is the
+ * wire format used by Symfony's VarExporter\DeepCloner, making the extension
+ * a transparent drop-in accelerator.
+ *
+ *   function deepclone_to_array(mixed $value, ?array $allowed_classes = null): array
  *     Traverses a PHP value graph, extracts object properties, tracks
  *     references, and returns a pure-scalar array equivalent to what
  *     Symfony\Component\VarExporter\DeepCloner::toArray() produces.
  *     Leverages copy-on-write for strings and scalar arrays.
  *
- *   function deepclone_from_array(array $data): mixed
+ *   function deepclone_from_array(array $data, ?array $allowed_classes = null): mixed
  *     Reconstructs the value graph from such an array, equivalent to
  *     Symfony\Component\VarExporter\DeepCloner::fromArray($data)->clone().
  *     Throws \ValueError on malformed input.
+ *
+ *   function deepclone_hydrate(object|string $object_or_class,
+ *                              array $scoped_vars = [],
+ *                              array $mangled_vars = []): object
+ *     Instantiates a class (or takes an existing object) and sets its
+ *     properties — including private, protected, and readonly — via direct
+ *     property-slot writes. Replaces Symfony's Hydrator/Instantiator.
+ *
+ * `$allowed_classes` follows unserialize()'s semantics: null = allow all,
+ * [] = allow none, case-insensitive. Closures require `"Closure"` in the list.
+ *
+ * Typed exceptions (both extending \InvalidArgumentException):
+ *   DeepClone\NotInstantiableException — deepclone_to_array / deepclone_hydrate
+ *   DeepClone\ClassNotFoundException   — deepclone_from_array / deepclone_hydrate
+ * ValueError is thrown on malformed input or disallowed class names.
  */
 
 #ifdef HAVE_CONFIG_H
