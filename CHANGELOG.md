@@ -5,7 +5,7 @@ All notable changes to this extension will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.2.0] - 2026-04-12
+## [0.2.0] - 2026-04-14
 
 ### Added
 
@@ -20,17 +20,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Reflector subclasses, internal classes without serialization API). Results
   are cached per class for zero-cost repeated calls.
 - `ValueError` on invalid input: integer keys in `$mangled_vars`, non-array
-  values in `$scoped_vars`.
+  values in `$scoped_vars`, mangled keys inside `$scoped_vars`, property names
+  containing NUL bytes, and scopes that aren't a parent of the object's class.
 
 ### Changed
 
 - All function parameters now use snake_case to follow PHP conventions:
   `$allowed_classes`, `$object_or_class`, `$scoped_vars`, `$mangled_vars`.
+- `deepclone_from_array()` now writes declared properties via direct
+  `OBJ_PROP` slot access (same fast path as `deepclone_hydrate`), including
+  correct `zend_reference` type-source tracking for typed properties. On a
+  50-node graph this is ~25% faster and also covers a latent assertion on
+  references flowing through typed user-class properties.
+- `deepclone_to_array()` scalar fast path in the transpose loop — ~10%
+  faster on graphs dominated by scalar leaves.
+- Scope-class resolution in `deepclone_from_array()` uses
+  `zend_lookup_class_ex(..., ZEND_FETCH_CLASS_NO_AUTOLOAD)` — leverages the
+  per-`zend_string` CE cache for O(1) repeat lookups and never triggers
+  autoload for scope names (scope classes must already be loaded as parents
+  of validated objects).
 
 ### Fixed
 
 - `deepclone_to_array()` no longer warns about `__sleep()`-listed typed
   properties that are uninitialized — matching native `serialize()` behavior.
+- `deepclone_from_array()` rejects ref-id values equal to `ZEND_LONG_MIN` or
+  non-negative — prevents signed-integer negation UB on malformed payloads.
+- ZTS thread-safety: the per-class instantiability cache used by
+  `deepclone_hydrate()` is now per-thread via module globals (previously a
+  function-level static, racy under concurrent ZTS init).
 
 ## [0.1.1] - 2026-04-10
 
