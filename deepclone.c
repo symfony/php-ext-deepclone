@@ -119,6 +119,15 @@ static zend_always_inline zend_class_entry *dc_register_internal_class_with_flag
 # ifndef ZEND_ACC_PRIVATE_SET
 #  define ZEND_ACC_PRIVATE_SET (0)
 # endif
+# ifndef ZEND_ACC_VIRTUAL
+#  define ZEND_ACC_VIRTUAL (0)
+# endif
+# ifndef ZEND_VIRTUAL_PROPERTY_OFFSET
+#  define ZEND_VIRTUAL_PROPERTY_OFFSET ((uint32_t)-1)
+# endif
+# ifndef IS_HOOKED_PROPERTY_OFFSET
+#  define IS_HOOKED_PROPERTY_OFFSET(offset) (0)
+# endif
 #endif
 
 /* The stub-generated header relies on the compat shims above (specifically
@@ -598,6 +607,40 @@ static zend_always_inline bool dc_class_allowed(HashTable *set, zend_string *nam
 	bool found = zend_hash_exists(set, lcname);
 	zend_string_release(lcname);
 	return found;
+}
+
+static zend_always_inline bool dc_can_direct_write_property(zend_property_info *pi)
+{
+	/* Direct slot write bypasses set hooks (matches ReflectionProperty::setRawValue
+	 * semantics). Requires a real backing slot: reject virtual properties and
+	 * any offset sentinel. Non-virtual hooked properties have a real backing
+	 * offset (>= ZEND_FIRST_PROPERTY_OFFSET) and are safe to write directly. */
+	return pi
+		&& !(pi->flags & ZEND_ACC_STATIC)
+		&& !(pi->flags & ZEND_ACC_VIRTUAL)
+		&& pi->offset != ZEND_VIRTUAL_PROPERTY_OFFSET
+		&& !IS_HOOKED_PROPERTY_OFFSET(pi->offset);
+}
+
+static zend_always_inline bool dc_is_std_scope_property(zend_property_info *pi)
+{
+	return pi
+		&& !(pi->flags & ZEND_ACC_STATIC)
+		&& (pi->flags & ZEND_ACC_PUBLIC)
+		&& !(pi->flags & (ZEND_ACC_PROTECTED_SET | ZEND_ACC_PRIVATE_SET));
+}
+
+static zend_always_inline void dc_write_property_slot(zend_object *obj, zend_property_info *pi, zval *value)
+{
+	zval *slot = OBJ_PROP(obj, pi->offset);
+	if (Z_ISREF_P(slot) && ZEND_TYPE_IS_SET(pi->type)) {
+		ZEND_REF_DEL_TYPE_SOURCE(Z_REF_P(slot), pi);
+	}
+	zval_ptr_dtor(slot);
+	ZVAL_COPY(slot, value);
+	if (Z_ISREF_P(slot) && ZEND_TYPE_IS_SET(pi->type)) {
+		ZEND_REF_ADD_TYPE_SOURCE(Z_REF_P(slot), pi);
+	}
 }
 
 /* ── Core traversal ─────────────────────────────────────────── */
@@ -2452,6 +2495,10 @@ PHP_FUNCTION(deepclone_from_array)
 				 * scope_name for O(1) repeat lookups. */
 				scope_ce = zend_lookup_class_ex(scope_name, NULL, ZEND_FETCH_CLASS_NO_AUTOLOAD);
 			}
+			DC_REQUIRE(scope_ce,
+				"deepclone_from_array(): Argument #1 ($data) \"properties\" scope \"%s\" is not a loaded class name",
+				ZSTR_VAL(scope_name));
+			bool scope_is_std = scope_ce == zend_standard_class_def;
 			/* PHP 8.5+ made EG(fake_scope) a const pointer (#19060). The
 			 * shim casts the read so we keep one source for both worlds. */
 #if PHP_VERSION_ID >= 80500
@@ -2507,6 +2554,13 @@ PHP_FUNCTION(deepclone_from_array)
 				ZEND_HASH_FOREACH_NUM_KEY_VAL(Z_ARRVAL_P(id_values), obj_id, prop_val) {
 					if (obj_id >= num_objects) continue;
 					zval *obj_zval = &objects[obj_id];
+					zend_object *obj = Z_OBJ_P(obj_zval);
+
+					if (!scope_is_std && !instanceof_function(obj->ce, scope_ce)) {
+						EG(fake_scope) = old_scope;
+						DC_INVALID("deepclone_from_array(): Argument #1 ($data) \"properties\" scope \"%s\" is not a parent of object id " ZEND_ULONG_FMT " (%s)",
+							ZSTR_VAL(scope_name), obj_id, ZSTR_VAL(obj->ce->name));
+					}
 
 					zval final_val;
 					zval *marker = resolve_ids ? zend_hash_index_find(resolve_ids, obj_id) : NULL;
@@ -2522,34 +2576,36 @@ PHP_FUNCTION(deepclone_from_array)
 					}
 
 					/* Write property to object */
-					zend_object *obj = Z_OBJ_P(obj_zval);
 					/* For stdClass-scoped public properties on typed classes,
 					 * look up pi via obj->ce — this also preserves references
 					 * (zend_std_write_property can't accept IS_REFERENCE). */
 					zend_property_info *use_pi = pi;
-					if (!use_pi && obj->ce != zend_standard_class_def) {
+					if (!use_pi && scope_is_std && obj->ce != zend_standard_class_def) {
 						zval *zv = zend_hash_find_known_hash(&obj->ce->properties_info, prop_name);
 						if (zv) {
 							zend_property_info *candidate = Z_PTR_P(zv);
-							if (!(candidate->flags & ZEND_ACC_STATIC)) {
+							if (dc_is_std_scope_property(candidate)) {
 								use_pi = candidate;
+							} else {
+								zval_ptr_dtor(&final_val);
+								EG(fake_scope) = old_scope;
+								DC_INVALID("deepclone_from_array(): Argument #1 ($data) \"properties\" value for \"%s::%s\" targets a non-public declared property on object id " ZEND_ULONG_FMT,
+									ZSTR_VAL(scope_name), ZSTR_VAL(prop_name), obj_id);
 							}
 						}
+					} else if (!use_pi && !scope_is_std) {
+						zval_ptr_dtor(&final_val);
+						EG(fake_scope) = old_scope;
+						DC_INVALID("deepclone_from_array(): Argument #1 ($data) \"properties\" value for \"%s::%s\" does not match a declared property on object id " ZEND_ULONG_FMT,
+							ZSTR_VAL(scope_name), ZSTR_VAL(prop_name), obj_id);
 					}
-					if (EXPECTED(use_pi)) {
+					if (dc_can_direct_write_property(use_pi)) {
 						/* Fast path: direct OBJ_PROP slot write (same as deepclone_hydrate).
 						 * pi->offset is valid on any subclass because inherited slots
 						 * preserve their offsets in the object layout. */
-						zval *slot = OBJ_PROP(obj, use_pi->offset);
-						if (Z_ISREF_P(slot) && ZEND_TYPE_IS_SET(use_pi->type)) {
-							ZEND_REF_DEL_TYPE_SOURCE(Z_REF_P(slot), use_pi);
-						}
-						zval_ptr_dtor(slot);
-						ZVAL_COPY_VALUE(slot, &final_val);
-						if (Z_ISREF_P(slot) && ZEND_TYPE_IS_SET(use_pi->type)) {
-							ZEND_REF_ADD_TYPE_SOURCE(Z_REF_P(slot), use_pi);
-						}
-					} else if (obj->ce == zend_standard_class_def) {
+						dc_write_property_slot(obj, use_pi, &final_val);
+						zval_ptr_dtor(&final_val);
+					} else if (scope_is_std && obj->ce == zend_standard_class_def) {
 						if (UNEXPECTED(!obj->properties)) {
 							rebuild_object_properties_internal(obj);
 						}
@@ -2803,9 +2859,11 @@ PHP_FUNCTION(deepclone_hydrate)
 
 				/* Find second \0 separator */
 				const char *sep = memchr(key + 1, '\0', key_len - 1);
-				if (!sep) {
-					/* Malformed — skip */
-					continue;
+				if (!sep || sep == key + 1) {
+					zend_value_error("deepclone_hydrate(): Argument #3 ($mangled_vars) contains an invalid mangled key");
+					if (scoped_owned) zval_ptr_dtor(&local_scoped);
+					if (created) zval_ptr_dtor(&obj_zval);
+					return;
 				}
 				size_t class_len = sep - (key + 1);
 				size_t name_len = key_len - class_len - 2;
@@ -3019,16 +3077,8 @@ add_to_scope:
 					zval *zv = zend_hash_find_known_hash(&scope_ce->properties_info, prop_name);
 					if (zv) pi = Z_PTR_P(zv);
 				}
-				if (EXPECTED(pi) && !(pi->flags & ZEND_ACC_STATIC)) {
-					zval *slot = OBJ_PROP(obj, pi->offset);
-					if (Z_ISREF_P(slot) && ZEND_TYPE_IS_SET(pi->type)) {
-						ZEND_REF_DEL_TYPE_SOURCE(Z_REF_P(slot), pi);
-					}
-					zval_ptr_dtor(slot);
-					ZVAL_COPY(slot, prop_val);
-					if (Z_ISREF_P(prop_val) && ZEND_TYPE_IS_SET(pi->type)) {
-						ZEND_REF_ADD_TYPE_SOURCE(Z_REF_P(slot), pi);
-					}
+				if (dc_can_direct_write_property(pi)) {
+					dc_write_property_slot(obj, pi, prop_val);
 				} else {
 					/* Fallback: dynamic property or unknown name — validate first */
 					if (UNEXPECTED(memchr(ZSTR_VAL(prop_name), '\0', ZSTR_LEN(prop_name)) != NULL)) {

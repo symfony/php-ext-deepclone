@@ -22,6 +22,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `ValueError` on invalid input: integer keys in `$mangled_vars`, non-array
   values in `$scoped_vars`, mangled keys inside `$scoped_vars`, property names
   containing NUL bytes, and scopes that aren't a parent of the object's class.
+- Strict scope validation in `deepclone_from_array()`: rejects unloaded
+  scope-class names, scopes that aren't a parent of the target object's
+  class, stdClass-scoped writes targeting non-public declared properties,
+  and non-stdClass scopes referencing property names not declared on the
+  scope class. Blocks scope-confusion payloads that could otherwise reach
+  private slots on unrelated classes that happen to share a property name.
+- Mangled-key validation in `deepclone_hydrate()`: rejects keys with a
+  missing second NUL separator (e.g. `"\0broken"`) or an empty class name
+  (e.g. `"\0\0prop"`) with a `ValueError` instead of silently skipping.
 
 ### Changed
 
@@ -32,6 +41,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   correct `zend_reference` type-source tracking for typed properties. On a
   50-node graph this is ~25% faster and also covers a latent assertion on
   references flowing through typed user-class properties.
+- Non-virtual hooked properties (PHP 8.4+) are now written via direct slot
+  access, bypassing the `set` hook. Matches `ReflectionProperty::setRawValue`
+  semantics: hydration restores stored state rather than re-running
+  transformation logic. Virtual properties still go through the engine
+  write path (they have no backing slot).
 - `deepclone_to_array()` scalar fast path in the transpose loop — ~10%
   faster on graphs dominated by scalar leaves.
 - Scope-class resolution in `deepclone_from_array()` uses
