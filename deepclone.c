@@ -1303,7 +1303,7 @@ done_props:
 	if (sleep_set) {
 		zend_string *missing;
 		ZEND_HASH_FOREACH_STR_KEY(sleep_set, missing) {
-			if (missing) {
+			if (missing && !zend_hash_find_ptr(&ce->properties_info, missing)) {
 				php_error_docref(NULL, E_NOTICE,
 					"serialize(): \"%s\" returned as member variable from __sleep() but does not exist",
 					ZSTR_VAL(missing));

@@ -27,6 +27,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - All function parameters now use snake_case to follow PHP conventions:
   `$allowed_classes`, `$object_or_class`, `$scoped_vars`, `$mangled_vars`.
 
+### Fixed
+
+- `deepclone_to_array()` no longer warns about `__sleep()`-listed typed
+  properties that are uninitialized — matching native `serialize()` behavior.
+
 ## [0.1.1] - 2026-04-10
 
 ### Fixed
