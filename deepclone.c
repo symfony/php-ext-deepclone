@@ -153,8 +153,9 @@ static zend_always_inline zend_class_entry *dc_register_internal_class_with_flag
 #define DEEPCLONE_HYDRATE_CALL_HOOKS    (1 << 0)
 #define DEEPCLONE_HYDRATE_NO_LAZY_INIT  (1 << 1)
 #define DEEPCLONE_HYDRATE_MANGLED_VARS  (1 << 2)
+#define DEEPCLONE_HYDRATE_PRESERVE_REFS (1 << 3)
 #define DEEPCLONE_HYDRATE_FLAGS_MASK \
-	(DEEPCLONE_HYDRATE_CALL_HOOKS | DEEPCLONE_HYDRATE_NO_LAZY_INIT | DEEPCLONE_HYDRATE_MANGLED_VARS)
+	(DEEPCLONE_HYDRATE_CALL_HOOKS | DEEPCLONE_HYDRATE_NO_LAZY_INIT | DEEPCLONE_HYDRATE_MANGLED_VARS | DEEPCLONE_HYDRATE_PRESERVE_REFS)
 
 /* The stub-generated header relies on the compat shims above (specifically
  * zend_register_internal_class_with_flags on PHP < 8.4), so it has to be
@@ -3280,6 +3281,14 @@ add_to_scope:
 					}
 				}
 				continue;
+			}
+
+			/* Default: the input's PHP & references are dropped (dereferenced) on
+			 * write. Pass DEEPCLONE_HYDRATE_PRESERVE_REFS to keep the ref link,
+			 * which matters for call sites that intentionally share a value slot
+			 * between two properties or between a property and a caller-side var. */
+			if (!(flags & DEEPCLONE_HYDRATE_PRESERVE_REFS)) {
+				ZVAL_DEREF(prop_val);
 			}
 
 			if (obj_ce == zend_standard_class_def) {

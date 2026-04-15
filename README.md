@@ -120,10 +120,19 @@ $user = deepclone_hydrate(User::class,
 | `DEEPCLONE_HYDRATE_CALL_HOOKS`         | `ReflectionProperty::setValue` — invoke set hooks |
 | `DEEPCLONE_HYDRATE_NO_LAZY_INIT`       | `ReflectionProperty::setRawValueWithoutLazyInitialization` — skip the lazy initializer; realize the object when the last lazy property is set |
 | `DEEPCLONE_HYDRATE_MANGLED_VARS`       | interpret `$vars` as a flat mangled-key array (above) |
+| `DEEPCLONE_HYDRATE_PRESERVE_REFS`      | preserve PHP `&` references from `$vars` onto the target property slots; by default, references are dropped (dereferenced) on write |
 
 `DEEPCLONE_HYDRATE_CALL_HOOKS` and `DEEPCLONE_HYDRATE_NO_LAZY_INIT` are
-mutually exclusive; `MANGLED_VARS` composes with either. `deepclone_from_array()`
-always uses the default setRawValue semantics, mirroring `unserialize()`.
+mutually exclusive; `MANGLED_VARS` and `PRESERVE_REFS` compose with either.
+`deepclone_from_array()` always uses the default setRawValue semantics,
+mirroring `unserialize()`.
+
+`PRESERVE_REFS` is off by default because preserving references requires a
+per-call probe of the input array, which costs more than the typical DTO
+hydration saves by using the ext over Reflection. Pass the flag when you
+actually need a property slot to remain aliased to a caller-side variable or
+to another property (e.g. when rehydrating a graph previously exported with
+`deepclone_to_array()` that contained `&` references).
 
 ### Forgiving payload handling
 

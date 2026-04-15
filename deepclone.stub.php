@@ -29,6 +29,12 @@ namespace {
      */
     const DEEPCLONE_HYDRATE_MANGLED_VARS = UNKNOWN;
 
+    /**
+     * @var int
+     * @cvalue DEEPCLONE_HYDRATE_PRESERVE_REFS
+     */
+    const DEEPCLONE_HYDRATE_PRESERVE_REFS = UNKNOWN;
+
     function deepclone_to_array(mixed $value, ?array $allowed_classes = null): array {}
 
     function deepclone_from_array(array $data, ?array $allowed_classes = null): mixed {}

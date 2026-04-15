@@ -155,17 +155,25 @@ var_dump($obj->getValue() === 123);
 $obj = deepclone_hydrate('ReadonlyClass', ['ReadonlyClass' => ['value' => 456]]);
 var_dump($obj->getValue() === 456);
 
-// PHP references preservation (mangled mode keeps refs across the hydrate)
+// PHP references are dropped by default (deref on write)
 $a = 1;
 $props = ['p1' => &$a, 'p2' => &$a];
 $obj = deepclone_hydrate('stdClass', $props, DEEPCLONE_HYDRATE_MANGLED_VARS);
 var_dump($obj->p1 === 1 && $obj->p2 === 1);
 $a = 2;
+var_dump($obj->p1 === 1 && $obj->p2 === 1); // stayed at 1 — no ref preserved
+
+// PRESERVE_REFS keeps the ref link across the hydrate
+$a = 1;
+$props = ['p1' => &$a, 'p2' => &$a];
+$obj = deepclone_hydrate('stdClass', $props, DEEPCLONE_HYDRATE_MANGLED_VARS | DEEPCLONE_HYDRATE_PRESERVE_REFS);
+var_dump($obj->p1 === 1 && $obj->p2 === 1);
+$a = 2;
 var_dump($obj->p1 === 2 && $obj->p2 === 2);
 
-// References in scoped properties
+// Refs in scoped properties also need PRESERVE_REFS
 $v = 'hello';
-$obj = deepclone_hydrate('stdClass', ['stdClass' => ['x' => &$v, 'y' => &$v]]);
+$obj = deepclone_hydrate('stdClass', ['stdClass' => ['x' => &$v, 'y' => &$v]], DEEPCLONE_HYDRATE_PRESERVE_REFS);
 $v = 'world';
 var_dump($obj->x === 'world' && $obj->y === 'world');
 
@@ -318,6 +326,8 @@ var_dump($o instanceof stdClass);
 echo "Done\n";
 ?>
 --EXPECT--
+bool(true)
+bool(true)
 bool(true)
 bool(true)
 bool(true)
