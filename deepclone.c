@@ -3346,10 +3346,13 @@ add_to_scope:
 						RETURN_THROWS();
 					}
 				} else {
-					/* Fallback: dynamic property or unknown name. Matches
-					 * unserialize(): the engine rejects NUL-prefix names with
-					 * \Error and accepts NUL-in-middle as raw dynamic props. */
-					zend_std_write_property(obj, prop_name, prop_val, NULL);
+					/* Fallback: dynamic property or unknown name. Goes through
+					 * zend_update_property_ex() so any overridden write_property
+					 * handler (internal classes, extensions overriding default
+					 * handlers) is respected. Matches unserialize(): the engine
+					 * rejects NUL-prefix names with \Error and accepts NUL-in-middle
+					 * as raw dynamic properties. */
+					zend_update_property_ex(scope_ce ?: obj_ce, obj, prop_name, prop_val);
 					if (UNEXPECTED(EG(exception))) {
 						if (prop_name_owned) zend_string_release(prop_name);
 						EG(fake_scope) = old_scope;
