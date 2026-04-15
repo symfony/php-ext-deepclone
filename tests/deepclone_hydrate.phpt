@@ -139,7 +139,9 @@ var_dump($actual === $expected);
 $e = deepclone_hydrate('Exception', [], ['trace' => [234]]);
 var_dump($e->getTrace() === [234]);
 
-// Readonly: direct slot write overwrites even initialized readonly
+// Readonly: hydrating an already-initialized readonly property throws,
+// matching ReflectionProperty::setRawValue semantics (engine checks
+// ZEND_ACC_READONLY during the write).
 class ReadonlyClass {
     public string $status = 'new';
     private readonly int $value;
@@ -147,9 +149,13 @@ class ReadonlyClass {
     public function getValue(): int { return $this->value; }
 }
 $obj = new ReadonlyClass(123);
-$obj = deepclone_hydrate($obj, [], ['value' => 456, 'status' => 'hydrated']);
-var_dump($obj->getValue() === 456);
-var_dump($obj->status === 'hydrated');
+try {
+    deepclone_hydrate($obj, [], ['value' => 456]);
+    var_dump(false);
+} catch (\Error $e) {
+    var_dump(str_contains($e->getMessage(), 'readonly'));
+}
+var_dump($obj->getValue() === 123);
 
 // Readonly: uninitialized → sets value
 $obj = deepclone_hydrate('ReadonlyClass', ['ReadonlyClass' => ['value' => 456]]);

@@ -141,6 +141,12 @@ static zend_always_inline zend_class_entry *dc_register_internal_class_with_flag
 # endif
 #endif
 
+#if PHP_VERSION_ID >= 80400
+# define DC_PROP_HAS_HOOKS(pi) ((pi)->hooks != NULL)
+#else
+# define DC_PROP_HAS_HOOKS(pi) (0)
+#endif
+
 /* The stub-generated header relies on the compat shims above (specifically
  * zend_register_internal_class_with_flags on PHP < 8.4), so it has to be
  * included after this point. */
@@ -620,12 +626,12 @@ static zend_always_inline bool dc_class_allowed(HashTable *set, zend_string *nam
 	return found;
 }
 
-static zend_always_inline bool dc_can_direct_write_property(zend_property_info *pi)
+static zend_always_inline bool dc_is_backed_declared_property(zend_property_info *pi)
 {
-	/* Direct slot write bypasses set hooks (matches ReflectionProperty::setRawValue
-	 * semantics). Requires a real backing slot: reject virtual properties and
-	 * any offset sentinel. Non-virtual hooked properties have a real backing
-	 * offset (>= ZEND_FIRST_PROPERTY_OFFSET) and are safe to write directly. */
+	/* A "backed declared property" is a non-static, non-virtual property with
+	 * a real backing slot (offset >= ZEND_FIRST_PROPERTY_OFFSET). Hooked
+	 * non-virtual properties qualify (they have a real offset); virtual
+	 * properties and hook-metadata offsets do not. */
 	return pi
 		&& !(pi->flags & ZEND_ACC_STATIC)
 		&& !(pi->flags & ZEND_ACC_VIRTUAL)
@@ -641,22 +647,42 @@ static zend_always_inline bool dc_is_std_scope_property(zend_property_info *pi)
 		&& !(pi->flags & (ZEND_ACC_PROTECTED_SET | ZEND_ACC_PRIVATE_SET));
 }
 
-static zend_always_inline void dc_write_property_slot(zend_object *obj, zend_property_info *pi, zval *value)
+/* Write a declared property, matching ReflectionProperty::setRawValue semantics:
+ *  - Non-typed, non-hooked: direct slot write (fast path, dtor-reentrancy safe).
+ *  - Typed non-hooked: zend_update_property_ex with the declaring class as
+ *    fake scope — engine type-checks (coerces under non-strict).
+ *  - Hooked non-virtual: invoke the set-hook trampoline. The trampoline's
+ *    execute_data->func carries prop_info, so the recursion check inside
+ *    zend_std_write_property (zend_is_in_hook / zend_should_call_hook) short-
+ *    circuits to the direct backing write, bypassing the user set hook while
+ *    still type-checking. This is exactly what ReflectionProperty::setRawValue
+ *    does.
+ * Caller must have verified dc_is_backed_declared_property(pi). Returns false
+ * if a TypeError (or any exception) was raised by the engine. */
+static bool dc_write_backed_property(zend_object *obj, zend_property_info *pi,
+	zend_string *name, zval *value)
 {
-	zval *slot = OBJ_PROP(obj, pi->offset);
-	/* Move the old value out before running its destructor: a __destruct on
-	 * the old value can legitimately read (or even reassign) this same slot.
-	 * Install the new value first so reentrant reads see a valid, typed slot. */
-	zval old;
-	ZVAL_COPY_VALUE(&old, slot);
-	if (Z_ISREF(old) && ZEND_TYPE_IS_SET(pi->type)) {
-		ZEND_REF_DEL_TYPE_SOURCE(Z_REF(old), pi);
+	if (!ZEND_TYPE_IS_SET(pi->type) && !DC_PROP_HAS_HOOKS(pi)) {
+		zval *slot = OBJ_PROP(obj, pi->offset);
+		/* Move the old value out before running its destructor: a __destruct
+		 * on the old value can legitimately read (or reassign) this same slot.
+		 * Install the new value first so reentrant reads see a valid slot. */
+		zval old;
+		ZVAL_COPY_VALUE(&old, slot);
+		ZVAL_COPY(slot, value);
+		zval_ptr_dtor(&old);
+		return true;
 	}
-	ZVAL_COPY(slot, value);
-	if (Z_ISREF_P(slot) && ZEND_TYPE_IS_SET(pi->type)) {
-		ZEND_REF_ADD_TYPE_SOURCE(Z_REF_P(slot), pi);
+#if PHP_VERSION_ID >= 80400
+	if (DC_PROP_HAS_HOOKS(pi) && pi->hooks[ZEND_PROPERTY_HOOK_SET]) {
+		zend_function *trampoline = zend_get_property_hook_trampoline(
+			pi, ZEND_PROPERTY_HOOK_SET, name);
+		zend_call_known_instance_method_with_1_params(trampoline, obj, NULL, value);
+		return !EG(exception);
 	}
-	zval_ptr_dtor(&old);
+#endif
+	zend_update_property_ex(pi->ce, obj, name, value);
+	return !EG(exception);
 }
 
 /* ── Core traversal ─────────────────────────────────────────── */
@@ -2615,12 +2641,17 @@ PHP_FUNCTION(deepclone_from_array)
 						DC_INVALID("deepclone_from_array(): Argument #1 ($data) \"properties\" value for \"%s::%s\" does not match a declared property on object id " ZEND_ULONG_FMT,
 							ZSTR_VAL(scope_name), ZSTR_VAL(prop_name), obj_id);
 					}
-					if (dc_can_direct_write_property(use_pi)) {
-						/* Fast path: direct OBJ_PROP slot write (same as deepclone_hydrate).
-						 * pi->offset is valid on any subclass because inherited slots
-						 * preserve their offsets in the object layout. */
-						dc_write_property_slot(obj, use_pi, &final_val);
+					if (dc_is_backed_declared_property(use_pi)) {
+						/* setRawValue-style write: direct slot for non-typed
+						 * non-hooked (fast path), engine path otherwise — the
+						 * engine type-checks, bypasses set hooks on hooked
+						 * non-virtual, and tracks refs/type-sources. */
+						bool ok = dc_write_backed_property(obj, use_pi, prop_name, &final_val);
 						zval_ptr_dtor(&final_val);
+						if (UNEXPECTED(!ok)) {
+							EG(fake_scope) = old_scope;
+							goto cleanup;
+						}
 					} else if (scope_is_std && obj->ce == zend_standard_class_def) {
 						if (UNEXPECTED(!obj->properties)) {
 							rebuild_object_properties_internal(obj);
@@ -2758,7 +2789,7 @@ PHP_FUNCTION(deepclone_hydrate)
 				"Class \"%s\" not found.", ZSTR_VAL(class_name));
 			RETURN_THROWS();
 		}
-		if (UNEXPECTED(ce->ce_flags & (ZEND_ACC_INTERFACE|ZEND_ACC_TRAIT|ZEND_ACC_EXPLICIT_ABSTRACT_CLASS|ZEND_ACC_IMPLICIT_ABSTRACT_CLASS|ZEND_ACC_ENUM))) {
+		if (UNEXPECTED(ce->ce_flags & ZEND_ACC_UNINSTANTIABLE)) {
 			zend_throw_exception_ex(dc_ce_not_instantiable_exception, 0,
 				"Class \"%s\" is not instantiable.", ZSTR_VAL(ce->name));
 			RETURN_THROWS();
@@ -3105,8 +3136,14 @@ add_to_scope:
 					zval *zv = zend_hash_find_known_hash(&scope_ce->properties_info, prop_name);
 					if (zv) pi = Z_PTR_P(zv);
 				}
-				if (dc_can_direct_write_property(pi)) {
-					dc_write_property_slot(obj, pi, prop_val);
+				if (dc_is_backed_declared_property(pi)) {
+					bool ok = dc_write_backed_property(obj, pi, prop_name, prop_val);
+					if (UNEXPECTED(!ok)) {
+						EG(fake_scope) = old_scope;
+						if (scoped_owned) zval_ptr_dtor(&local_scoped);
+						zval_ptr_dtor(&obj_zval);
+						RETURN_THROWS();
+					}
 				} else {
 					/* Fallback: dynamic property or unknown name — validate first */
 					if (UNEXPECTED(memchr(ZSTR_VAL(prop_name), '\0', ZSTR_LEN(prop_name)) != NULL)) {
