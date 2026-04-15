@@ -26,6 +26,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with `DEEPCLONE_HYDRATE_MANGLED_VARS`, `DEEPCLONE_HYDRATE_CALL_HOOKS`, and
   `DEEPCLONE_HYDRATE_NO_LAZY_INIT`.
 
+### Changed
+
+- `deepclone_hydrate()` scoped-mode property-name validation now matches
+  `unserialize()` permissiveness: integer keys coerce to strings on dynamic
+  property access; NUL-in-middle names are stored as raw dynamic properties
+  (same as `unserialize()` on an `O:…` payload with a NUL-containing key);
+  NUL-prefix names surface the engine's native `Error: Cannot access property
+  starting with "\0"`. The pre-v0.4.0 `ValueError` was stricter than
+  `unserialize()` and cost a per-prop validation in the hot path; dropping it
+  aligns the semantics and saves hot-path work. `DEEPCLONE_HYDRATE_MANGLED_VARS`
+  mode still parses and validates mangled keys.
+
 ## [0.3.1] - 2026-04-15
 
 ### Fixed

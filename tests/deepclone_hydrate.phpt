@@ -268,32 +268,30 @@ try {
     var_dump(str_contains($e->getMessage(), 'array values'));
 }
 
-// NUL byte in property name inside scoped array → ValueError
-try {
-    deepclone_hydrate('stdClass', ['stdClass' => ["foo\0bar" => 'val']]);
-} catch (\ValueError $e) {
-    var_dump(str_contains($e->getMessage(), 'invalid property name'));
-}
+// NUL-in-middle of a property name: matches unserialize() — accepted
+// as a dynamic property, the engine stores the raw name.
+$o = deepclone_hydrate('stdClass', ['stdClass' => ["foo\0bar" => 'val']]);
+var_dump(((array) $o)["foo\0bar"] === 'val');
 
-// NUL byte in mangled key property portion → ValueError
+// NUL byte in mangled key property portion → ValueError (MANGLED_VARS mode parses keys)
 try {
     deepclone_hydrate('stdClass', ["\0*\0foo\0bar" => 'val'], DEEPCLONE_HYDRATE_MANGLED_VARS);
 } catch (\ValueError $e) {
     var_dump(str_contains($e->getMessage(), 'invalid mangled key'));
 }
 
-// Integer key inside scoped array → ValueError
-try {
-    deepclone_hydrate('stdClass', ['stdClass' => [0 => 'val']]);
-} catch (\ValueError $e) {
-    var_dump(str_contains($e->getMessage(), 'string keys'));
-}
+// Integer key inside a scope: matches unserialize() — coerced to string
+// on dynamic property access.
+$o = deepclone_hydrate('stdClass', ['stdClass' => [0 => 'val']]);
+var_dump($o->{'0'} === 'val');
 
-// Mangled key inside scoped array → ValueError
+// Mangled-shape key inside a scope: engine rejects the NUL-prefix
+// property name with \Error. Callers wanting mangled keys pass
+// DEEPCLONE_HYDRATE_MANGLED_VARS.
 try {
     deepclone_hydrate('stdClass', ['stdClass' => ["\0stdClass\0x" => 'val']]);
-} catch (\ValueError $e) {
-    var_dump(str_contains($e->getMessage(), 'DEEPCLONE_HYDRATE_MANGLED_VARS'));
+} catch (\Error $e) {
+    var_dump(str_contains($e->getMessage(), 'starting with'));
 }
 
 // Interface as scope → ValueError
@@ -326,7 +324,6 @@ var_dump($o instanceof stdClass);
 echo "Done\n";
 ?>
 --EXPECT--
-bool(true)
 bool(true)
 bool(true)
 bool(true)

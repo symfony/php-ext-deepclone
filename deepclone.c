@@ -3218,16 +3218,16 @@ add_to_scope:
 			EG(fake_scope) = scope_ce;
 		}
 
+		zend_ulong prop_idx;
 		zend_string *prop_name;
 		zval *prop_val;
-		ZEND_HASH_FOREACH_STR_KEY_VAL(Z_ARRVAL_P(scope_props), prop_name, prop_val) {
-			if (UNEXPECTED(!prop_name)) {
-				zend_value_error("deepclone_hydrate(): Argument #2 ($vars) scope \"%s\" must have only string keys",
-					ZSTR_VAL(scope_name));
-				EG(fake_scope) = old_scope;
-				if (scoped_owned) zval_ptr_dtor(&local_scoped);
-				zval_ptr_dtor(&obj_zval);
-				RETURN_THROWS();
+		ZEND_HASH_FOREACH_KEY_VAL(Z_ARRVAL_P(scope_props), prop_idx, prop_name, prop_val) {
+			/* Integer keys: coerce to string on dynamic property access, matching
+			 * unserialize()'s permissiveness. Allocated name is released below. */
+			bool prop_name_owned = false;
+			if (!prop_name) {
+				prop_name = zend_long_to_str((zend_long) prop_idx);
+				prop_name_owned = true;
 			}
 
 			/* "\0" key = internal state for ArrayObject/ArrayIterator/SplObjectStorage */
@@ -3292,15 +3292,9 @@ add_to_scope:
 			}
 
 			if (obj_ce == zend_standard_class_def) {
-				if (UNEXPECTED(memchr(ZSTR_VAL(prop_name), '\0', ZSTR_LEN(prop_name)) != NULL)) {
-					zend_value_error("deepclone_hydrate(): Argument #2 ($vars) scope \"%s\" contains an invalid property name; "
-						"use bare property names in scoped mode, or pass DEEPCLONE_HYDRATE_MANGLED_VARS in $flags",
-						ZSTR_VAL(scope_name));
-					EG(fake_scope) = old_scope;
-					if (scoped_owned) zval_ptr_dtor(&local_scoped);
-					zval_ptr_dtor(&obj_zval);
-					RETURN_THROWS();
-				}
+				/* Matches unserialize(): NUL-in-middle names are stored as-is,
+				 * NUL-prefix names are rejected by the engine on read. No
+				 * pre-validation — the polyfill follows the same rule. */
 				Z_TRY_ADDREF_P(prop_val);
 				zend_hash_update(obj->properties, prop_name, prop_val);
 			} else {
@@ -3317,24 +3311,19 @@ add_to_scope:
 				if (dc_is_backed_declared_property(pi)) {
 					bool ok = dc_write_backed_property(obj, pi, prop_name, prop_val, flags);
 					if (UNEXPECTED(!ok)) {
+						if (prop_name_owned) zend_string_release(prop_name);
 						EG(fake_scope) = old_scope;
 						if (scoped_owned) zval_ptr_dtor(&local_scoped);
 						zval_ptr_dtor(&obj_zval);
 						RETURN_THROWS();
 					}
 				} else {
-					/* Fallback: dynamic property or unknown name — validate first */
-					if (UNEXPECTED(memchr(ZSTR_VAL(prop_name), '\0', ZSTR_LEN(prop_name)) != NULL)) {
-						zend_value_error("deepclone_hydrate(): Argument #2 ($vars) scope \"%s\" contains an invalid property name; "
-							"use bare property names in scoped mode, or pass DEEPCLONE_HYDRATE_MANGLED_VARS in $flags",
-							ZSTR_VAL(scope_name));
-						EG(fake_scope) = old_scope;
-						if (scoped_owned) zval_ptr_dtor(&local_scoped);
-						zval_ptr_dtor(&obj_zval);
-						return;
-					}
+					/* Fallback: dynamic property or unknown name. Matches
+					 * unserialize(): the engine rejects NUL-prefix names with
+					 * \Error and accepts NUL-in-middle as raw dynamic props. */
 					zend_std_write_property(obj, prop_name, prop_val, NULL);
 					if (UNEXPECTED(EG(exception))) {
+						if (prop_name_owned) zend_string_release(prop_name);
 						EG(fake_scope) = old_scope;
 						if (scoped_owned) zval_ptr_dtor(&local_scoped);
 						zval_ptr_dtor(&obj_zval);
@@ -3342,6 +3331,7 @@ add_to_scope:
 					}
 				}
 			}
+			if (prop_name_owned) zend_string_release(prop_name);
 		} ZEND_HASH_FOREACH_END();
 
 		EG(fake_scope) = old_scope;
