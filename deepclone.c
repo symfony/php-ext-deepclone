@@ -732,6 +732,15 @@ static bool dc_write_backed_property(zend_object *obj, zend_property_info *pi,
 #if PHP_VERSION_ID >= 80400
 	bool call_hooks   = (flags & DEEPCLONE_HYDRATE_CALL_HOOKS) != 0;
 	bool no_lazy_init = (flags & DEEPCLONE_HYDRATE_NO_LAZY_INIT) != 0;
+
+	/* Lazy objects: a direct slot write would bypass the engine's realization
+	 * hook and leave the object in a half-initialized state. Route through
+	 * zend_update_property_ex() which triggers realization on first write.
+	 * DEEPCLONE_HYDRATE_NO_LAZY_INIT has its own opt-out fast path below. */
+	if (!no_lazy_init && UNEXPECTED(!zend_lazy_object_initialized(obj))) {
+		zend_update_property_ex(pi->ce, obj, name, value);
+		return !EG(exception);
+	}
 #endif
 	zval *slot = OBJ_PROP(obj, pi->offset);
 
