@@ -716,6 +716,38 @@ static bool dc_write_backed_property(zend_object *obj, zend_property_info *pi,
 		return true;
 	}
 
+#if PHP_VERSION_ID >= 80100
+	/* Backed-enum cast: when pi is a single-class typed property referring
+	 * to a backed enum and the incoming value is a scalar (int|string),
+	 * substitute the corresponding enum case via Enum::from() semantics.
+	 * Property type only — hook presence and CALL_HOOKS don't change it. */
+	zval enum_holder;
+	bool enum_holder_used = false;
+	if ((Z_TYPE_P(value) == IS_LONG || Z_TYPE_P(value) == IS_STRING)
+		&& ZEND_TYPE_HAS_NAME(pi->type)
+		&& !ZEND_TYPE_HAS_LIST(pi->type))
+	{
+		zend_class_entry *type_ce = zend_lookup_class_ex(
+			ZEND_TYPE_NAME(pi->type), NULL, ZEND_FETCH_CLASS_NO_AUTOLOAD);
+		if (type_ce && (type_ce->ce_flags & ZEND_ACC_ENUM)
+			&& type_ce->enum_backing_type != IS_UNDEF)
+		{
+			/* Delegate to Enum::from() for full parity with the polyfill —
+			 * raises TypeError on int-backed + string, ValueError on unknown
+			 * backing values, and coerces int → string for string-backed
+			 * enums (per Enum::from()'s param-parsing rules). */
+			ZVAL_UNDEF(&enum_holder);
+			zend_call_method_with_1_params(NULL, type_ce, NULL, "from",
+				&enum_holder, value);
+			if (UNEXPECTED(EG(exception))) {
+				return false;
+			}
+			value = &enum_holder;
+			enum_holder_used = true;
+		}
+	}
+#endif
+
 	if (!ZEND_TYPE_IS_SET(pi->type) && !DC_PROP_HAS_HOOKS(pi)) {
 		/* Move the old value out before running its destructor: a __destruct
 		 * on the old value can legitimately read (or reassign) this same slot.
@@ -736,6 +768,11 @@ static bool dc_write_backed_property(zend_object *obj, zend_property_info *pi,
 		zend_update_property_ex(pi->ce, obj, name, value);
 	}
 
+#if PHP_VERSION_ID >= 80100
+	if (enum_holder_used) {
+		zval_ptr_dtor(&enum_holder);
+	}
+#endif
 	return !EG(exception);
 }
 

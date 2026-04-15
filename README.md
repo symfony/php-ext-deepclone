@@ -114,6 +114,37 @@ or `setRawValue`. Suppressing the initializer requires
 on engine helpers that aren't `ZEND_API`-exported and therefore aren't
 reachable from a shared extension.
 
+### Forgiving payload handling
+
+`deepclone_hydrate()` applies three coercions before writing each
+declared property, so common rehydration patterns don't trip on
+strict-type errors. They run under every mode unless noted:
+
+- **Readonly idempotent skip** — when the readonly slot already holds an
+  identical value (`===`), the write is silently skipped. Avoids
+  `Error: Cannot modify readonly property` on no-op rehydration.
+  Different values still raise the engine's normal error.
+- **`null` → `unset()` for non-nullable typed properties** — writing
+  `null` into a non-nullable typed slot stores the uninitialized state
+  (so `ReflectionProperty::isInitialized()` returns `false` and reads
+  raise the standard "must not be accessed before initialization"
+  error) instead of throwing `TypeError`. This restores a state
+  otherwise unreachable through hydration. Nullable / `mixed` types
+  keep their existing semantics. Hooked properties never trigger this
+  rule (no backing slot to "unset" semantically; a set hook may handle
+  `null` itself).
+- **Scalar → backed-enum cast** — when the property is typed with a
+  single (possibly nullable) backed enum and the payload value is a
+  scalar matching the enum's backing type (`int` ↔ int-backed,
+  `string` ↔ string-backed), the value is cast to the corresponding
+  case. Unknown backing values raise the standard `ValueError` ("X is
+  not a valid backing value for enum Y"), matching `Enum::from()`.
+  Union/intersection types on the property itself are left untouched.
+  The decision rests on the property type only — hook presence and
+  `DEEPCLONE_HYDRATE_CALL_HOOKS` mode don't change it. Set hooks on
+  enum-typed properties accordingly receive the enum case, not the
+  raw scalar.
+
 The special `"\0"` key sets the internal state of SPL classes. In
 `$scoped_vars` it goes inside a scope entry; in `$mangled_vars` it is a
 flat key:

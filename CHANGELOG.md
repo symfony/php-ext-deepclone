@@ -15,9 +15,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   readonly and to different-valued readonly still obey engine semantics.
 - `deepclone_hydrate()` writes `null` into a non-nullable typed property
   as `unset()` (restoring the uninitialized state) instead of raising
-  `TypeError`. Nullable/mixed types keep their existing semantics. Not
-  applied under `DEEPCLONE_HYDRATE_CALL_HOOKS`, where the user's set
-  hook may legitimately handle `null`.
+  `TypeError`. Nullable/mixed types keep their existing semantics.
+  Hooked properties are exempt (no backing slot to "unset"; the set
+  hook may handle `null` itself).
+- `deepclone_hydrate()` casts scalar values to the matching backed-enum
+  case when the target is a single-type (possibly nullable) backed-enum
+  property and the value matches the enum's backing type (`int` ↔ int-
+  backed, `string` ↔ string-backed). Unknown backing values raise the
+  standard `ValueError` from `Enum::from()`. Decision rests on the
+  property type only — `DEEPCLONE_HYDRATE_CALL_HOOKS` and hook presence
+  don't change it. Set hooks on enum-typed properties accordingly
+  receive the enum case, not the raw scalar.
 
 ### Added
 
