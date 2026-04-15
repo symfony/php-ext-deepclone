@@ -692,6 +692,30 @@ static bool dc_write_backed_property(zend_object *obj, zend_property_info *pi,
 		return true;
 	}
 
+	/* null into a non-nullable typed slot: unset instead of raising
+	 * TypeError. Restores the "uninitialized typed" state that would
+	 * otherwise be unreachable via hydration. Hooked properties are
+	 * excluded outright (no backing slot to "unset" semantically, plus
+	 * a set hook may legitimately handle null) — gate is per-prop, so
+	 * non-hooked typed props in a CALL_HOOKS-mode hydrate still get the
+	 * forgiving treatment. */
+	if (Z_TYPE_P(value) == IS_NULL
+		&& ZEND_TYPE_IS_SET(pi->type)
+		&& !ZEND_TYPE_ALLOW_NULL(pi->type)
+		&& !DC_PROP_HAS_HOOKS(pi))
+	{
+		if (Z_TYPE_P(slot) != IS_UNDEF) {
+			zval old;
+			ZVAL_COPY_VALUE(&old, slot);
+			ZVAL_UNDEF(slot);
+			Z_PROP_FLAG_P(slot) |= IS_PROP_UNINIT;
+			zval_ptr_dtor(&old);
+		} else {
+			Z_PROP_FLAG_P(slot) |= IS_PROP_UNINIT;
+		}
+		return true;
+	}
+
 	if (!ZEND_TYPE_IS_SET(pi->type) && !DC_PROP_HAS_HOOKS(pi)) {
 		/* Move the old value out before running its destructor: a __destruct
 		 * on the old value can legitimately read (or reassign) this same slot.

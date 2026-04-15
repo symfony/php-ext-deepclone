@@ -13,6 +13,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   slot already holds an identical value (`===`). Avoids "Cannot modify
   readonly property" on idempotent rehydration. Writes to uninitialized
   readonly and to different-valued readonly still obey engine semantics.
+- `deepclone_hydrate()` writes `null` into a non-nullable typed property
+  as `unset()` (restoring the uninitialized state) instead of raising
+  `TypeError`. Nullable/mixed types keep their existing semantics. Not
+  applied under `DEEPCLONE_HYDRATE_CALL_HOOKS`, where the user's set
+  hook may legitimately handle `null`.
 
 ### Added
 
