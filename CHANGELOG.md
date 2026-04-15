@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `deepclone_hydrate()` silently skips readonly writes when the target
+  slot already holds an identical value (`===`). Avoids "Cannot modify
+  readonly property" on idempotent rehydration. Writes to uninitialized
+  readonly and to different-valued readonly still obey engine semantics.
+
 ### Added
 
 - `deepclone_hydrate(..., int $flags = 0)` — new optional parameter to

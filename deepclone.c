@@ -681,6 +681,17 @@ static bool dc_write_backed_property(zend_object *obj, zend_property_info *pi,
 	bool call_hooks = (flags & DEEPCLONE_HYDRATE_CALL_HOOKS) != 0;
 	zval *slot = OBJ_PROP(obj, pi->offset);
 
+	/* Readonly same-value skip: avoid the engine's "Cannot modify readonly
+	 * property" on an idempotent hydrate. Readonly and hooks are XOR, so
+	 * we don't need to worry about the trampoline path here. */
+	if ((pi->flags & ZEND_ACC_READONLY)
+		&& Z_TYPE_P(slot) != IS_UNDEF
+		&& !(Z_PROP_FLAG_P(slot) & IS_PROP_UNINIT)
+		&& zend_is_identical(slot, value))
+	{
+		return true;
+	}
+
 	if (!ZEND_TYPE_IS_SET(pi->type) && !DC_PROP_HAS_HOOKS(pi)) {
 		/* Move the old value out before running its destructor: a __destruct
 		 * on the old value can legitimately read (or reassign) this same slot.
