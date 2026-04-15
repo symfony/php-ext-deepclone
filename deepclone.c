@@ -769,7 +769,11 @@ static bool dc_write_backed_property(zend_object *obj, zend_property_info *pi,
 	bool enum_holder_used = false;
 	if ((Z_TYPE_P(value) == IS_LONG || Z_TYPE_P(value) == IS_STRING)
 		&& ZEND_TYPE_HAS_NAME(pi->type)
-		&& !ZEND_TYPE_HAS_LIST(pi->type))
+		&& !ZEND_TYPE_HAS_LIST(pi->type)
+		/* Only cast for types of the form `Enum` or `?Enum` — unions like
+		 * `Enum|string|int` already accept the scalar literally, so casting
+		 * it to an enum case would be surprising. */
+		&& (ZEND_TYPE_PURE_MASK(pi->type) & ~MAY_BE_NULL) == 0)
 	{
 		zend_class_entry *type_ce = zend_lookup_class_ex(
 			ZEND_TYPE_NAME(pi->type), NULL, ZEND_FETCH_CLASS_NO_AUTOLOAD);
