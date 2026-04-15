@@ -8,6 +8,10 @@ extern zend_module_entry deepclone_module_entry;
 
 ZEND_BEGIN_MODULE_GLOBALS(deepclone)
 	HashTable hydrate_cache;
+	/* Per-request cache of pre-constructed ReflectionProperty instances, keyed
+	 * by zend_property_info pointer. Used to amortize the construction cost in
+	 * the DEEPCLONE_HYDRATE_NO_LAZY_INIT path. */
+	HashTable lazy_init_refl_cache;
 ZEND_END_MODULE_GLOBALS(deepclone)
 
 ZEND_EXTERN_MODULE_GLOBALS(deepclone)

@@ -67,6 +67,7 @@
  * linker resolves the symbols against the loaded PHP binary at runtime. */
 extern PHPAPI zend_class_entry *reflector_ptr;
 extern PHPAPI zend_class_entry *reflection_type_ptr;
+extern PHPAPI zend_class_entry *reflection_property_ptr;
 
 /* ── Compatibility shims for older PHP versions ────────────── */
 
@@ -150,7 +151,9 @@ static zend_always_inline zend_class_entry *dc_register_internal_class_with_flag
 /* Public flags for deepclone_hydrate()'s $flags parameter. Exported as
  * PHP-level constants via deepclone.stub.php; values must match. */
 #define DEEPCLONE_HYDRATE_CALL_HOOKS    (1 << 0)
-#define DEEPCLONE_HYDRATE_FLAGS_MASK    (DEEPCLONE_HYDRATE_CALL_HOOKS)
+#define DEEPCLONE_HYDRATE_NO_LAZY_INIT  (1 << 1)
+#define DEEPCLONE_HYDRATE_FLAGS_MASK \
+	(DEEPCLONE_HYDRATE_CALL_HOOKS | DEEPCLONE_HYDRATE_NO_LAZY_INIT)
 
 /* The stub-generated header relies on the compat shims above (specifically
  * zend_register_internal_class_with_flags on PHP < 8.4), so it has to be
@@ -652,10 +655,89 @@ static zend_always_inline bool dc_is_std_scope_property(zend_property_info *pi)
 		&& !(pi->flags & (ZEND_ACC_PROTECTED_SET | ZEND_ACC_PRIVATE_SET));
 }
 
+#if PHP_VERSION_ID >= 80400
+/* fn_proxy slot cached across calls — first invocation fills it via method
+ * lookup; subsequent invocations reuse the resolved zend_function*. */
+static zend_function *dc_set_raw_no_lazy_fn = NULL;
+
+/* HashTable destructor for lazy_init_refl_cache (releases cached
+ * ReflectionProperty instances). Defined later; forward-declared here. */
+static void dc_lazy_refl_cache_dtor(zval *zv);
+
+/* Delegate a single property write to
+ * ReflectionProperty::setRawValueWithoutLazyInitialization($obj, $value).
+ * The reflection method handles lazy-prop flag clearing, counter decrement,
+ * and object realization via engine-internal helpers that aren't exposed as
+ * ZEND_API. Going through the PHP API avoids duplicating those internals.
+ * Caller is expected to fast-path the non-lazy case before calling this.
+ *
+ * Per-request cache: the constructed ReflectionProperty for a given pi
+ * is reusable across many target objects (it holds the class/property
+ * reference, not the instance), so we cache one instance per pi pointer.
+ * Returns false if an exception was raised. */
+static bool dc_set_raw_value_without_lazy_init(zend_object *obj,
+	zend_property_info *pi, zend_string *name, zval *value)
+{
+	HashTable *cache = &DC_G(lazy_init_refl_cache);
+	zend_object *refl_obj = NULL;
+
+	if (cache->nTableSize) {
+		refl_obj = zend_hash_index_find_ptr(cache, (zend_ulong) (uintptr_t) pi);
+	}
+
+	if (!refl_obj) {
+		zval refl_zv;
+		if (UNEXPECTED(object_init_ex(&refl_zv, reflection_property_ptr) != SUCCESS)) {
+			return false;
+		}
+
+		zval ctor_args[2];
+		ZVAL_STR_COPY(&ctor_args[0], pi->ce->name);
+		ZVAL_STR_COPY(&ctor_args[1], name);
+
+		zend_call_method_with_2_params(Z_OBJ(refl_zv), reflection_property_ptr,
+			&reflection_property_ptr->constructor, "__construct", NULL,
+			&ctor_args[0], &ctor_args[1]);
+
+		zval_ptr_dtor(&ctor_args[0]);
+		zval_ptr_dtor(&ctor_args[1]);
+
+		if (UNEXPECTED(EG(exception))) {
+			zval_ptr_dtor(&refl_zv);
+			return false;
+		}
+
+		if (!cache->nTableSize) {
+			zend_hash_init(cache, 8, NULL, dc_lazy_refl_cache_dtor, 0);
+		}
+		refl_obj = Z_OBJ(refl_zv);
+		zend_hash_index_add_ptr(cache, (zend_ulong) (uintptr_t) pi, refl_obj);
+		/* Cache holds the only reference; refcount stays at 1. */
+	}
+
+	zval method_args[2];
+	ZVAL_OBJ_COPY(&method_args[0], obj);
+	ZVAL_COPY(&method_args[1], value);
+
+	zend_call_method_with_2_params(refl_obj, reflection_property_ptr,
+		&dc_set_raw_no_lazy_fn,
+		"setRawValueWithoutLazyInitialization", NULL,
+		&method_args[0], &method_args[1]);
+
+	zval_ptr_dtor(&method_args[0]);
+	zval_ptr_dtor(&method_args[1]);
+
+	return !EG(exception);
+}
+#endif
+
 /* Write a declared property. Default (flags == 0) matches
  * ReflectionProperty::setRawValue: bypass set hooks, type-check, preserve
  * readonly. Flags:
  *  - DEEPCLONE_HYDRATE_CALL_HOOKS: setValue semantics — invoke set hooks.
+ *  - DEEPCLONE_HYDRATE_NO_LAZY_INIT: setRawValueWithoutLazyInitialization —
+ *    skip lazy-init on the target slot; realize the object when the last
+ *    lazy property is initialized. Delegates to ReflectionProperty.
  *
  * Dispatch:
  *  - Non-typed, non-hooked: direct slot write (fast path, dtor-safe).
@@ -665,20 +747,17 @@ static zend_always_inline bool dc_is_std_scope_property(zend_property_info *pi)
  *    check inside zend_std_write_property short-circuits to the direct
  *    backing write, bypassing the user set hook while still type-checking.
  *  - Hooked non-virtual (CALL_HOOKS): zend_update_property_ex — hook invoked.
- *
- * Lazy objects: writes go through the engine's standard path, which triggers
- * the lazy initializer on first access (matching ReflectionProperty::setValue
- * / setRawValue semantics). Suppressing initialization requires
- * ReflectionProperty::setRawValueWithoutLazyInitialization, which depends on
- * non-public engine APIs (zend_lazy_object_decr_lazy_props /
- * zend_lazy_object_realize) that aren't available to shared extensions.
+ *  - NO_LAZY_INIT (any prop shape): delegate to ReflectionProperty.
  *
  * Caller must have verified dc_is_backed_declared_property(pi). Returns false
  * if a TypeError (or any exception) was raised by the engine. */
 static bool dc_write_backed_property(zend_object *obj, zend_property_info *pi,
 	zend_string *name, zval *value, zend_long flags)
 {
-	bool call_hooks = (flags & DEEPCLONE_HYDRATE_CALL_HOOKS) != 0;
+	bool call_hooks   = (flags & DEEPCLONE_HYDRATE_CALL_HOOKS) != 0;
+#if PHP_VERSION_ID >= 80400
+	bool no_lazy_init = (flags & DEEPCLONE_HYDRATE_NO_LAZY_INIT) != 0;
+#endif
 	zval *slot = OBJ_PROP(obj, pi->offset);
 
 	/* Readonly same-value skip: avoid the engine's "Cannot modify readonly
@@ -745,6 +824,23 @@ static bool dc_write_backed_property(zend_object *obj, zend_property_info *pi,
 			value = &enum_holder;
 			enum_holder_used = true;
 		}
+	}
+#endif
+
+#if PHP_VERSION_ID >= 80400
+	/* Fast path: NO_LAZY_INIT only matters when the object is a lazy ghost
+	 * or proxy with at least one uninitialized lazy property. Otherwise the
+	 * default write path produces identical results without paying for the
+	 * Reflection round-trip. zend_lazy_object_initialized is a header-resident
+	 * static inline, so it's free to call. */
+	if (no_lazy_init && !zend_lazy_object_initialized(obj)) {
+		bool ok = dc_set_raw_value_without_lazy_init(obj, pi, name, value);
+#if PHP_VERSION_ID >= 80100
+		if (enum_holder_used) {
+			zval_ptr_dtor(&enum_holder);
+		}
+#endif
+		return ok;
 	}
 #endif
 
@@ -2873,6 +2969,10 @@ PHP_FUNCTION(deepclone_hydrate)
 		zend_value_error("deepclone_hydrate(): Argument #4 ($flags) contains unknown bits");
 		RETURN_THROWS();
 	}
+	if (UNEXPECTED((flags & DEEPCLONE_HYDRATE_CALL_HOOKS) && (flags & DEEPCLONE_HYDRATE_NO_LAZY_INIT))) {
+		zend_value_error("deepclone_hydrate(): Argument #4 ($flags) DEEPCLONE_HYDRATE_CALL_HOOKS and DEEPCLONE_HYDRATE_NO_LAZY_INIT are mutually exclusive");
+		RETURN_THROWS();
+	}
 
 	zval obj_zval;
 
@@ -3327,11 +3427,31 @@ static PHP_GINIT_FUNCTION(deepclone)
 	ZEND_TSRMLS_CACHE_UPDATE();
 #endif
 	zend_hash_init(&deepclone_globals->hydrate_cache, 8, NULL, NULL, 1);
+	/* lazy_init_refl_cache holds zend_object* (request-scoped). Initialized
+	 * lazily on first use in RINIT-equivalent flow; cleared in RSHUTDOWN. */
+	memset(&deepclone_globals->lazy_init_refl_cache, 0, sizeof(HashTable));
 }
 
 static PHP_GSHUTDOWN_FUNCTION(deepclone)
 {
 	zend_hash_destroy(&deepclone_globals->hydrate_cache);
+}
+
+#if PHP_VERSION_ID >= 80400
+static void dc_lazy_refl_cache_dtor(zval *zv)
+{
+	zend_object_release((zend_object *) Z_PTR_P(zv));
+}
+#endif
+
+static PHP_RSHUTDOWN_FUNCTION(deepclone)
+{
+	HashTable *cache = &DC_G(lazy_init_refl_cache);
+	if (cache->nTableSize) {
+		zend_hash_destroy(cache);
+		memset(cache, 0, sizeof(HashTable));
+	}
+	return SUCCESS;
 }
 
 PHP_MINFO_FUNCTION(deepclone)
@@ -3351,7 +3471,7 @@ zend_module_entry deepclone_module_entry = {
 	PHP_MINIT(deepclone),
 	NULL, /* MSHUTDOWN */
 	NULL, /* RINIT */
-	NULL, /* RSHUTDOWN */
+	PHP_RSHUTDOWN(deepclone),
 	PHP_MINFO(deepclone),
 	PHP_DEEPCLONE_VERSION,
 	PHP_MODULE_GLOBALS(deepclone),

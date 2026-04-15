@@ -103,16 +103,11 @@ which is handy when round-tripping with `(array)` casts.
 |----------------------------------------|--------------------------------------------|
 | `0` (default)                          | `ReflectionProperty::setRawValue` — bypass set hooks, type-check, respect readonly |
 | `DEEPCLONE_HYDRATE_CALL_HOOKS`         | `ReflectionProperty::setValue` — invoke set hooks |
+| `DEEPCLONE_HYDRATE_NO_LAZY_INIT`       | `ReflectionProperty::setRawValueWithoutLazyInitialization` — skip the lazy initializer; realize the object when the last lazy property is set |
 
-`deepclone_from_array()` always uses the default setRawValue semantics,
-mirroring `unserialize()`.
-
-For lazy objects, writes go through the engine's standard path, so the
-lazy initializer fires on first access — same as `ReflectionProperty::setValue`
-or `setRawValue`. Suppressing the initializer requires
-`ReflectionProperty::setRawValueWithoutLazyInitialization`, which depends
-on engine helpers that aren't `ZEND_API`-exported and therefore aren't
-reachable from a shared extension.
+`DEEPCLONE_HYDRATE_CALL_HOOKS` and `DEEPCLONE_HYDRATE_NO_LAZY_INIT` are
+mutually exclusive. `deepclone_from_array()` always uses the default
+setRawValue semantics, mirroring `unserialize()`.
 
 ### Forgiving payload handling
 

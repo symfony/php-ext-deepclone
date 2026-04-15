@@ -33,15 +33,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   choose the write semantics for declared-property assignments:
   - `DEEPCLONE_HYDRATE_CALL_HOOKS` — `ReflectionProperty::setValue`
     semantics: invoke user-defined set hooks on hooked properties.
+  - `DEEPCLONE_HYDRATE_NO_LAZY_INIT` —
+    `ReflectionProperty::setRawValueWithoutLazyInitialization` semantics:
+    skip the lazy initializer for each written property; realize the
+    object when the last lazy property is set. Delegated to the
+    Reflection API because the engine helpers the method relies on
+    (`zend_lazy_object_decr_lazy_props`, `zend_lazy_object_realize`) are
+    not exported as `ZEND_API`.
   - Default (0) — `setRawValue` semantics (bypass set hooks, type-check).
-  - Unknown bits are rejected with `ValueError`.
-  - Lazy-object semantics: writes go through the engine's standard path,
-    so the lazy initializer fires on first access (matching `setValue` /
-    `setRawValue`). Suppressing the initializer requires
-    `ReflectionProperty::setRawValueWithoutLazyInitialization`, whose
-    backing helpers (`zend_lazy_object_decr_lazy_props`,
-    `zend_lazy_object_realize`) are not exported as `ZEND_API` and so
-    aren't available to a shared extension.
+  - The two flags are mutually exclusive; unknown bits are rejected with
+    `ValueError`.
 - `deepclone_from_array()` always uses the default setRawValue semantics
   (same policy as `unserialize()` — payload-driven).
 

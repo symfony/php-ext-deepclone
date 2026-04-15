@@ -1,5 +1,5 @@
 /* This is a generated file, edit deepclone.stub.php instead.
- * Stub hash: c230b6f86caa038f9b54e91a1d5fff3b23ed0f2e */
+ * Stub hash: cc838592da0779d0068c308d771fd0d80e858102 */
 
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_deepclone_to_array, 0, 1, IS_ARRAY, 0)
 	ZEND_ARG_TYPE_INFO(0, value, IS_MIXED, 0)
@@ -32,6 +32,7 @@ static const zend_function_entry ext_functions[] = {
 static void register_deepclone_symbols(int module_number)
 {
 	REGISTER_LONG_CONSTANT("DEEPCLONE_HYDRATE_CALL_HOOKS", DEEPCLONE_HYDRATE_CALL_HOOKS, CONST_PERSISTENT);
+	REGISTER_LONG_CONSTANT("DEEPCLONE_HYDRATE_NO_LAZY_INIT", DEEPCLONE_HYDRATE_NO_LAZY_INIT, CONST_PERSISTENT);
 }
 
 static zend_class_entry *register_class_DeepClone_NotInstantiableException(zend_class_entry *class_entry_InvalidArgumentException)

@@ -33,12 +33,20 @@ try {
     var_dump(str_contains($e->getMessage(), 'unknown bits'));
 }
 
-// Lazy ghost: hydrating via deepclone_hydrate writes through the engine's
-// standard path, which triggers the lazy initializer on first access (same
-// as ReflectionProperty::setValue / setRawValue). Hydrate-written values
-// then take precedence over what the initializer set.
+// Mutually exclusive flags → ValueError
+try {
+    deepclone_hydrate(HookedBacking::class, [], [], DEEPCLONE_HYDRATE_CALL_HOOKS | DEEPCLONE_HYDRATE_NO_LAZY_INIT);
+    var_dump(false);
+} catch (\ValueError $e) {
+    var_dump(str_contains($e->getMessage(), 'mutually exclusive'));
+}
+
+// Lazy ghost, default flag: hydrate triggers the lazy initializer on first
+// access (matching ReflectionProperty::setValue / setRawValue). The hydrate
+// value wins for the written prop; initializer values survive for the rest.
 class Lazy { public int $a = 0; public string $b = ''; }
 $rc = new ReflectionClass(Lazy::class);
+
 $initRan = 0;
 $ghost = $rc->newLazyGhost(function (Lazy $o) use (&$initRan) {
     ++$initRan;
@@ -46,13 +54,32 @@ $ghost = $rc->newLazyGhost(function (Lazy $o) use (&$initRan) {
     $o->b = 'init';
 });
 deepclone_hydrate($ghost, [Lazy::class => ['a' => 99]]);
-var_dump($initRan === 1);     // initializer ran
-var_dump($ghost->a === 99);   // hydrate value wins
-var_dump($ghost->b === 'init'); // initializer-set value preserved
+var_dump($initRan === 1);        // initializer ran once
+var_dump($ghost->a === 99);      // hydrate value wins
+var_dump($ghost->b === 'init');  // initializer value preserved
+
+// Lazy ghost, NO_LAZY_INIT: hydrate skips the initializer. After writing
+// the single lazy prop, the object is realized (no more lazy props).
+$initRan = 0;
+$ghost = $rc->newLazyGhost(function (Lazy $o) use (&$initRan) {
+    ++$initRan;
+    $o->a = 1;
+    $o->b = 'init';
+});
+deepclone_hydrate($ghost, [Lazy::class => ['a' => 99, 'b' => 'hyd']], [], DEEPCLONE_HYDRATE_NO_LAZY_INIT);
+var_dump($initRan === 0);        // initializer did NOT run
+var_dump($ghost->a === 99);
+var_dump($ghost->b === 'hyd');
+var_dump($initRan === 0);        // subsequent read still doesn't init (realized)
 
 echo "Done\n";
 ?>
 --EXPECT--
+bool(true)
+bool(true)
+bool(true)
+bool(true)
+bool(true)
 bool(true)
 bool(true)
 bool(true)

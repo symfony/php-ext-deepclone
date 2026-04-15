@@ -17,6 +17,12 @@ namespace {
      */
     const DEEPCLONE_HYDRATE_CALL_HOOKS = UNKNOWN;
 
+    /**
+     * @var int
+     * @cvalue DEEPCLONE_HYDRATE_NO_LAZY_INIT
+     */
+    const DEEPCLONE_HYDRATE_NO_LAZY_INIT = UNKNOWN;
+
     function deepclone_to_array(mixed $value, ?array $allowed_classes = null): array {}
 
     function deepclone_from_array(array $data, ?array $allowed_classes = null): mixed {}
