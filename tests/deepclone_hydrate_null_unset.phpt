@@ -38,7 +38,7 @@ var_dump($o->m === null);
 // CALL_HOOKS is per-prop: a non-hooked typed prop still gets unset, even
 // when the flag is set (no set hook on this property to defer to).
 $o = new Typed();
-$o = deepclone_hydrate($o, [Typed::class => ['x' => null]], [], DEEPCLONE_HYDRATE_CALL_HOOKS);
+$o = deepclone_hydrate($o, [Typed::class => ['x' => null]], DEEPCLONE_HYDRATE_CALL_HOOKS);
 var_dump((new ReflectionProperty(Typed::class, 'x'))->isInitialized($o));
 
 echo "Done\n";

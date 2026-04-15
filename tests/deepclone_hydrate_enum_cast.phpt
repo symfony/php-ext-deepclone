@@ -78,7 +78,7 @@ var_dump($o->s === Suit::Spades);
 
 // CALL_HOOKS gate is per-prop: non-hooked enum-typed props still get cast.
 $o = new WithEnum();
-$o = deepclone_hydrate($o, [WithEnum::class => ['s' => 'S']], [], DEEPCLONE_HYDRATE_CALL_HOOKS);
+$o = deepclone_hydrate($o, [WithEnum::class => ['s' => 'S']], DEEPCLONE_HYDRATE_CALL_HOOKS);
 var_dump($o->s === Suit::Spades);
 
 // Hooked enum prop under CALL_HOOKS: the cast decision is property-type
@@ -99,7 +99,7 @@ if (PHP_VERSION_ID >= 80400) {
         }
     }');
     $o = new WithHookedEnumWider();
-    $o = deepclone_hydrate($o, [WithHookedEnumWider::class => ['s' => 'S']], [], DEEPCLONE_HYDRATE_CALL_HOOKS);
+    $o = deepclone_hydrate($o, [WithHookedEnumWider::class => ['s' => 'S']], DEEPCLONE_HYDRATE_CALL_HOOKS);
     var_dump($o->s === Suit::Spades);
     var_dump(WithHookedEnumWider::$lastRaw === null);
 
@@ -109,7 +109,7 @@ if (PHP_VERSION_ID >= 80400) {
         }
     }');
     $o = new WithHookedEnumStrict();
-    $o = deepclone_hydrate($o, [WithHookedEnumStrict::class => ['s' => 'S']], [], DEEPCLONE_HYDRATE_CALL_HOOKS);
+    $o = deepclone_hydrate($o, [WithHookedEnumStrict::class => ['s' => 'S']], DEEPCLONE_HYDRATE_CALL_HOOKS);
     var_dump($o->s === Suit::Spades);
 } else {
     var_dump(true);

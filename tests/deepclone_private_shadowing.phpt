@@ -39,13 +39,13 @@ var_dump($clone->getChild() === 'child_val');
 
 // 3) Bare name in $mangled_vars targets the most-derived private slot.
 $b2 = new PrivShadowB();
-deepclone_hydrate($b2, [], ['x' => 'bare_val']);
+deepclone_hydrate($b2, ['x' => 'bare_val'], DEEPCLONE_HYDRATE_MANGLED_VARS);
 var_dump($b2->get() === 'a_init');         // parent untouched
 var_dump($b2->getChild() === 'bare_val');  // child written
 
 // 4) Explicit mangled key targets the parent's private slot.
 $b3 = new PrivShadowB();
-deepclone_hydrate($b3, [], ["\0PrivShadowA\0x" => 'parent_targeted']);
+deepclone_hydrate($b3, ["\0PrivShadowA\0x" => 'parent_targeted'], DEEPCLONE_HYDRATE_MANGLED_VARS);
 var_dump($b3->get() === 'parent_targeted');
 var_dump($b3->getChild() === 'b_init');
 

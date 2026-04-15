@@ -85,24 +85,24 @@ var_dump(count($ai) === 3);
 // === Mangled vars (3rd parameter) ===
 
 // stdClass with flat properties
-$o = deepclone_hydrate('stdClass', [], ['p' => 123]);
+$o = deepclone_hydrate('stdClass', ['p' => 123], DEEPCLONE_HYDRATE_MANGLED_VARS);
 var_dump($o->p === 123);
 
 // Case-insensitive class name
-$o = deepclone_hydrate('STDcLASS', [], ['p' => 123]);
+$o = deepclone_hydrate('STDcLASS', ['p' => 123], DEEPCLONE_HYDRATE_MANGLED_VARS);
 var_dump($o->p === 123);
 
-// ArrayObject via "\0" key in $mangled_vars
-$ao = deepclone_hydrate('ArrayObject', [], ["\0" => [[123]]]);
+// ArrayObject via "\0" key in mangled-vars mode
+$ao = deepclone_hydrate('ArrayObject', ["\0" => [[123]]], DEEPCLONE_HYDRATE_MANGLED_VARS);
 var_dump($ao[0] === 123);
 
-// ArrayObject via "\0" key in $scoped_vars (own class as scope)
+// ArrayObject via "\0" key in scoped mode (own class as scope)
 $ao = deepclone_hydrate('ArrayObject', ['ArrayObject' => ["\0" => [[456]]]]);
 var_dump($ao[0] === 456);
 
-// SplObjectStorage via "\0" key in $mangled_vars
+// SplObjectStorage via "\0" key in mangled-vars mode
 $o1 = new stdClass();
-$s = deepclone_hydrate('SplObjectStorage', [], ["\0" => [$o1, 'data']]);
+$s = deepclone_hydrate('SplObjectStorage', ["\0" => [$o1, 'data']], DEEPCLONE_HYDRATE_MANGLED_VARS);
 var_dump($s->count() === 1);
 
 // SplObjectStorage via "\0" key in $scoped_vars
@@ -110,11 +110,6 @@ $o1 = new stdClass();
 $s = deepclone_hydrate('SplObjectStorage', ['SplObjectStorage' => ["\0" => [$o1, 'info']]]);
 var_dump($s->count() === 1);
 
-// Inheritance with mixed $properties + $scopedProperties
-$actual = (array) deepclone_hydrate('Bar', [Foo::class => ['priv' => 234]], [
-    'dyn' => 456, 'ro' => 567, 'prot' => 345, 'priv' => 123,
-]);
-ksort($actual);
 $expected = [
     "\0*\0prot" => 345,
     "\0Bar\0priv" => 123,
@@ -122,21 +117,20 @@ $expected = [
     'dyn' => 456,
     'ro' => 567,
 ];
-var_dump($actual === $expected);
 
-// Mangled key format in $properties
-$actual = (array) deepclone_hydrate('Bar', [], [
+// Mangled key format
+$actual = (array) deepclone_hydrate('Bar', [
     "\0*\0prot" => 345,
     "\0Bar\0priv" => 123,
     "\0Foo\0priv" => 234,
     'dyn' => 456,
     'ro' => 567,
-]);
+], DEEPCLONE_HYDRATE_MANGLED_VARS);
 ksort($actual);
 var_dump($actual === $expected);
 
 // Exception trace (internal class hydration)
-$e = deepclone_hydrate('Exception', [], ['trace' => [234]]);
+$e = deepclone_hydrate('Exception', ['trace' => [234]], DEEPCLONE_HYDRATE_MANGLED_VARS);
 var_dump($e->getTrace() === [234]);
 
 // Readonly: hydrating an already-initialized readonly property throws,
@@ -150,7 +144,7 @@ class ReadonlyClass {
 }
 $obj = new ReadonlyClass(123);
 try {
-    deepclone_hydrate($obj, [], ['value' => 456]);
+    deepclone_hydrate($obj, ['value' => 456], DEEPCLONE_HYDRATE_MANGLED_VARS);
     var_dump(false);
 } catch (\Error $e) {
     var_dump(str_contains($e->getMessage(), 'readonly'));
@@ -161,10 +155,10 @@ var_dump($obj->getValue() === 123);
 $obj = deepclone_hydrate('ReadonlyClass', ['ReadonlyClass' => ['value' => 456]]);
 var_dump($obj->getValue() === 456);
 
-// PHP references preservation
+// PHP references preservation (mangled mode keeps refs across the hydrate)
 $a = 1;
 $props = ['p1' => &$a, 'p2' => &$a];
-$obj = deepclone_hydrate('stdClass', [], $props);
+$obj = deepclone_hydrate('stdClass', $props, DEEPCLONE_HYDRATE_MANGLED_VARS);
 var_dump($obj->p1 === 1 && $obj->p2 === 1);
 $a = 2;
 var_dump($obj->p1 === 2 && $obj->p2 === 2);
@@ -180,15 +174,10 @@ class GP { private string $secret = ''; public function getSecret(): string { re
 class P extends GP { private int $mid = 0; public function getMid(): int { return $this->mid; } }
 class C extends P { public string $pub = ''; }
 
-$o = deepclone_hydrate('C', [], ["\0GP\0secret" => 'gp_val', "\0P\0mid" => 42, 'pub' => 'hi']);
+$o = deepclone_hydrate('C', ["\0GP\0secret" => 'gp_val', "\0P\0mid" => 42, 'pub' => 'hi'], DEEPCLONE_HYDRATE_MANGLED_VARS);
 var_dump($o->getSecret() === 'gp_val');
 var_dump($o->getMid() === 42);
 var_dump($o->pub === 'hi');
-
-// === Both $scopedProperties and $properties writing same property ===
-// $properties are resolved and merged into scopedProperties, overwriting same scope+name
-$o = deepclone_hydrate('stdClass', ['stdClass' => ['x' => 'from_scoped']], ['x' => 'from_flat']);
-var_dump($o->x === 'from_flat');
 
 // === Error cases ===
 
@@ -259,7 +248,7 @@ try {
 
 // Integer key in $mangled_vars → ValueError
 try {
-    deepclone_hydrate('stdClass', [], [0 => 'val']);
+    deepclone_hydrate('stdClass', [0 => 'val'], DEEPCLONE_HYDRATE_MANGLED_VARS);
 } catch (\ValueError $e) {
     var_dump(str_contains($e->getMessage(), 'string keys'));
 }
@@ -280,7 +269,7 @@ try {
 
 // NUL byte in mangled key property portion → ValueError
 try {
-    deepclone_hydrate('stdClass', [], ["\0*\0foo\0bar" => 'val']);
+    deepclone_hydrate('stdClass', ["\0*\0foo\0bar" => 'val'], DEEPCLONE_HYDRATE_MANGLED_VARS);
 } catch (\ValueError $e) {
     var_dump(str_contains($e->getMessage(), 'invalid mangled key'));
 }
@@ -329,8 +318,6 @@ var_dump($o instanceof stdClass);
 echo "Done\n";
 ?>
 --EXPECT--
-bool(true)
-bool(true)
 bool(true)
 bool(true)
 bool(true)

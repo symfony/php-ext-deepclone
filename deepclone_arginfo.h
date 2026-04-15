@@ -1,5 +1,5 @@
 /* This is a generated file, edit deepclone.stub.php instead.
- * Stub hash: cc838592da0779d0068c308d771fd0d80e858102 */
+ * Stub hash: 2383b81a7c575515337480af636d47f80d3c77f0 */
 
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_deepclone_to_array, 0, 1, IS_ARRAY, 0)
 	ZEND_ARG_TYPE_INFO(0, value, IS_MIXED, 0)
@@ -13,8 +13,7 @@ ZEND_END_ARG_INFO()
 
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_deepclone_hydrate, 0, 1, IS_OBJECT, 0)
 	ZEND_ARG_TYPE_MASK(0, object_or_class, MAY_BE_OBJECT|MAY_BE_STRING, NULL)
-	ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, scoped_vars, IS_ARRAY, 0, "[]")
-	ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, mangled_vars, IS_ARRAY, 0, "[]")
+	ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, vars, IS_ARRAY, 0, "[]")
 	ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, flags, IS_LONG, 0, "0")
 ZEND_END_ARG_INFO()
 
@@ -33,6 +32,7 @@ static void register_deepclone_symbols(int module_number)
 {
 	REGISTER_LONG_CONSTANT("DEEPCLONE_HYDRATE_CALL_HOOKS", DEEPCLONE_HYDRATE_CALL_HOOKS, CONST_PERSISTENT);
 	REGISTER_LONG_CONSTANT("DEEPCLONE_HYDRATE_NO_LAZY_INIT", DEEPCLONE_HYDRATE_NO_LAZY_INIT, CONST_PERSISTENT);
+	REGISTER_LONG_CONSTANT("DEEPCLONE_HYDRATE_MANGLED_VARS", DEEPCLONE_HYDRATE_MANGLED_VARS, CONST_PERSISTENT);
 }
 
 static zend_class_entry *register_class_DeepClone_NotInstantiableException(zend_class_entry *class_entry_InvalidArgumentException)

@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### BC Break
+
+- `deepclone_hydrate()` now takes a single `$vars` array instead of
+  separate `$scoped_vars` and `$mangled_vars`. The default interpretation
+  is the scoped per-class shape; pass the new `DEEPCLONE_HYDRATE_MANGLED_VARS`
+  flag in `$flags` to interpret `$vars` as a flat mangled-key array (the
+  shape `(array) $object` produces). Old positional callers
+  (`deepclone_hydrate($obj, [], $mangled)`) need to be updated to
+  `deepclone_hydrate($obj, $mangled, DEEPCLONE_HYDRATE_MANGLED_VARS)`.
+  As a footgun guard, passing a NUL-prefixed key in scoped mode raises
+  a `ValueError` pointing at the missing flag.
+
+### Added
+
+- `DEEPCLONE_HYDRATE_MANGLED_VARS` constant — see BC break above.
+
 ### Changed
 
 - `deepclone_hydrate()` silently skips readonly writes when the target

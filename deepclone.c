@@ -20,8 +20,8 @@
  *     Throws \ValueError on malformed input.
  *
  *   function deepclone_hydrate(object|string $object_or_class,
- *                              array $scoped_vars = [],
- *                              array $mangled_vars = []): object
+ *                              array $vars = [],
+ *                              int $flags = 0): object
  *     Instantiates a class (or takes an existing object) and sets its
  *     properties — including private, protected, and readonly — via direct
  *     property-slot writes. Replaces Symfony's Hydrator/Instantiator.
@@ -152,8 +152,9 @@ static zend_always_inline zend_class_entry *dc_register_internal_class_with_flag
  * PHP-level constants via deepclone.stub.php; values must match. */
 #define DEEPCLONE_HYDRATE_CALL_HOOKS    (1 << 0)
 #define DEEPCLONE_HYDRATE_NO_LAZY_INIT  (1 << 1)
+#define DEEPCLONE_HYDRATE_MANGLED_VARS  (1 << 2)
 #define DEEPCLONE_HYDRATE_FLAGS_MASK \
-	(DEEPCLONE_HYDRATE_CALL_HOOKS | DEEPCLONE_HYDRATE_NO_LAZY_INIT)
+	(DEEPCLONE_HYDRATE_CALL_HOOKS | DEEPCLONE_HYDRATE_NO_LAZY_INIT | DEEPCLONE_HYDRATE_MANGLED_VARS)
 
 /* The stub-generated header relies on the compat shims above (specifically
  * zend_register_internal_class_with_flags on PHP < 8.4), so it has to be
@@ -664,17 +665,9 @@ static zend_function *dc_set_raw_no_lazy_fn = NULL;
  * ReflectionProperty instances). Defined later; forward-declared here. */
 static void dc_lazy_refl_cache_dtor(zval *zv);
 
-/* Delegate a single property write to
- * ReflectionProperty::setRawValueWithoutLazyInitialization($obj, $value).
- * The reflection method handles lazy-prop flag clearing, counter decrement,
- * and object realization via engine-internal helpers that aren't exposed as
- * ZEND_API. Going through the PHP API avoids duplicating those internals.
- * Caller is expected to fast-path the non-lazy case before calling this.
- *
- * Per-request cache: the constructed ReflectionProperty for a given pi
- * is reusable across many target objects (it holds the class/property
- * reference, not the instance), so we cache one instance per pi pointer.
- * Returns false if an exception was raised. */
+/* Delegates to ReflectionProperty::setRawValueWithoutLazyInitialization because the
+ * required engine helpers (zend_lazy_object_decr_lazy_props, _realize) aren't ZEND_API.
+ * Per-request cache keyed on pi — the ReflectionProperty is per-class, not per-instance. */
 static bool dc_set_raw_value_without_lazy_init(zend_object *obj,
 	zend_property_info *pi, zend_string *name, zval *value)
 {
@@ -731,38 +724,21 @@ static bool dc_set_raw_value_without_lazy_init(zend_object *obj,
 }
 #endif
 
-/* Write a declared property. Default (flags == 0) matches
- * ReflectionProperty::setRawValue: bypass set hooks, type-check, preserve
- * readonly. Flags:
- *  - DEEPCLONE_HYDRATE_CALL_HOOKS: setValue semantics — invoke set hooks.
- *  - DEEPCLONE_HYDRATE_NO_LAZY_INIT: setRawValueWithoutLazyInitialization —
- *    skip lazy-init on the target slot; realize the object when the last
- *    lazy property is initialized. Delegates to ReflectionProperty.
- *
- * Dispatch:
- *  - Non-typed, non-hooked: direct slot write (fast path, dtor-safe).
- *  - Typed non-hooked: zend_update_property_ex (engine type-checks).
- *  - Hooked non-virtual (default): invoke the set-hook trampoline. The
- *    trampoline's execute_data->func carries prop_info, so the recursion
- *    check inside zend_std_write_property short-circuits to the direct
- *    backing write, bypassing the user set hook while still type-checking.
- *  - Hooked non-virtual (CALL_HOOKS): zend_update_property_ex — hook invoked.
- *  - NO_LAZY_INIT (any prop shape): delegate to ReflectionProperty.
- *
- * Caller must have verified dc_is_backed_declared_property(pi). Returns false
- * if a TypeError (or any exception) was raised by the engine. */
+/* Default dispatch matches ReflectionProperty::setRawValue. The non-obvious branch
+ * is the hook trampoline path: zend_std_write_property's recursion check sees
+ * prop_info on execute_data->func and short-circuits to the backing write,
+ * bypassing the user set hook while keeping the type-check.
+ * Caller must have verified dc_is_backed_declared_property(pi). */
 static bool dc_write_backed_property(zend_object *obj, zend_property_info *pi,
 	zend_string *name, zval *value, zend_long flags)
 {
-	bool call_hooks   = (flags & DEEPCLONE_HYDRATE_CALL_HOOKS) != 0;
 #if PHP_VERSION_ID >= 80400
+	bool call_hooks   = (flags & DEEPCLONE_HYDRATE_CALL_HOOKS) != 0;
 	bool no_lazy_init = (flags & DEEPCLONE_HYDRATE_NO_LAZY_INIT) != 0;
 #endif
 	zval *slot = OBJ_PROP(obj, pi->offset);
 
-	/* Readonly same-value skip: avoid the engine's "Cannot modify readonly
-	 * property" on an idempotent hydrate. Readonly and hooks are XOR, so
-	 * we don't need to worry about the trampoline path here. */
+	/* Idempotent readonly write — readonly and hooks are XOR, so no trampoline concern. */
 	if ((pi->flags & ZEND_ACC_READONLY)
 		&& Z_TYPE_P(slot) != IS_UNDEF
 		&& !(Z_PROP_FLAG_P(slot) & IS_PROP_UNINIT)
@@ -771,13 +747,8 @@ static bool dc_write_backed_property(zend_object *obj, zend_property_info *pi,
 		return true;
 	}
 
-	/* null into a non-nullable typed slot: unset instead of raising
-	 * TypeError. Restores the "uninitialized typed" state that would
-	 * otherwise be unreachable via hydration. Hooked properties are
-	 * excluded outright (no backing slot to "unset" semantically, plus
-	 * a set hook may legitimately handle null) — gate is per-prop, so
-	 * non-hooked typed props in a CALL_HOOKS-mode hydrate still get the
-	 * forgiving treatment. */
+	/* null → uninitialized for non-nullable typed slots; hooked props excluded
+	 * (no backing slot to "unset", and the set hook may handle null itself). */
 	if (Z_TYPE_P(value) == IS_NULL
 		&& ZEND_TYPE_IS_SET(pi->type)
 		&& !ZEND_TYPE_ALLOW_NULL(pi->type)
@@ -796,10 +767,7 @@ static bool dc_write_backed_property(zend_object *obj, zend_property_info *pi,
 	}
 
 #if PHP_VERSION_ID >= 80100
-	/* Backed-enum cast: when pi is a single-class typed property referring
-	 * to a backed enum and the incoming value is a scalar (int|string),
-	 * substitute the corresponding enum case via Enum::from() semantics.
-	 * Property type only — hook presence and CALL_HOOKS don't change it. */
+	/* Property-type-only decision: hook presence and CALL_HOOKS don't influence it. */
 	zval enum_holder;
 	bool enum_holder_used = false;
 	if ((Z_TYPE_P(value) == IS_LONG || Z_TYPE_P(value) == IS_STRING)
@@ -811,10 +779,7 @@ static bool dc_write_backed_property(zend_object *obj, zend_property_info *pi,
 		if (type_ce && (type_ce->ce_flags & ZEND_ACC_ENUM)
 			&& type_ce->enum_backing_type != IS_UNDEF)
 		{
-			/* Delegate to Enum::from() for full parity with the polyfill —
-			 * raises TypeError on int-backed + string, ValueError on unknown
-			 * backing values, and coerces int → string for string-backed
-			 * enums (per Enum::from()'s param-parsing rules). */
+			/* Enum::from() for parity with polyfill: standard TypeError/ValueError, scalar coercion. */
 			ZVAL_UNDEF(&enum_holder);
 			zend_call_method_with_1_params(NULL, type_ce, NULL, "from",
 				&enum_holder, value);
@@ -828,11 +793,7 @@ static bool dc_write_backed_property(zend_object *obj, zend_property_info *pi,
 #endif
 
 #if PHP_VERSION_ID >= 80400
-	/* Fast path: NO_LAZY_INIT only matters when the object is a lazy ghost
-	 * or proxy with at least one uninitialized lazy property. Otherwise the
-	 * default write path produces identical results without paying for the
-	 * Reflection round-trip. zend_lazy_object_initialized is a header-resident
-	 * static inline, so it's free to call. */
+	/* Skip the Reflection round-trip when there's no lazy-init to skip. */
 	if (no_lazy_init && !zend_lazy_object_initialized(obj)) {
 		bool ok = dc_set_raw_value_without_lazy_init(obj, pi, name, value);
 #if PHP_VERSION_ID >= 80100
@@ -2953,26 +2914,30 @@ PHP_FUNCTION(deepclone_hydrate)
 {
 	zend_object *obj_arg = NULL;
 	zend_string *class_name = NULL;
-	HashTable *scoped_props = NULL;
-	HashTable *mangled_vars = NULL;
+	HashTable *vars = NULL;
 	zend_long flags = 0;
 
-	ZEND_PARSE_PARAMETERS_START(1, 4)
+	ZEND_PARSE_PARAMETERS_START(1, 3)
 		Z_PARAM_OBJ_OR_STR(obj_arg, class_name)
 		Z_PARAM_OPTIONAL
-		Z_PARAM_ARRAY_HT(scoped_props)
-		Z_PARAM_ARRAY_HT(mangled_vars)
+		Z_PARAM_ARRAY_HT(vars)
 		Z_PARAM_LONG(flags)
 	ZEND_PARSE_PARAMETERS_END();
 
 	if (UNEXPECTED(flags & ~(zend_long) DEEPCLONE_HYDRATE_FLAGS_MASK)) {
-		zend_value_error("deepclone_hydrate(): Argument #4 ($flags) contains unknown bits");
+		zend_value_error("deepclone_hydrate(): Argument #3 ($flags) contains unknown bits");
 		RETURN_THROWS();
 	}
 	if (UNEXPECTED((flags & DEEPCLONE_HYDRATE_CALL_HOOKS) && (flags & DEEPCLONE_HYDRATE_NO_LAZY_INIT))) {
-		zend_value_error("deepclone_hydrate(): Argument #4 ($flags) DEEPCLONE_HYDRATE_CALL_HOOKS and DEEPCLONE_HYDRATE_NO_LAZY_INIT are mutually exclusive");
+		zend_value_error("deepclone_hydrate(): Argument #3 ($flags) DEEPCLONE_HYDRATE_CALL_HOOKS and DEEPCLONE_HYDRATE_NO_LAZY_INIT are mutually exclusive");
 		RETURN_THROWS();
 	}
+
+	/* In MANGLED_VARS mode $vars is a flat mangled-key array (the shape
+	 * (array) $obj produces). Otherwise it's the scoped per-class shape. */
+	bool mangled_vars_mode = (flags & DEEPCLONE_HYDRATE_MANGLED_VARS) != 0;
+	HashTable *scoped_props = mangled_vars_mode ? NULL : vars;
+	HashTable *mangled_vars = mangled_vars_mode ? vars : NULL;
 
 	zval obj_zval;
 
@@ -3079,7 +3044,7 @@ PHP_FUNCTION(deepclone_hydrate)
 		zval *prop_val;
 		ZEND_HASH_FOREACH_STR_KEY_VAL(mangled_vars, prop_key, prop_val) {
 			if (UNEXPECTED(!prop_key)) {
-				zend_value_error("deepclone_hydrate(): Argument #3 ($mangled_vars) must have only string keys");
+				zend_value_error("deepclone_hydrate(): Argument #2 ($vars) in MANGLED_VARS mode must have only string keys");
 				if (scoped_owned) zval_ptr_dtor(&local_scoped);
 				zval_ptr_dtor(&obj_zval);
 				RETURN_THROWS();
@@ -3102,7 +3067,7 @@ PHP_FUNCTION(deepclone_hydrate)
 				/* Find second \0 separator */
 				const char *sep = memchr(key + 1, '\0', key_len - 1);
 				if (!sep || sep == key + 1) {
-					zend_value_error("deepclone_hydrate(): Argument #3 ($mangled_vars) contains an invalid mangled key");
+					zend_value_error("deepclone_hydrate(): Argument #2 ($vars) in MANGLED_VARS mode contains an invalid mangled key");
 					if (scoped_owned) zval_ptr_dtor(&local_scoped);
 					zval_ptr_dtor(&obj_zval);
 					RETURN_THROWS();
@@ -3112,7 +3077,7 @@ PHP_FUNCTION(deepclone_hydrate)
 
 				/* Reject embedded NUL in the property name portion */
 				if (UNEXPECTED(memchr(sep + 1, '\0', name_len) != NULL)) {
-					zend_value_error("deepclone_hydrate(): Argument #3 ($mangled_vars) contains an invalid mangled key");
+					zend_value_error("deepclone_hydrate(): Argument #2 ($vars) in MANGLED_VARS mode contains an invalid mangled key");
 					if (scoped_owned) zval_ptr_dtor(&local_scoped);
 					zval_ptr_dtor(&obj_zval);
 					RETURN_THROWS();
@@ -3156,7 +3121,7 @@ add_to_scope:
 				scope_bucket = zend_hash_update(scoped_props, scope_str, &new_arr);
 			}
 			if (UNEXPECTED(Z_TYPE_P(scope_bucket) != IS_ARRAY)) {
-				zend_value_error("deepclone_hydrate(): Argument #2 ($scoped_vars) value for scope \"%s\" must be of type array, %s given",
+				zend_value_error("deepclone_hydrate(): Argument #2 ($vars) value for scope \"%s\" must be of type array, %s given",
 					ZSTR_VAL(scope_str), zend_zval_value_name(scope_bucket));
 				if (real_name && real_name != prop_key) zend_string_release(real_name);
 				if (key_len > 2 && key[0] == '\0' && key[1] != '*') {
@@ -3197,14 +3162,22 @@ add_to_scope:
 	zval *scope_props;
 	ZEND_HASH_FOREACH_STR_KEY_VAL(scoped_props, scope_name, scope_props) {
 		if (UNEXPECTED(!scope_name)) {
-			zend_value_error("deepclone_hydrate(): Argument #2 ($scoped_vars) must have only string keys");
+			zend_value_error("deepclone_hydrate(): Argument #2 ($vars) must have only string keys");
 			if (scoped_owned) zval_ptr_dtor(&local_scoped);
 			zval_ptr_dtor(&obj_zval);
 			RETURN_THROWS();
 		}
 		if (UNEXPECTED(Z_TYPE_P(scope_props) != IS_ARRAY)) {
-			zend_value_error("deepclone_hydrate(): Argument #2 ($scoped_vars) must have only array values, %s given for key \"%s\"",
+			zend_value_error("deepclone_hydrate(): Argument #2 ($vars) must have only array values, %s given for key \"%s\"",
 				zend_zval_value_name(scope_props), ZSTR_VAL(scope_name));
+			if (scoped_owned) zval_ptr_dtor(&local_scoped);
+			zval_ptr_dtor(&obj_zval);
+			RETURN_THROWS();
+		}
+		/* Footgun: NUL-prefixed scope key almost certainly means a missing DEEPCLONE_HYDRATE_MANGLED_VARS flag. */
+		if (UNEXPECTED(ZSTR_VAL(scope_name)[0] == '\0')) {
+			zend_value_error("deepclone_hydrate(): Argument #2 ($vars) contains a NUL-prefixed key — "
+				"pass DEEPCLONE_HYDRATE_MANGLED_VARS in the $flags argument to interpret $vars as a flat mangled-key array");
 			if (scoped_owned) zval_ptr_dtor(&local_scoped);
 			zval_ptr_dtor(&obj_zval);
 			RETURN_THROWS();
@@ -3227,7 +3200,7 @@ add_to_scope:
 				p = p->parent;
 			}
 			if (UNEXPECTED(!scope_ce)) {
-				zend_value_error("deepclone_hydrate(): Argument #2 ($scoped_vars) scope \"%s\" is not a parent of \"%s\"",
+				zend_value_error("deepclone_hydrate(): Argument #2 ($vars) scope \"%s\" is not a parent of \"%s\"",
 					ZSTR_VAL(scope_name), ZSTR_VAL(obj_ce->name));
 				if (scoped_owned) zval_ptr_dtor(&local_scoped);
 				zval_ptr_dtor(&obj_zval);
@@ -3248,7 +3221,7 @@ add_to_scope:
 		zval *prop_val;
 		ZEND_HASH_FOREACH_STR_KEY_VAL(Z_ARRVAL_P(scope_props), prop_name, prop_val) {
 			if (UNEXPECTED(!prop_name)) {
-				zend_value_error("deepclone_hydrate(): Argument #2 ($scoped_vars) scope \"%s\" must have only string keys",
+				zend_value_error("deepclone_hydrate(): Argument #2 ($vars) scope \"%s\" must have only string keys",
 					ZSTR_VAL(scope_name));
 				EG(fake_scope) = old_scope;
 				if (scoped_owned) zval_ptr_dtor(&local_scoped);
@@ -3259,7 +3232,7 @@ add_to_scope:
 			/* "\0" key = internal state for ArrayObject/ArrayIterator/SplObjectStorage */
 			if (ZSTR_LEN(prop_name) == 1 && ZSTR_VAL(prop_name)[0] == '\0') {
 				if (UNEXPECTED(Z_TYPE_P(prop_val) != IS_ARRAY)) {
-					zend_value_error("deepclone_hydrate(): Argument #2 ($scoped_vars) scope \"%s\" special \"\\0\" value must be of type array, %s given",
+					zend_value_error("deepclone_hydrate(): Argument #2 ($vars) scope \"%s\" special \"\\0\" value must be of type array, %s given",
 						ZSTR_VAL(scope_name), zend_zval_value_name(prop_val));
 					EG(fake_scope) = old_scope;
 					if (scoped_owned) zval_ptr_dtor(&local_scoped);
@@ -3311,7 +3284,7 @@ add_to_scope:
 
 			if (obj_ce == zend_standard_class_def) {
 				if (UNEXPECTED(memchr(ZSTR_VAL(prop_name), '\0', ZSTR_LEN(prop_name)) != NULL)) {
-					zend_value_error("deepclone_hydrate(): Argument #2 ($scoped_vars) scope \"%s\" contains an invalid property name; "
+					zend_value_error("deepclone_hydrate(): Argument #2 ($vars) scope \"%s\" contains an invalid property name; "
 						"use bare property names in $scoped_vars, or pass mangled keys via $mangled_vars",
 						ZSTR_VAL(scope_name));
 					EG(fake_scope) = old_scope;
@@ -3343,7 +3316,7 @@ add_to_scope:
 				} else {
 					/* Fallback: dynamic property or unknown name — validate first */
 					if (UNEXPECTED(memchr(ZSTR_VAL(prop_name), '\0', ZSTR_LEN(prop_name)) != NULL)) {
-						zend_value_error("deepclone_hydrate(): Argument #2 ($scoped_vars) scope \"%s\" contains an invalid property name; "
+						zend_value_error("deepclone_hydrate(): Argument #2 ($vars) scope \"%s\" contains an invalid property name; "
 							"use bare property names in $scoped_vars, or pass mangled keys via $mangled_vars",
 							ZSTR_VAL(scope_name));
 						EG(fake_scope) = old_scope;

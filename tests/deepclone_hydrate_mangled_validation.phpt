@@ -10,7 +10,7 @@ class BadKeys {}
 function check_bad_key(string $key): bool
 {
     try {
-        deepclone_hydrate('BadKeys', [], [$key => 123]);
+        deepclone_hydrate('BadKeys', [$key => 123], DEEPCLONE_HYDRATE_MANGLED_VARS);
         return false;
     } catch (ValueError $e) {
         return str_contains($e->getMessage(), 'invalid mangled key');

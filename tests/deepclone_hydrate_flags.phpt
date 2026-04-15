@@ -22,12 +22,12 @@ $o = deepclone_hydrate(HookedBacking::class, [HookedBacking::class => ['x' => 7]
 var_dump($o->x === 7);
 
 // DEEPCLONE_HYDRATE_CALL_HOOKS → setValue: invoke hook
-$o = deepclone_hydrate(HookedBacking::class, [HookedBacking::class => ['x' => 7]], [], DEEPCLONE_HYDRATE_CALL_HOOKS);
+$o = deepclone_hydrate(HookedBacking::class, [HookedBacking::class => ['x' => 7]], DEEPCLONE_HYDRATE_CALL_HOOKS);
 var_dump($o->x === 70);
 
 // Unknown bit → ValueError
 try {
-    deepclone_hydrate(HookedBacking::class, [], [], 1 << 30);
+    deepclone_hydrate(HookedBacking::class, [], 1 << 30);
     var_dump(false);
 } catch (\ValueError $e) {
     var_dump(str_contains($e->getMessage(), 'unknown bits'));
@@ -35,7 +35,7 @@ try {
 
 // Mutually exclusive flags → ValueError
 try {
-    deepclone_hydrate(HookedBacking::class, [], [], DEEPCLONE_HYDRATE_CALL_HOOKS | DEEPCLONE_HYDRATE_NO_LAZY_INIT);
+    deepclone_hydrate(HookedBacking::class, [], DEEPCLONE_HYDRATE_CALL_HOOKS | DEEPCLONE_HYDRATE_NO_LAZY_INIT);
     var_dump(false);
 } catch (\ValueError $e) {
     var_dump(str_contains($e->getMessage(), 'mutually exclusive'));
@@ -66,7 +66,7 @@ $ghost = $rc->newLazyGhost(function (Lazy $o) use (&$initRan) {
     $o->a = 1;
     $o->b = 'init';
 });
-deepclone_hydrate($ghost, [Lazy::class => ['a' => 99, 'b' => 'hyd']], [], DEEPCLONE_HYDRATE_NO_LAZY_INIT);
+deepclone_hydrate($ghost, [Lazy::class => ['a' => 99, 'b' => 'hyd']], DEEPCLONE_HYDRATE_NO_LAZY_INIT);
 var_dump($initRan === 0);        // initializer did NOT run
 var_dump($ghost->a === 99);
 var_dump($ghost->b === 'hyd');
