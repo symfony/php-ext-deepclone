@@ -638,15 +638,11 @@ static zend_always_inline bool dc_class_allowed(HashTable *set, zend_string *nam
 
 static zend_always_inline bool dc_is_backed_declared_property(zend_property_info *pi)
 {
-	/* A "backed declared property" is a non-static, non-virtual property with
-	 * a real backing slot (offset >= ZEND_FIRST_PROPERTY_OFFSET). Hooked
-	 * non-virtual properties qualify (they have a real offset); virtual
-	 * properties and hook-metadata offsets do not. */
-	return pi
-		&& !(pi->flags & ZEND_ACC_STATIC)
-		&& !(pi->flags & ZEND_ACC_VIRTUAL)
-		&& pi->offset != ZEND_VIRTUAL_PROPERTY_OFFSET
-		&& !IS_HOOKED_PROPERTY_OFFSET(pi->offset);
+	/* Non-static, non-virtual property with a real backing slot. ZEND_ACC_VIRTUAL
+	 * already implies pi->offset == ZEND_VIRTUAL_PROPERTY_OFFSET, and
+	 * IS_HOOKED_PROPERTY_OFFSET() is only meaningful on offsets returned by
+	 * zend_get_property_offset() — not on the raw pi->offset. */
+	return pi && !(pi->flags & (ZEND_ACC_STATIC | ZEND_ACC_VIRTUAL));
 }
 
 static zend_always_inline bool dc_is_std_scope_property(zend_property_info *pi)
