@@ -56,15 +56,22 @@ properties — including private, protected, and readonly ones — without calli
 their constructor, faster than Reflection:
 
 ```php
-// Set private properties via scoped array (fastest path)
+// Scoped array — keyed by declaring class
 $user = deepclone_hydrate(User::class, [
     User::class => ['id' => 42, 'name' => 'Alice'],
     AbstractEntity::class => ['createdAt' => new \DateTimeImmutable()],
 ]);
 
-// Instantiate from class name with mangled keys (same format as (array) cast)
+// Flat bare-name array — ideal for hydrating from a flat row
+// (e.g. a PDO result), no scope grouping needed
 $user = deepclone_hydrate(User::class,
-    ['name' => 'Alice', 'email' => 'alice@example.com'],
+    ['id' => 42, 'name' => 'Alice', 'email' => 'alice@example.com'],
+    DEEPCLONE_HYDRATE_MANGLED_VARS,
+);
+
+// Mangled keys (same format as (array) $obj cast)
+$user = deepclone_hydrate(User::class,
+    ['name' => 'Alice', "\0User\0email" => 'alice@example.com'],
     DEEPCLONE_HYDRATE_MANGLED_VARS,
 );
 
@@ -86,12 +93,12 @@ function deepclone_hydrate(object|string $object_or_class, array $vars = [], int
 the list.
 
 `deepclone_hydrate()` accepts either an object to hydrate in place or a class
-name to instantiate without calling its constructor. PHP `&` references in
-`$vars` are preserved through the hydrate.
+name to instantiate without calling its constructor. By default, PHP `&`
+references in `$vars` are dropped on write; pass `DEEPCLONE_HYDRATE_PRESERVE_REFS`
+to keep them.
 
 By default, `$vars` is keyed by declaring class name; each value is an array
-of property names to values. This is the fastest path — direct slot writes,
-no key parsing.
+of property names to values:
 
 ```php
 $user = deepclone_hydrate(User::class, [
@@ -101,16 +108,29 @@ $user = deepclone_hydrate(User::class, [
 ```
 
 Pass `DEEPCLONE_HYDRATE_MANGLED_VARS` in `$flags` to interpret `$vars` as a
-flat mangled-key array (the same shape `(array) $object` produces):
-`"\0ClassName\0prop"` for private, `"\0*\0prop"` for protected, bare name
-for public/dynamic. Each key is resolved to its scope automatically.
+flat key array. Keys can be bare property names (auto-resolved to the
+declaring class, the ideal shape for hydrating from a PDO row), or
+mangled (`"\0ClassName\0prop"` for private, `"\0*\0prop"` for protected — the
+same shape `(array) $object` produces). The two forms can be mixed:
 
 ```php
+// Bare names — each is resolved to its declaring class automatically
+$user = deepclone_hydrate(User::class,
+    ['id' => 42, 'name' => 'Alice', 'email' => 'alice@example.com'],
+    DEEPCLONE_HYDRATE_MANGLED_VARS,
+);
+
+// Mangled keys, typical (array) cast shape
 $user = deepclone_hydrate(User::class,
     ['name' => 'Alice', "\0User\0email" => 'alice@example.com'],
     DEEPCLONE_HYDRATE_MANGLED_VARS,
 );
 ```
+
+Both the scoped shape and the flat-bare-name shape take a direct
+`properties_info` lookup per key followed by a direct slot write — there's
+no meaningful performance difference between the two, pick whichever
+representation your caller already has on hand.
 
 `$flags` selects the write semantics for declared-property assignments:
 
