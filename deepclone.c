@@ -147,6 +147,11 @@ static zend_always_inline zend_class_entry *dc_register_internal_class_with_flag
 # define DC_PROP_HAS_HOOKS(pi) (0)
 #endif
 
+/* Public flags for deepclone_hydrate()'s $flags parameter. Exported as
+ * PHP-level constants via deepclone.stub.php; values must match. */
+#define DEEPCLONE_HYDRATE_CALL_HOOKS    (1 << 0)
+#define DEEPCLONE_HYDRATE_FLAGS_MASK    (DEEPCLONE_HYDRATE_CALL_HOOKS)
+
 /* The stub-generated header relies on the compat shims above (specifically
  * zend_register_internal_class_with_flags on PHP < 8.4), so it has to be
  * included after this point. */
@@ -647,23 +652,36 @@ static zend_always_inline bool dc_is_std_scope_property(zend_property_info *pi)
 		&& !(pi->flags & (ZEND_ACC_PROTECTED_SET | ZEND_ACC_PRIVATE_SET));
 }
 
-/* Write a declared property, matching ReflectionProperty::setRawValue semantics:
- *  - Non-typed, non-hooked: direct slot write (fast path, dtor-reentrancy safe).
- *  - Typed non-hooked: zend_update_property_ex with the declaring class as
- *    fake scope — engine type-checks (coerces under non-strict).
- *  - Hooked non-virtual: invoke the set-hook trampoline. The trampoline's
- *    execute_data->func carries prop_info, so the recursion check inside
- *    zend_std_write_property (zend_is_in_hook / zend_should_call_hook) short-
- *    circuits to the direct backing write, bypassing the user set hook while
- *    still type-checking. This is exactly what ReflectionProperty::setRawValue
- *    does.
+/* Write a declared property. Default (flags == 0) matches
+ * ReflectionProperty::setRawValue: bypass set hooks, type-check, preserve
+ * readonly. Flags:
+ *  - DEEPCLONE_HYDRATE_CALL_HOOKS: setValue semantics — invoke set hooks.
+ *
+ * Dispatch:
+ *  - Non-typed, non-hooked: direct slot write (fast path, dtor-safe).
+ *  - Typed non-hooked: zend_update_property_ex (engine type-checks).
+ *  - Hooked non-virtual (default): invoke the set-hook trampoline. The
+ *    trampoline's execute_data->func carries prop_info, so the recursion
+ *    check inside zend_std_write_property short-circuits to the direct
+ *    backing write, bypassing the user set hook while still type-checking.
+ *  - Hooked non-virtual (CALL_HOOKS): zend_update_property_ex — hook invoked.
+ *
+ * Lazy objects: writes go through the engine's standard path, which triggers
+ * the lazy initializer on first access (matching ReflectionProperty::setValue
+ * / setRawValue semantics). Suppressing initialization requires
+ * ReflectionProperty::setRawValueWithoutLazyInitialization, which depends on
+ * non-public engine APIs (zend_lazy_object_decr_lazy_props /
+ * zend_lazy_object_realize) that aren't available to shared extensions.
+ *
  * Caller must have verified dc_is_backed_declared_property(pi). Returns false
  * if a TypeError (or any exception) was raised by the engine. */
 static bool dc_write_backed_property(zend_object *obj, zend_property_info *pi,
-	zend_string *name, zval *value)
+	zend_string *name, zval *value, zend_long flags)
 {
+	bool call_hooks = (flags & DEEPCLONE_HYDRATE_CALL_HOOKS) != 0;
+	zval *slot = OBJ_PROP(obj, pi->offset);
+
 	if (!ZEND_TYPE_IS_SET(pi->type) && !DC_PROP_HAS_HOOKS(pi)) {
-		zval *slot = OBJ_PROP(obj, pi->offset);
 		/* Move the old value out before running its destructor: a __destruct
 		 * on the old value can legitimately read (or reassign) this same slot.
 		 * Install the new value first so reentrant reads see a valid slot. */
@@ -671,17 +689,18 @@ static bool dc_write_backed_property(zend_object *obj, zend_property_info *pi,
 		ZVAL_COPY_VALUE(&old, slot);
 		ZVAL_COPY(slot, value);
 		zval_ptr_dtor(&old);
-		return true;
 	}
 #if PHP_VERSION_ID >= 80400
-	if (DC_PROP_HAS_HOOKS(pi) && pi->hooks[ZEND_PROPERTY_HOOK_SET]) {
+	else if (!call_hooks && DC_PROP_HAS_HOOKS(pi) && pi->hooks[ZEND_PROPERTY_HOOK_SET]) {
 		zend_function *trampoline = zend_get_property_hook_trampoline(
 			pi, ZEND_PROPERTY_HOOK_SET, name);
 		zend_call_known_instance_method_with_1_params(trampoline, obj, NULL, value);
-		return !EG(exception);
 	}
 #endif
-	zend_update_property_ex(pi->ce, obj, name, value);
+	else {
+		zend_update_property_ex(pi->ce, obj, name, value);
+	}
+
 	return !EG(exception);
 }
 
@@ -2642,11 +2661,9 @@ PHP_FUNCTION(deepclone_from_array)
 							ZSTR_VAL(scope_name), ZSTR_VAL(prop_name), obj_id);
 					}
 					if (dc_is_backed_declared_property(use_pi)) {
-						/* setRawValue-style write: direct slot for non-typed
-						 * non-hooked (fast path), engine path otherwise — the
-						 * engine type-checks, bypasses set hooks on hooked
-						 * non-virtual, and tracks refs/type-sources. */
-						bool ok = dc_write_backed_property(obj, use_pi, prop_name, &final_val);
+						/* deepclone_from_array always uses setRawValue semantics
+						 * (flags=0): payload-driven, same policy as unserialize(). */
+						bool ok = dc_write_backed_property(obj, use_pi, prop_name, &final_val, 0);
 						zval_ptr_dtor(&final_val);
 						if (UNEXPECTED(!ok)) {
 							EG(fake_scope) = old_scope;
@@ -2770,13 +2787,20 @@ PHP_FUNCTION(deepclone_hydrate)
 	zend_string *class_name = NULL;
 	HashTable *scoped_props = NULL;
 	HashTable *mangled_vars = NULL;
+	zend_long flags = 0;
 
-	ZEND_PARSE_PARAMETERS_START(1, 3)
+	ZEND_PARSE_PARAMETERS_START(1, 4)
 		Z_PARAM_OBJ_OR_STR(obj_arg, class_name)
 		Z_PARAM_OPTIONAL
 		Z_PARAM_ARRAY_HT(scoped_props)
 		Z_PARAM_ARRAY_HT(mangled_vars)
+		Z_PARAM_LONG(flags)
 	ZEND_PARSE_PARAMETERS_END();
+
+	if (UNEXPECTED(flags & ~(zend_long) DEEPCLONE_HYDRATE_FLAGS_MASK)) {
+		zend_value_error("deepclone_hydrate(): Argument #4 ($flags) contains unknown bits");
+		RETURN_THROWS();
+	}
 
 	zval obj_zval;
 
@@ -3137,7 +3161,7 @@ add_to_scope:
 					if (zv) pi = Z_PTR_P(zv);
 				}
 				if (dc_is_backed_declared_property(pi)) {
-					bool ok = dc_write_backed_property(obj, pi, prop_name, prop_val);
+					bool ok = dc_write_backed_property(obj, pi, prop_name, prop_val, flags);
 					if (UNEXPECTED(!ok)) {
 						EG(fake_scope) = old_scope;
 						if (scoped_owned) zval_ptr_dtor(&local_scoped);
@@ -3211,6 +3235,8 @@ PHP_MINIT_FUNCTION(deepclone)
 		register_class_DeepClone_NotInstantiableException(spl_ce_InvalidArgumentException);
 	dc_ce_class_not_found_exception =
 		register_class_DeepClone_ClassNotFoundException(spl_ce_InvalidArgumentException);
+
+	register_deepclone_symbols(module_number);
 
 	return SUCCESS;
 }

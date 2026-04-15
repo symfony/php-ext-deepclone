@@ -74,7 +74,7 @@ deepclone_hydrate($existingUser, ['User' => ['name' => 'Bob']]);
 ```php
 function deepclone_to_array(mixed $value, ?array $allowed_classes = null): array;
 function deepclone_from_array(array $data, ?array $allowed_classes = null): mixed;
-function deepclone_hydrate(object|string $object_or_class, array $scoped_vars = [], array $mangled_vars = []): object;
+function deepclone_hydrate(object|string $object_or_class, array $scoped_vars = [], array $mangled_vars = [], int $flags = 0): object;
 ```
 
 `$allowed_classes` restricts which classes may be serialized or deserialized
@@ -96,6 +96,23 @@ declaring class name, each value being an array of property names to values.
 (`"\0ClassName\0prop"` for private, `"\0*\0prop"` for protected, bare name
 for public/dynamic). It resolves each key to the correct scope automatically,
 which is handy when round-tripping with `(array)` casts.
+
+`$flags` selects the write semantics for declared-property assignments:
+
+| Flag                                   | Semantics                                  |
+|----------------------------------------|--------------------------------------------|
+| `0` (default)                          | `ReflectionProperty::setRawValue` — bypass set hooks, type-check, respect readonly |
+| `DEEPCLONE_HYDRATE_CALL_HOOKS`         | `ReflectionProperty::setValue` — invoke set hooks |
+
+`deepclone_from_array()` always uses the default setRawValue semantics,
+mirroring `unserialize()`.
+
+For lazy objects, writes go through the engine's standard path, so the
+lazy initializer fires on first access — same as `ReflectionProperty::setValue`
+or `setRawValue`. Suppressing the initializer requires
+`ReflectionProperty::setRawValueWithoutLazyInitialization`, which depends
+on engine helpers that aren't `ZEND_API`-exported and therefore aren't
+reachable from a shared extension.
 
 The special `"\0"` key sets the internal state of SPL classes. In
 `$scoped_vars` it goes inside a scope entry; in `$mangled_vars` it is a

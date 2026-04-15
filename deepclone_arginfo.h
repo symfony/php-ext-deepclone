@@ -1,5 +1,5 @@
 /* This is a generated file, edit deepclone.stub.php instead.
- * Stub hash: 6aeb61465f527b63ceb6109ecda8fbcb037879fc */
+ * Stub hash: c230b6f86caa038f9b54e91a1d5fff3b23ed0f2e */
 
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_deepclone_to_array, 0, 1, IS_ARRAY, 0)
 	ZEND_ARG_TYPE_INFO(0, value, IS_MIXED, 0)
@@ -15,6 +15,7 @@ ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_deepclone_hydrate, 0, 1, IS_OBJE
 	ZEND_ARG_TYPE_MASK(0, object_or_class, MAY_BE_OBJECT|MAY_BE_STRING, NULL)
 	ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, scoped_vars, IS_ARRAY, 0, "[]")
 	ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, mangled_vars, IS_ARRAY, 0, "[]")
+	ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, flags, IS_LONG, 0, "0")
 ZEND_END_ARG_INFO()
 
 ZEND_FUNCTION(deepclone_to_array);
@@ -27,6 +28,11 @@ static const zend_function_entry ext_functions[] = {
 	ZEND_FE(deepclone_hydrate, arginfo_deepclone_hydrate)
 	ZEND_FE_END
 };
+
+static void register_deepclone_symbols(int module_number)
+{
+	REGISTER_LONG_CONSTANT("DEEPCLONE_HYDRATE_CALL_HOOKS", DEEPCLONE_HYDRATE_CALL_HOOKS, CONST_PERSISTENT);
+}
 
 static zend_class_entry *register_class_DeepClone_NotInstantiableException(zend_class_entry *class_entry_InvalidArgumentException)
 {

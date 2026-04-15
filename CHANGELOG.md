@@ -5,6 +5,26 @@ All notable changes to this extension will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `deepclone_hydrate(..., int $flags = 0)` — new optional parameter to
+  choose the write semantics for declared-property assignments:
+  - `DEEPCLONE_HYDRATE_CALL_HOOKS` — `ReflectionProperty::setValue`
+    semantics: invoke user-defined set hooks on hooked properties.
+  - Default (0) — `setRawValue` semantics (bypass set hooks, type-check).
+  - Unknown bits are rejected with `ValueError`.
+  - Lazy-object semantics: writes go through the engine's standard path,
+    so the lazy initializer fires on first access (matching `setValue` /
+    `setRawValue`). Suppressing the initializer requires
+    `ReflectionProperty::setRawValueWithoutLazyInitialization`, whose
+    backing helpers (`zend_lazy_object_decr_lazy_props`,
+    `zend_lazy_object_realize`) are not exported as `ZEND_API` and so
+    aren't available to a shared extension.
+- `deepclone_from_array()` always uses the default setRawValue semantics
+  (same policy as `unserialize()` — payload-driven).
+
 ## [0.2.0] - 2026-04-14
 
 ### Added
