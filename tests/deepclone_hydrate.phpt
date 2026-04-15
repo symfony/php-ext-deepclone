@@ -246,7 +246,7 @@ try {
 
 // Bad type
 try {
-    deepclone_hydrate(123, []);
+    deepclone_hydrate([], []);
 } catch (\TypeError $e) {
     var_dump(str_contains($e->getMessage(), 'must be of type object|string'));
 }
