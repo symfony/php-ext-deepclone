@@ -285,7 +285,7 @@ try {
 try {
     deepclone_hydrate('stdClass', ['stdClass' => ["\0stdClass\0x" => 'val']]);
 } catch (\ValueError $e) {
-    var_dump(str_contains($e->getMessage(), 'mangled key'));
+    var_dump(str_contains($e->getMessage(), 'DEEPCLONE_HYDRATE_MANGLED_VARS'));
 }
 
 // Interface as scope → ValueError
