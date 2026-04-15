@@ -3101,6 +3101,25 @@ PHP_FUNCTION(deepclone_hydrate)
 				/* Bare name — find declaring class */
 				real_name = prop_key;
 				zend_property_info *pi = zend_hash_find_ptr(&obj_ce->properties_info, real_name);
+
+				/* Fast path: the resolved property has a real backing slot (typed or
+				 * non-hooked). Write directly via dc_write_backed_property and skip the
+				 * scoped_props accumulation + second-pass write. This is the hot case
+				 * for Doctrine-style `fetchAll()` flows where the row is a flat dict
+				 * of declared field names. */
+				if (pi && !(pi->flags & ZEND_ACC_STATIC) && dc_is_backed_declared_property(pi)) {
+					zval *v = prop_val;
+					if (!(flags & DEEPCLONE_HYDRATE_PRESERVE_REFS)) {
+						ZVAL_DEREF(v);
+					}
+					if (UNEXPECTED(!dc_write_backed_property(Z_OBJ(obj_zval), pi, real_name, v, flags))) {
+						if (scoped_owned) zval_ptr_dtor(&local_scoped);
+						zval_ptr_dtor(&obj_zval);
+						RETURN_THROWS();
+					}
+					continue;
+				}
+
 				if (pi && !(pi->flags & ZEND_ACC_STATIC)) {
 					scope_str = pi->ce->name;
 					/* For private-set properties, use the declaring class as write scope */
