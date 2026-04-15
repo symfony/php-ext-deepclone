@@ -3285,7 +3285,7 @@ add_to_scope:
 			if (obj_ce == zend_standard_class_def) {
 				if (UNEXPECTED(memchr(ZSTR_VAL(prop_name), '\0', ZSTR_LEN(prop_name)) != NULL)) {
 					zend_value_error("deepclone_hydrate(): Argument #2 ($vars) scope \"%s\" contains an invalid property name; "
-						"use bare property names in $scoped_vars, or pass mangled keys via $mangled_vars",
+						"use bare property names in scoped mode, or pass DEEPCLONE_HYDRATE_MANGLED_VARS in $flags",
 						ZSTR_VAL(scope_name));
 					EG(fake_scope) = old_scope;
 					if (scoped_owned) zval_ptr_dtor(&local_scoped);
@@ -3317,7 +3317,7 @@ add_to_scope:
 					/* Fallback: dynamic property or unknown name — validate first */
 					if (UNEXPECTED(memchr(ZSTR_VAL(prop_name), '\0', ZSTR_LEN(prop_name)) != NULL)) {
 						zend_value_error("deepclone_hydrate(): Argument #2 ($vars) scope \"%s\" contains an invalid property name; "
-							"use bare property names in $scoped_vars, or pass mangled keys via $mangled_vars",
+							"use bare property names in scoped mode, or pass DEEPCLONE_HYDRATE_MANGLED_VARS in $flags",
 							ZSTR_VAL(scope_name));
 						EG(fake_scope) = old_scope;
 						if (scoped_owned) zval_ptr_dtor(&local_scoped);
