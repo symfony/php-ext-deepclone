@@ -17,19 +17,19 @@ class TypedReadonly
 
 // A. Strict type mismatch → TypeError
 try {
-    deepclone_hydrate(TypedInt::class, [TypedInt::class => ['x' => 'hello']]);
+    deepclone_hydrate(TypedInt::class, ['x' => 'hello']);
     echo "A: NO THROW\n";
 } catch (\TypeError $e) {
     var_dump(str_contains($e->getMessage(), 'type int'));
 }
 
 // B. Coercible scalar → coerced to int (non-strict default)
-$o = deepclone_hydrate(TypedInt::class, [TypedInt::class => ['x' => '42']]);
+$o = deepclone_hydrate(TypedInt::class, ['x' => '42']);
 var_dump($o->x === 42);
 
 // C. Readonly + wrong type → TypeError
 try {
-    deepclone_hydrate(TypedReadonly::class, [TypedReadonly::class => ['v' => 'nope']]);
+    deepclone_hydrate(TypedReadonly::class, ['v' => 'nope']);
     echo "C: NO THROW\n";
 } catch (\TypeError $e) {
     var_dump(str_contains($e->getMessage(), 'type int'));

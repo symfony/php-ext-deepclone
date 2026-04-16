@@ -21,7 +21,7 @@ class HookedProps
     }
 }
 
-$hydrated = deepclone_hydrate('HookedProps', ['HookedProps' => ['x' => 5]]);
+$hydrated = deepclone_hydrate('HookedProps', ['x' => 5]);
 var_dump($hydrated->x === 6);
 
 $fromArray = deepclone_from_array([
@@ -46,7 +46,7 @@ class HookedBackingProps
 
 // Non-virtual hooked property: hydrate writes the backing slot directly,
 // bypassing the set hook (matches ReflectionProperty::setRawValue).
-$bypass = deepclone_hydrate('HookedBackingProps', ['HookedBackingProps' => ['x' => 7]]);
+$bypass = deepclone_hydrate('HookedBackingProps', ['x' => 7]);
 var_dump($bypass->x === 7);
 
 $bypassFromArray = deepclone_from_array([

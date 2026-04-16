@@ -23,22 +23,22 @@ class WithEnum
 
 // String → string-backed enum
 $o = new WithEnum();
-$o = deepclone_hydrate($o, [WithEnum::class => ['s' => 'S']]);
+$o = deepclone_hydrate($o, ['s' => 'S']);
 var_dump($o->s === Suit::Spades);
 
 // Int → int-backed enum
 $o = new WithEnum();
-$o = deepclone_hydrate($o, [WithEnum::class => ['n' => 2]]);
+$o = deepclone_hydrate($o, ['n' => 2]);
 var_dump($o->n === Size::Large);
 
 // Nullable enum + null → stored as null (no cast, unset rule doesn't fire either)
 $o = new WithEnum();
-$o = deepclone_hydrate($o, [WithEnum::class => ['ns' => null]]);
+$o = deepclone_hydrate($o, ['ns' => null]);
 var_dump($o->ns === null);
 
 // Nullable enum + matching scalar → cast
 $o = new WithEnum();
-$o = deepclone_hydrate($o, [WithEnum::class => ['ns' => 'S']]);
+$o = deepclone_hydrate($o, ['ns' => 'S']);
 var_dump($o->ns === Suit::Spades);
 
 // Cross-type scalar (int → string-backed enum): Enum::from() coerces the
@@ -46,7 +46,7 @@ var_dump($o->ns === Suit::Spades);
 // ValueError. Same path the polyfill takes via Enum::from($value).
 $o = new WithEnum();
 try {
-    deepclone_hydrate($o, [WithEnum::class => ['s' => 5]]);
+    deepclone_hydrate($o, ['s' => 5]);
     var_dump(false);
 } catch (\ValueError $e) {
     var_dump(str_contains($e->getMessage(), 'not a valid backing value for enum'));
@@ -56,7 +56,7 @@ try {
 // valid backing value for enum Suit").
 $o = new WithEnum();
 try {
-    deepclone_hydrate($o, [WithEnum::class => ['s' => 'X']]);
+    deepclone_hydrate($o, ['s' => 'X']);
     var_dump(false);
 } catch (\ValueError $e) {
     var_dump(str_contains($e->getMessage(), 'not a valid backing value for enum'));
@@ -65,7 +65,7 @@ try {
 // Non-backed enum: no cast applied, engine TypeError on scalar
 $o = new WithEnum();
 try {
-    deepclone_hydrate($o, [WithEnum::class => ['p' => 'Alpha']]);
+    deepclone_hydrate($o, ['p' => 'Alpha']);
     var_dump(false);
 } catch (\TypeError $e) {
     var_dump(str_contains($e->getMessage(), 'Plain'));
@@ -73,12 +73,12 @@ try {
 
 // Passing the enum case directly still works (no cast needed)
 $o = new WithEnum();
-$o = deepclone_hydrate($o, [WithEnum::class => ['s' => Suit::Spades]]);
+$o = deepclone_hydrate($o, ['s' => Suit::Spades]);
 var_dump($o->s === Suit::Spades);
 
 // CALL_HOOKS gate is per-prop: non-hooked enum-typed props still get cast.
 $o = new WithEnum();
-$o = deepclone_hydrate($o, [WithEnum::class => ['s' => 'S']], DEEPCLONE_HYDRATE_CALL_HOOKS);
+$o = deepclone_hydrate($o, ['s' => 'S'], DEEPCLONE_HYDRATE_CALL_HOOKS);
 var_dump($o->s === Suit::Spades);
 
 // Hooked enum prop under CALL_HOOKS: the cast decision is property-type
@@ -99,7 +99,7 @@ if (PHP_VERSION_ID >= 80400) {
         }
     }');
     $o = new WithHookedEnumWider();
-    $o = deepclone_hydrate($o, [WithHookedEnumWider::class => ['s' => 'S']], DEEPCLONE_HYDRATE_CALL_HOOKS);
+    $o = deepclone_hydrate($o, ['s' => 'S'], DEEPCLONE_HYDRATE_CALL_HOOKS);
     var_dump($o->s === Suit::Spades);
     var_dump(WithHookedEnumWider::$lastRaw === null);
 
@@ -109,7 +109,7 @@ if (PHP_VERSION_ID >= 80400) {
         }
     }');
     $o = new WithHookedEnumStrict();
-    $o = deepclone_hydrate($o, [WithHookedEnumStrict::class => ['s' => 'S']], DEEPCLONE_HYDRATE_CALL_HOOKS);
+    $o = deepclone_hydrate($o, ['s' => 'S'], DEEPCLONE_HYDRATE_CALL_HOOKS);
     var_dump($o->s === Suit::Spades);
 } else {
     var_dump(true);

@@ -14,7 +14,7 @@ class Typed
 
 // null into non-nullable typed → slot becomes uninitialized
 $o = new Typed();
-$o = deepclone_hydrate($o, [Typed::class => ['x' => null]]);
+$o = deepclone_hydrate($o, ['x' => null]);
 var_dump((new ReflectionProperty(Typed::class, 'x'))->isInitialized($o));
 
 // Reading an uninitialized typed prop throws the standard engine error
@@ -27,18 +27,18 @@ try {
 
 // null into nullable → stored as null
 $o = new Typed();
-$o = deepclone_hydrate($o, [Typed::class => ['y' => null]]);
+$o = deepclone_hydrate($o, ['y' => null]);
 var_dump($o->y === null);
 
 // null into mixed → stored as null
 $o = new Typed();
-$o = deepclone_hydrate($o, [Typed::class => ['m' => null]]);
+$o = deepclone_hydrate($o, ['m' => null]);
 var_dump($o->m === null);
 
 // CALL_HOOKS is per-prop: a non-hooked typed prop still gets unset, even
 // when the flag is set (no set hook on this property to defer to).
 $o = new Typed();
-$o = deepclone_hydrate($o, [Typed::class => ['x' => null]], DEEPCLONE_HYDRATE_CALL_HOOKS);
+$o = deepclone_hydrate($o, ['x' => null], DEEPCLONE_HYDRATE_CALL_HOOKS);
 var_dump((new ReflectionProperty(Typed::class, 'x'))->isInitialized($o));
 
 echo "Done\n";

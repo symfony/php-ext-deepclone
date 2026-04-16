@@ -56,27 +56,23 @@ properties — including private, protected, and readonly ones — without calli
 their constructor, faster than Reflection:
 
 ```php
-// Scoped array — keyed by declaring class
+// Flat bare-name array — ideal for hydrating from a flat row
+// (e.g. a PDO result).
 $user = deepclone_hydrate(User::class, [
-    User::class => ['id' => 42, 'name' => 'Alice'],
-    AbstractEntity::class => ['createdAt' => new \DateTimeImmutable()],
+    'id' => 42,
+    'name' => 'Alice',
+    'email' => 'alice@example.com',
 ]);
 
-// Flat bare-name array — ideal for hydrating from a flat row
-// (e.g. a PDO result), no scope grouping needed
-$user = deepclone_hydrate(User::class,
-    ['id' => 42, 'name' => 'Alice', 'email' => 'alice@example.com'],
-    DEEPCLONE_HYDRATE_MANGLED_VARS,
-);
-
-// Mangled keys (same format as (array) $obj cast)
-$user = deepclone_hydrate(User::class,
-    ['name' => 'Alice', "\0User\0email" => 'alice@example.com'],
-    DEEPCLONE_HYDRATE_MANGLED_VARS,
-);
+// Mangled keys for parent-declared private properties — same format as
+// (array) $obj cast produces.
+$user = deepclone_hydrate(User::class, [
+    'name' => 'Alice',
+    "\0AbstractEntity\0createdAt" => new \DateTimeImmutable(),
+]);
 
 // Hydrate an existing object
-deepclone_hydrate($existingUser, ['User' => ['name' => 'Bob']]);
+deepclone_hydrate($existingUser, ['name' => 'Bob']);
 ```
 
 ## API
@@ -97,40 +93,32 @@ name to instantiate without calling its constructor. By default, PHP `&`
 references in `$vars` are dropped on write; pass `DEEPCLONE_HYDRATE_PRESERVE_REFS`
 to keep them.
 
-By default, `$vars` is keyed by declaring class name; each value is an array
-of property names to values:
+`$vars` is a flat array keyed by property name — the exact shape
+`(array) $obj` produces:
+
+| key shape                   | target                                                    |
+|-----------------------------|-----------------------------------------------------------|
+| `"propName"`                | public, protected (any declaring class), or private declared on the object's own class |
+| `"\0*\0propName"`           | protected (the declaring class is resolved via the object) |
+| `"\0ClassName\0propName"`   | private declared on `ClassName` — must be the object's own class or a parent |
+| `"\0"`                      | SPL internal state (SplObjectStorage / ArrayObject / ArrayIterator) |
+
+Each key triggers one `properties_info` hash lookup followed by a direct
+slot write.
 
 ```php
 $user = deepclone_hydrate(User::class, [
-    User::class => ['id' => 42, 'name' => 'Alice'],
-    AbstractEntity::class => ['createdAt' => new \DateTimeImmutable()],
+    'id' => 42,                             // bare — public or own-private
+    'name' => 'Alice',
+    "\0*\0createdAt" => new \DateTimeImmutable(),    // protected
+    "\0AbstractEntity\0metadata" => [...],           // parent-private
 ]);
 ```
 
-Pass `DEEPCLONE_HYDRATE_MANGLED_VARS` in `$flags` to interpret `$vars` as a
-flat key array. Keys can be bare property names (auto-resolved to the
-declaring class, the ideal shape for hydrating from a PDO row), or
-mangled (`"\0ClassName\0prop"` for private, `"\0*\0prop"` for protected — the
-same shape `(array) $object` produces). The two forms can be mixed:
-
-```php
-// Bare names — each is resolved to its declaring class automatically
-$user = deepclone_hydrate(User::class,
-    ['id' => 42, 'name' => 'Alice', 'email' => 'alice@example.com'],
-    DEEPCLONE_HYDRATE_MANGLED_VARS,
-);
-
-// Mangled keys, typical (array) cast shape
-$user = deepclone_hydrate(User::class,
-    ['name' => 'Alice', "\0User\0email" => 'alice@example.com'],
-    DEEPCLONE_HYDRATE_MANGLED_VARS,
-);
-```
-
-Both the scoped shape and the flat-bare-name shape take a direct
-`properties_info` lookup per key followed by a direct slot write — there's
-no meaningful performance difference between the two, pick whichever
-representation your caller already has on hand.
+Bare names are enough for every public, protected, or most-derived-private
+property. Parent-declared private properties need the explicit
+`"\0ClassName\0prop"` mangled form (the engine keys them that way in the
+child's `properties_info`).
 
 `$flags` selects the write semantics for declared-property assignments:
 
@@ -139,11 +127,10 @@ representation your caller already has on hand.
 | `0` (default)                          | `ReflectionProperty::setRawValue` — bypass set hooks, type-check, respect readonly |
 | `DEEPCLONE_HYDRATE_CALL_HOOKS`         | `ReflectionProperty::setValue` — invoke set hooks |
 | `DEEPCLONE_HYDRATE_NO_LAZY_INIT`       | `ReflectionProperty::setRawValueWithoutLazyInitialization` — skip the lazy initializer; realize the object when the last lazy property is set |
-| `DEEPCLONE_HYDRATE_MANGLED_VARS`       | interpret `$vars` as a flat mangled-key array (above) |
 | `DEEPCLONE_HYDRATE_PRESERVE_REFS`      | preserve PHP `&` references from `$vars` onto the target property slots; by default, references are dropped (dereferenced) on write |
 
 `DEEPCLONE_HYDRATE_CALL_HOOKS` and `DEEPCLONE_HYDRATE_NO_LAZY_INIT` are
-mutually exclusive; `MANGLED_VARS` and `PRESERVE_REFS` compose with either.
+mutually exclusive; `PRESERVE_REFS` composes with either.
 `deepclone_from_array()` always uses the default setRawValue semantics,
 mirroring `unserialize()`.
 
@@ -185,24 +172,18 @@ strict-type errors. They run under every mode unless noted:
   enum-typed properties accordingly receive the enum case, not the
   raw scalar.
 
-The special `"\0"` key sets the internal state of SPL classes. In scoped
-mode it goes inside a scope entry; in `MANGLED_VARS` mode it is a flat key:
+The special `"\0"` key sets the internal state of SPL classes:
 
 ```php
-// Scoped mode:
-$ao = deepclone_hydrate('ArrayObject', ['ArrayObject' => ["\0" => [['x' => 1]]]]);
+// ArrayObject / ArrayIterator — ["\0" => [$array, $flags?, $iteratorClass?]]
+$ao = deepclone_hydrate('ArrayObject', [
+    "\0" => [['x' => 1, 'y' => 2], ArrayObject::ARRAY_AS_PROPS],
+]);
 
-// MANGLED_VARS mode:
-$ao = deepclone_hydrate('ArrayObject',
-    ["\0" => [['x' => 1], ArrayObject::ARRAY_AS_PROPS]],
-    DEEPCLONE_HYDRATE_MANGLED_VARS,
-);
-
-// SplObjectStorage: "\0" => [$obj1, $info1, $obj2, $info2, ...]
-$s = deepclone_hydrate('SplObjectStorage',
-    ["\0" => [$obj, 'metadata']],
-    DEEPCLONE_HYDRATE_MANGLED_VARS,
-);
+// SplObjectStorage — ["\0" => [$obj1, $info1, $obj2, $info2, ...]]
+$s = deepclone_hydrate('SplObjectStorage', [
+    "\0" => [$obj, 'metadata'],
+]);
 ```
 
 ## What it preserves

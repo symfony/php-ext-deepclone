@@ -17,11 +17,11 @@ class PrivShadowB extends PrivShadowA
     public function getChild(): string { return $this->x; }
 }
 
-// 1) Per-scope hydrate writes to distinct slots.
+// 1) Both slots targeted in one call via mangled keys.
 $b = new PrivShadowB();
 deepclone_hydrate($b, [
-    PrivShadowA::class => ['x' => 'A_written'],
-    PrivShadowB::class => ['x' => 'B_written'],
+    "\0PrivShadowA\0x" => 'A_written',
+    "\0PrivShadowB\0x" => 'B_written',
 ]);
 var_dump($b->get() === 'A_written');
 var_dump($b->getChild() === 'B_written');
@@ -37,15 +37,15 @@ $clone = deepclone_from_array(deepclone_to_array($orig));
 var_dump($clone->get() === 'parent_val');
 var_dump($clone->getChild() === 'child_val');
 
-// 3) Bare name in $mangled_vars targets the most-derived private slot.
+// 3) Bare name targets the most-derived private slot.
 $b2 = new PrivShadowB();
-deepclone_hydrate($b2, ['x' => 'bare_val'], DEEPCLONE_HYDRATE_MANGLED_VARS);
+deepclone_hydrate($b2, ['x' => 'bare_val']);
 var_dump($b2->get() === 'a_init');         // parent untouched
 var_dump($b2->getChild() === 'bare_val');  // child written
 
 // 4) Explicit mangled key targets the parent's private slot.
 $b3 = new PrivShadowB();
-deepclone_hydrate($b3, ["\0PrivShadowA\0x" => 'parent_targeted'], DEEPCLONE_HYDRATE_MANGLED_VARS);
+deepclone_hydrate($b3, ["\0PrivShadowA\0x" => 'parent_targeted']);
 var_dump($b3->get() === 'parent_targeted');
 var_dump($b3->getChild() === 'b_init');
 

@@ -42,7 +42,7 @@ $new->back = $host;
 // Hydrate $host with slot = $new. The assignment frees the old object,
 // whose __destruct reads $host->slot. That read must observe $new, not
 // a freed zval.
-deepclone_hydrate($host, [Host::class => ['slot' => $new]]);
+deepclone_hydrate($host, ['slot' => $new]);
 
 var_dump($host->slot->tag === 'new');
 var_dump(ReadsSlotOnDtor::$observed === 'new');

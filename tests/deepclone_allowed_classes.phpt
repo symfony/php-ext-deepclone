@@ -94,9 +94,29 @@ var_dump($c->x === 1);
 $c = deepclone_from_array(['value' => 42], []);
 var_dump($c === 42);
 
+// ── from_array: allowed child carries inherited parent-declared private
+// state even when the parent isn't listed in $allowedClasses. The scope
+// check on "properties" entries (is-a-parent-of obj->ce) is the security
+// boundary; allowed_classes is for instantiation. ──
+class AllowedParent { private string $secret = ''; public function getSecret(): string { return $this->secret; } }
+class AllowedChild extends AllowedParent { public string $pub = ''; }
+
+$c = new AllowedChild();
+(function () { $this->secret = 'inherited'; })->bindTo($c, AllowedParent::class)();
+$c->pub = 'visible';
+
+$d = deepclone_to_array($c, ['AllowedChild']);
+$r = deepclone_from_array($d, ['AllowedChild']);
+var_dump($r instanceof AllowedChild);
+var_dump($r->getSecret() === 'inherited');
+var_dump($r->pub === 'visible');
+
 echo "Done\n";
 ?>
 --EXPECT--
+bool(true)
+bool(true)
+bool(true)
 bool(true)
 bool(true)
 bool(true)

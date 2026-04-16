@@ -5,6 +5,74 @@ All notable changes to this extension will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-04-15
+
+### BC Break
+
+- `deepclone_hydrate()` now interprets `$vars` exclusively as a flat
+  mangled-key array (the shape `(array) $obj` produces). The per-class
+  scoped shape (`[$class => ['prop' => $val]]`) is no longer supported —
+  callers passing the old shape will hit the `"invalid mangled key"` /
+  `"not a parent"` errors on NUL-prefixed keys, or silently create a
+  dynamic property named after the class on non-NUL keys. Migrate by
+  flattening: for each scope entry, use bare names for public / protected
+  / most-derived-private, and `"\0ScopeClass\0prop"` for parent-private
+  props. Motivation: the two shapes were functionally equivalent (same
+  resolution path, same slot writes), and keeping both required an
+  intermediate scoped_props HashTable + a double-pass write. Dropping
+  scoped mode simplifies the dispatcher into a single key-parse + write
+  loop, and removes ~200 lines of C.
+- `DEEPCLONE_HYDRATE_MANGLED_VARS` constant removed — flat mangled is
+  now the only mode, so the flag is redundant. Callers who were passing
+  the flag can simply drop it.
+- `DEEPCLONE_HYDRATE_PRESERVE_REFS` flag value changed from `1 << 3` to
+  `1 << 2` (filling the slot vacated by `DEEPCLONE_HYDRATE_MANGLED_VARS`).
+  Symbolic references via the constant name are unaffected; anyone using
+  the raw integer value `4` now gets `PRESERVE_REFS` instead of the old
+  `MANGLED_VARS` — in practice both are the flags real callers pass, so
+  the arithmetic happens to line up.
+
+### Fixed
+
+- `deepclone_hydrate()` rejects the SPL-internal-state `"\0"` key on
+  objects that don't support it (anything other than `SplObjectStorage`,
+  `ArrayObject`, `ArrayIterator`) with a `ValueError`. Previously the
+  value silently landed in `obj->properties` as a NUL-named dynamic
+  property.
+- `deepclone_hydrate()` rejects malformed SPL `"\0"` payloads: a
+  non-even-count pair stream for `SplObjectStorage` and a payload with
+  more than 3 ctor args for `ArrayObject` / `ArrayIterator`. Both were
+  previously tolerated silently (odd tail dropped; excess args truncated).
+- `deepclone_hydrate()` no longer direct-writes `IS_PROP_UNINIT` to a
+  lazy object's slot via the `null` → uninitialized shortcut. The
+  shortcut is now gated on `zend_lazy_object_initialized(obj)`, so
+  `DEEPCLONE_HYDRATE_NO_LAZY_INIT` + lazy objects fall through to the
+  Reflection-based path instead of bypassing the lazy-props bookkeeping.
+- `deepclone_from_array()` cross-validates `objectMeta` wakeup flags
+  against `states` entries: each state entry must match the sign
+  advertised in `objectMeta[id][1]` (positive → `__wakeup`, negative →
+  `__unserialize`), and any id flagged for state replay without a
+  matching entry is rejected. Closes a validation hole where payloads
+  with impossible meta like `[0, 999]` or `[0, -123]` were accepted.
+- `deepclone_from_array()` routes writes to undeclared property names
+  on non-stdClass objects through `zend_update_property_ex()` instead
+  of `zend_std_write_property()`, respecting overridden `write_property`
+  handlers on internal classes and extensions. Matches the
+  `deepclone_hydrate()` path.
+- `deepclone_from_array()` throws `ValueError` on out-of-range object
+  ids in `"properties"` entries (previously silently skipped).
+
+### Changed
+
+- `deepclone_from_array()` object-creation loop drops the pointer-scan
+  over `class_names[]` that recovered the class id per object. A
+  per-object `uint32_t class_id` is stored directly from the
+  `objectMeta` parse, turning an O(N × K) step into O(N) on payloads
+  with many objects across many classes.
+- `deepclone_hydrate()` caches the `offsetSet` method lookup across
+  iterations on `SplObjectStorage` `"\0"` payloads (was re-resolved
+  by name on every entry).
+
 ## [0.4.0] - 2026-04-15
 
 ### BC Break

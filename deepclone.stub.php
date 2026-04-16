@@ -25,12 +25,6 @@ namespace {
 
     /**
      * @var int
-     * @cvalue DEEPCLONE_HYDRATE_MANGLED_VARS
-     */
-    const DEEPCLONE_HYDRATE_MANGLED_VARS = UNKNOWN;
-
-    /**
-     * @var int
      * @cvalue DEEPCLONE_HYDRATE_PRESERVE_REFS
      */
     const DEEPCLONE_HYDRATE_PRESERVE_REFS = UNKNOWN;
