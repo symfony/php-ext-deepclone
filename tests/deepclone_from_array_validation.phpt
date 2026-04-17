@@ -23,6 +23,7 @@ check('classes wrong type',  ['classes' => null, 'objectMeta' => 0, 'prepared' =
 check('classes int entry',   ['classes' => [42], 'objectMeta' => 0, 'prepared' => 0]);
 check('objectMeta wrong type', ['classes' => 'stdClass', 'objectMeta' => 'foo', 'prepared' => 0]);
 check('objectMeta count negative', ['classes' => 'stdClass', 'objectMeta' => -1, 'prepared' => 0]);
+check('objectMeta count too large', ['classes' => 'stdClass', 'objectMeta' => 0x100001, 'prepared' => 0]);
 check('objectMeta needs class but classes empty', ['classes' => '', 'objectMeta' => 1, 'prepared' => 0]);
 check('cidx out of range',   ['classes' => 'stdClass', 'objectMeta' => [[5, 0]], 'prepared' => 0]);
 check('meta wrong shape',    ['classes' => 'stdClass', 'objectMeta' => [['x','y']], 'prepared' => 0]);
@@ -63,6 +64,7 @@ classes wrong type: ValueError: deepclone_from_array(): Argument #1 ($data) "cla
 classes int entry: ValueError: deepclone_from_array(): Argument #1 ($data) "classes" entries must be of type string, %s given
 objectMeta wrong type: ValueError: deepclone_from_array(): Argument #1 ($data) "objectMeta" must be of type int|array, %s given
 objectMeta count negative: ValueError: deepclone_from_array(): Argument #1 ($data) "objectMeta" count must be non-negative, -1 given
+objectMeta count too large: ValueError: deepclone_from_array(): Argument #1 ($data) "objectMeta" count out of range: 1048577
 objectMeta needs class but classes empty: ValueError: deepclone_from_array(): Argument #1 ($data) "objectMeta" references class index 0 but "classes" is empty
 cidx out of range: ValueError: deepclone_from_array(): Argument #1 ($data) "objectMeta" entry 0 has out-of-range class index 5
 meta wrong shape: ValueError: deepclone_from_array(): Argument #1 ($data) "objectMeta" entry 0 must be [int, int]
