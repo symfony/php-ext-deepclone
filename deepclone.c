@@ -1050,10 +1050,11 @@ static void dc_copy_value(dc_ctx *ctx, zval *src, zval *dst, zval *mask_dst)
 	ctx->is_static = 0;
 	{
 		uint32_t handle = Z_OBJ_HANDLE_P(src);
-		/* Skip pool lookup for refcount==1 objects without __serialize */
-		zval *pooled = (Z_REFCOUNT_P(src) == 1 && Z_OBJCE_P(src)->__serialize == NULL)
-			? NULL
-			: zend_hash_index_find(&ctx->object_pool, handle);
+		/* Always do the pool lookup — an object with refcount==1 can still be
+		 * reached twice if a SHARED parent array is walked from multiple paths.
+		 * The earlier "skip on refcount==1" optimization tripped add_new() on
+		 * the second visit, since pool state persists across walks. */
+		zval *pooled = zend_hash_index_find(&ctx->object_pool, handle);
 		if (UNEXPECTED(pooled != NULL)) {
 			ctx->objects_count++;
 			dc_pool_entry *entry = (dc_pool_entry *)Z_PTR_P(pooled);
