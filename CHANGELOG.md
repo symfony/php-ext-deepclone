@@ -5,6 +5,42 @@ All notable changes to this extension will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.1] - 2026-04-17
+
+### Fixed
+
+- `deepclone_to_array()` heap-use-after-free when a referenced value
+  is copied into an array that later transitions from packed to hash
+  storage. `dc_copy_array` stashed pointers into the dst hash in
+  `ref_entry->tree_pos` for later dtor; the first insert with a string
+  key triggered `zend_hash_packed_to_hash()` which freed the packed
+  storage, leaving earlier tree_pos pointers dangling. Fix: force
+  mixed/hash storage on dst before the loop.
+- `deepclone_to_array()` unsound refcount-based pool-skip: skipping the
+  object-pool lookup when `Z_REFCOUNT_P(src) == 1` (without
+  `__serialize`) was incorrect when the object is reached via a SHARED
+  parent array — the parent is walked multiple times and the object is
+  visited twice, but the skip bypassed the pool and tripped
+  `zend_hash_index_add_new`'s assertion on the second visit. Fix:
+  always do the pool lookup.
+- `deepclone_to_array()` `scope_name` leak on private-property skip:
+  the `goto next_prop` paths (for `__sleep`-filtered or proto-identical
+  values) bypassed the release of `scope_name` allocated in the
+  private-key branch. Fix: track `scope_name_owned` and release at
+  `next_prop`.
+- `deepclone_from_array()` DoS via unbounded IS_LONG `objectMeta`
+  count: a 59-byte payload with `objectMeta` as a large integer (e.g.
+  `844067442`) triggered multi-GB allocations. Fix: cap the IS_LONG
+  form at 1 << 20 (1M); payloads needing more should use the array form
+  which is naturally bounded by hash-table size.
+
+All four were found by libFuzzer harnesses with ASAN/UBSAN — two
+targeting `deepclone_from_array()` and `deepclone_hydrate()` directly,
+and one round-trip harness that builds a graph from a tiny stack
+machine and feeds it through `deepclone_to_array()` /
+`deepclone_from_array()`. Total: 8.47M executions on hydrate and
+6.98M on from_array clean after fixes, plus ~million roundtrip execs.
+
 ## [0.5.0] - 2026-04-16
 
 ### BC Break
