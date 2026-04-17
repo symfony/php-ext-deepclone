@@ -1458,6 +1458,7 @@ build_scoped_props:
 			zend_string *prop_name = NULL;
 			zend_string *scope_name = NULL;
 			bool prop_name_owned = false;
+			bool scope_name_owned = false;
 
 			/* Dereference IS_INDIRECT (declared properties) and IS_REFERENCE */
 			if (Z_TYPE_P(arr_val) == IS_INDIRECT) {
@@ -1497,6 +1498,7 @@ build_scoped_props:
 				}
 				size_t class_len = sep - key - 1;
 				scope_name = zend_string_init_existing_interned(key + 1, class_len, 0);
+				scope_name_owned = true;
 				prop_name = zend_string_init_existing_interned(sep + 1, key_len - class_len - 2, 0);
 				prop_name_owned = true;
 			}
@@ -1543,24 +1545,27 @@ build_scoped_props:
 				}
 			}
 
-			zend_string_addref(scope_name);
-
-			/* Add to scoped properties */
+			/* Add to scoped properties. The addref pairs with the hash's
+			 * own ref — scope_name is either interned (release is a no-op)
+			 * or owned here (release at next_prop via scope_name_owned). */
 			{
 				zval *scope_ht = zend_hash_find(Z_ARRVAL(props_zval), scope_name);
 				if (!scope_ht) {
 					zval new_ht;
 					array_init(&new_ht);
+					zend_string_addref(scope_name);
 					scope_ht = zend_hash_add_new(Z_ARRVAL(props_zval), scope_name, &new_ht);
 				}
 				Z_TRY_ADDREF_P(arr_val);
 				zend_hash_add_new(Z_ARRVAL_P(scope_ht), prop_name, arr_val);
 			}
-			zend_string_release(scope_name);
 
 next_prop:
 			if (prop_name_owned) {
 				zend_string_release(prop_name);
+			}
+			if (scope_name_owned) {
+				zend_string_release(scope_name);
 			}
 		} ZEND_HASH_FOREACH_END();
 
