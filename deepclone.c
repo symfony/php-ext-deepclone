@@ -909,6 +909,13 @@ static void dc_copy_array(dc_ctx *ctx, HashTable *src_ht, zval *dst, zval *mask_
 		return;
 	}
 
+	/* Force hash (mixed) storage up front. dc_copy_value on a reference
+	 * stashes new_dst_slot in ref_entry->tree_pos; if the first insert here
+	 * transitioned dst from packed to hash mode, the later zend_hash_add_new
+	 * would free the packed storage and leave that tree_pos dangling. */
+	zend_hash_real_init_mixed(Z_ARRVAL_P(dst));
+	zend_hash_real_init_mixed(Z_ARRVAL_P(mask_dst));
+
 	ZEND_HASH_FOREACH_KEY_VAL(src_ht, idx, key, src_val) {
 		zval undef, null_marker;
 		ZVAL_UNDEF(&undef);
