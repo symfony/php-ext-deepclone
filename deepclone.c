@@ -27,7 +27,7 @@
  *     property-slot writes. Replaces Symfony's Hydrator/Instantiator.
  *
  * `$allowed_classes` follows unserialize()'s semantics: null = allow all,
- * [] = allow none, case-insensitive. Closures require `"Closure"` in the list.
+ * [] = allow none, case-insensitive.
  *
  * Typed exceptions (both extending \InvalidArgumentException):
  *   DeepClone\NotInstantiableException — deepclone_to_array / deepclone_hydrate

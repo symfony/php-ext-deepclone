@@ -85,8 +85,7 @@ function deepclone_hydrate(object|string $object_or_class, array $vars = [], int
 
 `$allowed_classes` restricts which classes may be serialized or deserialized
 (`null` = allow all, `[]` = allow none). Case-insensitive, matching
-`unserialize()`'s `allowed_classes` option. Closures require `"Closure"` in
-the list.
+`unserialize()`'s `allowed_classes` option.
 
 `deepclone_hydrate()` accepts either an object to hydrate in place or a class
 name to instantiate without calling its constructor. By default, PHP `&`
