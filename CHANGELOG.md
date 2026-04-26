@@ -5,6 +5,25 @@ All notable changes to this extension will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] - 2026-04-26
+
+### Removed
+
+- `deepclone_hydrate()` no longer treats the special `"\0"` key as SPL
+  internal state. `ArrayObject`, `ArrayIterator`, and `SplObjectStorage`
+  all ship `__serialize` / `__unserialize` since PHP 7.4 — callers can
+  populate them by instantiating with `deepclone_hydrate()` and calling
+  `__unserialize()` with the documented array shape, or by round-tripping
+  via `deepclone_from_array()` which routes through `__unserialize`
+  natively. The mangled-key resolution path (`"propName"`, `"\0*\0prop"`,
+  `"\0Class\0prop"`) is unchanged.
+
+  This removes ~80 lines of bespoke SPL handling — `offsetSet` loops,
+  constructor invocation, packed-array shape validation, error paths —
+  that duplicated what the classes natively expose. Symfony's
+  `Hydrator::hydrate()` / `Instantiator::instantiate()` retain BC by
+  translating the legacy `"\0"` shape to `__unserialize()` in user-land.
+
 ## [0.5.1] - 2026-04-17
 
 ### Fixed

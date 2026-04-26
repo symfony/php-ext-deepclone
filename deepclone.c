@@ -59,8 +59,6 @@
 #include "Zend/zend_interfaces.h"
 #include "ext/spl/spl_iterators.h"
 #include "ext/spl/spl_exceptions.h"
-#include "ext/spl/spl_array.h"
-#include "ext/spl/spl_observer.h"
 
 /* ext/reflection's class entries are PHPAPI but Debian's php-dev does not
  * ship ext/reflection/php_reflection.h. Forward-declare what we use; the
@@ -3093,8 +3091,6 @@ PHP_FUNCTION(deepclone_hydrate)
 	 *   "\0*\0propName"         → protected (declaring class resolved via obj_ce)
 	 *   "\0ClassName\0propName" → private declared on ClassName (must be obj_ce
 	 *                             or a parent; interfaces are not valid scopes)
-	 *   "\0"                    → SPL internal state (SplObjectStorage/
-	 *                             ArrayObject/ArrayIterator)
 	 */
 	zend_ulong prop_idx;
 	zend_string *prop_key;
@@ -3110,91 +3106,6 @@ PHP_FUNCTION(deepclone_hydrate)
 
 		const char *key = ZSTR_VAL(prop_key);
 		size_t key_len = ZSTR_LEN(prop_key);
-
-		/* "\0" = internal state for SplObjectStorage/ArrayObject/ArrayIterator */
-		if (key_len == 1 && key[0] == '\0') {
-			if (UNEXPECTED(Z_TYPE_P(prop_val) != IS_ARRAY)) {
-				zend_value_error("deepclone_hydrate(): Argument #2 ($vars) special \"\\0\" value must be of type array, %s given",
-					zend_zval_value_name(prop_val));
-				if (prop_key_owned) zend_string_release(prop_key);
-				zval_ptr_dtor(&obj_zval);
-				RETURN_THROWS();
-			}
-			if (instanceof_function(obj_ce, spl_ce_SplObjectStorage)) {
-				/* [$obj1, $info1, $obj2, $info2, ...] → offsetSet(obj, info).
-				 * Count must be even (pair-aligned); packed/contiguous indexing
-				 * is required since the format is a flat pair stream. */
-				uint32_t count = zend_hash_num_elements(Z_ARRVAL_P(prop_val));
-				if (UNEXPECTED(count & 1)) {
-					zend_value_error("deepclone_hydrate(): Argument #2 ($vars) special \"\\0\" value for %s must have an even number of entries, %u given",
-						ZSTR_VAL(obj_ce->name), count);
-					if (prop_key_owned) zend_string_release(prop_key);
-					zval_ptr_dtor(&obj_zval);
-					RETURN_THROWS();
-				}
-				zend_function *offset_set_fn = NULL;
-				for (uint32_t i = 0; i < count; i += 2) {
-					zval *zkey = zend_hash_index_find(Z_ARRVAL_P(prop_val), i);
-					zval *zinfo = zend_hash_index_find(Z_ARRVAL_P(prop_val), i + 1);
-					if (UNEXPECTED(!zkey || !zinfo)) {
-						zend_value_error("deepclone_hydrate(): Argument #2 ($vars) special \"\\0\" value for %s must be a packed array of [obj, info] pairs",
-							ZSTR_VAL(obj_ce->name));
-						if (prop_key_owned) zend_string_release(prop_key);
-						zval_ptr_dtor(&obj_zval);
-						RETURN_THROWS();
-					}
-					zend_call_method_with_2_params(obj, obj_ce, &offset_set_fn, "offsetset", NULL, zkey, zinfo);
-					if (UNEXPECTED(EG(exception))) {
-						if (prop_key_owned) zend_string_release(prop_key);
-						zval_ptr_dtor(&obj_zval);
-						RETURN_THROWS();
-					}
-				}
-			} else if (instanceof_function(obj_ce, spl_ce_ArrayObject)
-			        || instanceof_function(obj_ce, spl_ce_ArrayIterator)) {
-				/* [$array, $flags?, $iteratorClass?] — call constructor */
-				uint32_t argc = zend_hash_num_elements(Z_ARRVAL_P(prop_val));
-				if (UNEXPECTED(argc > 3)) {
-					zend_value_error("deepclone_hydrate(): Argument #2 ($vars) special \"\\0\" value for %s accepts at most 3 entries, %u given",
-						ZSTR_VAL(obj_ce->name), argc);
-					if (prop_key_owned) zend_string_release(prop_key);
-					zval_ptr_dtor(&obj_zval);
-					RETURN_THROWS();
-				}
-				zend_function *ctor = obj_ce->constructor;
-				if (ctor) {
-					zval args[3];
-					for (uint32_t a = 0; a < argc; a++) {
-						zval *arg = zend_hash_index_find(Z_ARRVAL_P(prop_val), a);
-						if (UNEXPECTED(!arg)) {
-							zend_value_error("deepclone_hydrate(): Argument #2 ($vars) special \"\\0\" value for %s must be a packed array",
-								ZSTR_VAL(obj_ce->name));
-							if (prop_key_owned) zend_string_release(prop_key);
-							zval_ptr_dtor(&obj_zval);
-							RETURN_THROWS();
-						}
-						ZVAL_COPY_VALUE(&args[a], arg);
-					}
-					zval retval;
-					ZVAL_UNDEF(&retval);
-					zend_call_known_function(ctor, obj, obj_ce, &retval, argc, args, NULL);
-					zval_ptr_dtor(&retval);
-					if (UNEXPECTED(EG(exception))) {
-						if (prop_key_owned) zend_string_release(prop_key);
-						zval_ptr_dtor(&obj_zval);
-						RETURN_THROWS();
-					}
-				}
-			} else {
-				zend_value_error("deepclone_hydrate(): Argument #2 ($vars) uses the special \"\\0\" key, which is only supported for SplObjectStorage, ArrayObject, and ArrayIterator; got \"%s\"",
-					ZSTR_VAL(obj_ce->name));
-				if (prop_key_owned) zend_string_release(prop_key);
-				zval_ptr_dtor(&obj_zval);
-				RETURN_THROWS();
-			}
-			if (prop_key_owned) zend_string_release(prop_key);
-			continue;
-		}
 
 		/* Resolve (scope_ce, real_name) from the mangled key shape.
 		 * is_mangled is set when the key started with NUL — if the resolved

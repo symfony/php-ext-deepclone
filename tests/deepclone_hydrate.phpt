@@ -61,33 +61,30 @@ var_dump($o->y === 'hi');
 $o = deepclone_hydrate('STDcLASS', ['p' => 123]);
 var_dump($o->p === 123);
 
-// === "\0" key = SPL internal state ===
+// === SPL classes (ArrayObject, ArrayIterator, SplObjectStorage) ===
+// These ship __serialize/__unserialize since PHP 7.4. deepclone_hydrate()
+// instantiates them; callers wire up state by calling __unserialize() with
+// the array shape these classes document, or by going through
+// deepclone_from_array() which handles it natively.
 
-// SplObjectStorage via "\0" key
-$s = new SplObjectStorage();
-$o1 = new stdClass(); $o1->name = 'a';
-$o2 = new stdClass(); $o2->name = 'b';
-$result = deepclone_hydrate($s, ["\0" => [$o1, 'info1', $o2, 'info2']]);
-var_dump($result === $s);
-var_dump($result->count() === 2);
-$result->rewind();
-var_dump($result->current() === $o1);
-var_dump($result->getInfo() === 'info1');
-
-$o3 = new stdClass();
-$s = deepclone_hydrate('SplObjectStorage', ["\0" => [$o3, 'data']]);
-var_dump($s->count() === 1);
-
-// ArrayObject via "\0" key
-$ao = deepclone_hydrate('ArrayObject', ["\0" => [['x' => 1, 'y' => 2], ArrayObject::ARRAY_AS_PROPS]]);
+// ArrayObject + __unserialize
+$ao = deepclone_hydrate('ArrayObject');
+$ao->__unserialize([ArrayObject::ARRAY_AS_PROPS, ['x' => 1, 'y' => 2], []]);
 var_dump($ao instanceof ArrayObject);
 var_dump($ao['x'] === 1);
 var_dump($ao->getFlags() === ArrayObject::ARRAY_AS_PROPS);
 
-// ArrayIterator via "\0" key
-$ai = deepclone_hydrate('ArrayIterator', ["\0" => [['a', 'b', 'c']]]);
+// ArrayIterator + __unserialize
+$ai = deepclone_hydrate('ArrayIterator');
+$ai->__unserialize([0, ['a', 'b', 'c'], []]);
 var_dump($ai instanceof ArrayIterator);
 var_dump(count($ai) === 3);
+
+// SplObjectStorage + __unserialize
+$o1 = new stdClass(); $o2 = new stdClass();
+$s = deepclone_hydrate('SplObjectStorage');
+$s->__unserialize([[$o1, 'info1', $o2, 'info2'], []]);
+var_dump($s->count() === 2);
 
 // === (array) $obj round-trip — all four mangled-key shapes ===
 
@@ -265,35 +262,6 @@ try {
     var_dump(str_contains($e->getMessage(), 'invalid mangled key'));
 }
 
-// "\0" special key with a non-array value → ValueError
-try {
-    deepclone_hydrate('SplObjectStorage', ["\0" => 42]);
-} catch (\ValueError $e) {
-    var_dump(str_contains($e->getMessage(), 'must be of type array'));
-}
-
-// "\0" special key on a class that doesn't support it → ValueError
-class NoSpl { public int $x = 0; }
-try {
-    deepclone_hydrate('NoSpl', ["\0" => [1, 2]]);
-} catch (\ValueError $e) {
-    var_dump(str_contains($e->getMessage(), 'SplObjectStorage'));
-}
-
-// SplObjectStorage "\0" payload with odd count → ValueError
-try {
-    deepclone_hydrate('SplObjectStorage', ["\0" => [new stdClass()]]);
-} catch (\ValueError $e) {
-    var_dump(str_contains($e->getMessage(), 'even number of entries'));
-}
-
-// ArrayObject "\0" payload with more than 3 args → ValueError
-try {
-    deepclone_hydrate('ArrayObject', ["\0" => [[], 0, 'ArrayIterator', 'extra']]);
-} catch (\ValueError $e) {
-    var_dump(str_contains($e->getMessage(), 'at most 3 entries'));
-}
-
 // Mangled-private key referencing a non-parent class → ValueError
 class HydrateUnrelated { public int $x = 0; }
 try {
@@ -345,14 +313,6 @@ var_dump($o instanceof stdClass);
 echo "Done\n";
 ?>
 --EXPECT--
-bool(true)
-bool(true)
-bool(true)
-bool(true)
-bool(true)
-bool(true)
-bool(true)
-bool(true)
 bool(true)
 bool(true)
 bool(true)

@@ -101,7 +101,6 @@ to keep them.
 | `"propName"`                | public, protected (any declaring class), or private declared on the object's own class |
 | `"\0*\0propName"`           | protected (the declaring class is resolved via the object) |
 | `"\0ClassName\0propName"`   | private declared on `ClassName` — must be the object's own class or a parent |
-| `"\0"`                      | SPL internal state (SplObjectStorage / ArrayObject / ArrayIterator) |
 
 Each key triggers one `properties_info` hash lookup followed by a direct
 slot write.
@@ -172,18 +171,18 @@ strict-type errors. They run under every mode unless noted:
   enum-typed properties accordingly receive the enum case, not the
   raw scalar.
 
-The special `"\0"` key sets the internal state of SPL classes:
+SPL classes that hold internal state (`ArrayObject`, `ArrayIterator`,
+`SplObjectStorage`, …) have shipped `__serialize` / `__unserialize` since
+PHP 7.4. To populate them, instantiate with `deepclone_hydrate()` and call
+`__unserialize()` with the array shape the class documents — or just use
+`deepclone_from_array()`, which routes through `__unserialize` natively.
 
 ```php
-// ArrayObject / ArrayIterator — ["\0" => [$array, $flags?, $iteratorClass?]]
-$ao = deepclone_hydrate('ArrayObject', [
-    "\0" => [['x' => 1, 'y' => 2], ArrayObject::ARRAY_AS_PROPS],
-]);
+$ao = deepclone_hydrate('ArrayObject');
+$ao->__unserialize([ArrayObject::ARRAY_AS_PROPS, ['x' => 1, 'y' => 2], []]);
 
-// SplObjectStorage — ["\0" => [$obj1, $info1, $obj2, $info2, ...]]
-$s = deepclone_hydrate('SplObjectStorage', [
-    "\0" => [$obj, 'metadata'],
-]);
+$s = deepclone_hydrate('SplObjectStorage');
+$s->__unserialize([[$obj1, 'info1', $obj2, 'info2'], []]);
 ```
 
 ## What it preserves
