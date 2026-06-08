@@ -3150,6 +3150,54 @@ PHP_FUNCTION(deepclone_hydrate)
 						ok = false;
 					}
 				}
+				/* Internal final classes with create_object: the engine refuses
+				 * newInstanceWithoutConstructor() for them (INTERNAL + create_object
+				 * + FINAL). Hydrate injects properties into a create_object shell,
+				 * but a class whose validity depends on __construct()/__unserialize()
+				 * (e.g. BcMath\Number, whose bc_num stays NULL until then) cannot be
+				 * built that way. Mirror the polyfill: probe an empty serialization
+				 * payload and refuse hydrate if it does not reconstruct an object.
+				 * Round-trip (deepclone_from_array) is unaffected — it replays the
+				 * real state through __unserialize(). */
+				if (ok && has_ser_api && ce->create_object != NULL
+				 && (ce->ce_flags & ZEND_ACC_FINAL) && ce != php_ce_incomplete_class) {
+					smart_str payload = {0};
+					smart_str_appendc(&payload, (ce->serialize != NULL && !has_unser) ? 'C' : 'O');
+					smart_str_appendc(&payload, ':');
+					smart_str_append_long(&payload, (zend_long) ZSTR_LEN(ce->name));
+					smart_str_appendl(&payload, ":\"", 2);
+					smart_str_append(&payload, ce->name);
+					smart_str_appendl(&payload, "\":0:{}", 6);
+					smart_str_0(&payload);
+
+					zval probe;
+					ZVAL_UNDEF(&probe);
+					const unsigned char *p = (const unsigned char *) ZSTR_VAL(payload.s);
+					const unsigned char *pend = p + ZSTR_LEN(payload.s);
+					/* Raise serialize_lock so the probe gets an isolated
+					 * php_unserialize_data: otherwise, when hydrate runs inside
+					 * an active unserialize (e.g. Serializable::unserialize()),
+					 * PHP_VAR_UNSERIALIZE_INIT would reuse the outer context's
+					 * data and DESTROY would skip var_destroy (level>1), so the
+					 * deferred __unserialize([])/__wakeup() never fires here and
+					 * the probe object leaks into the outer dtor list. */
+					BG(serialize_lock)++;
+					php_unserialize_data_t var_hash;
+					PHP_VAR_UNSERIALIZE_INIT(var_hash);
+					bool shell_ok = php_var_unserialize(&probe, &p, pend, &var_hash)
+						&& Z_TYPE(probe) == IS_OBJECT;
+					PHP_VAR_UNSERIALIZE_DESTROY(var_hash);
+					BG(serialize_lock)--;
+					if (EG(exception)) {
+						zend_clear_exception();
+						shell_ok = false;
+					}
+					zval_ptr_dtor(&probe);
+					smart_str_free(&payload);
+					if (!shell_ok) {
+						ok = false;
+					}
+				}
 				packed = (uintptr_t) ce | (ok ? 1 : 0);
 				zend_hash_update_ptr(hydrate_cache, ce->name, (void *) packed);
 				if (!ok) {

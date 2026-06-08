@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `deepclone_hydrate()` now refuses an internal `final` class with a
+  serialization API whose empty serialization payload cannot reconstruct an
+  instance (e.g. `BcMath\Number`, whose `bc_num` stays `NULL` until
+  `__construct()`/`__unserialize()` runs), throwing the documented
+  `\DeepClone\NotInstantiableException` instead of injecting properties into a
+  half-built `create_object` shell, which produced an uninitialized object
+  that crashed on first use. The engine already refuses
+  `ReflectionClass::newInstanceWithoutConstructor()` for such classes; this
+  matches that behaviour and the polyfill. The instantiability probe runs under
+  `serialize_lock` so it stays isolated when `deepclone_hydrate()` is called
+  from inside another `unserialize()` (e.g. `Serializable::unserialize()`).
+  Round-trip via `deepclone_to_array()` / `deepclone_from_array()` is
+  unaffected; it replays the real state through `__unserialize()`
+  (symfony/symfony#64323).
 - `deepclone_from_array()` now rejects a malformed payload whose serialized
   class-name blob (a string whose second byte is `:`) decodes to a non-object
   via `unserialize()`, instead of storing the scalar/array result and later
