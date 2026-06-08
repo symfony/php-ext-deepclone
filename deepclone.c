@@ -2165,6 +2165,11 @@ static void dc_resolve(zval *value, zval *mask, zval *objects, uint32_t num_obje
 			}
 			target = &objects[id];
 		} else {
+			/* Guard against ZEND_LONG_MIN — negating it is signed-overflow UB. */
+			if (UNEXPECTED(id <= ZEND_LONG_MIN)) {
+				zend_value_error("deepclone_from_array(): malformed payload, ref id out of range");
+				return;
+			}
 			target = zend_hash_index_find(refs, -id);
 			if (UNEXPECTED(!target)) {
 				zend_value_error("deepclone_from_array(): malformed payload, unknown ref id " ZEND_LONG_FMT, -id);
@@ -2253,6 +2258,11 @@ static void dc_resolve(zval *value, zval *mask, zval *objects, uint32_t num_obje
 				}
 				target = &objects[id];
 			} else {
+				/* Guard against ZEND_LONG_MIN — negating it is signed-overflow UB. */
+				if (UNEXPECTED(id <= ZEND_LONG_MIN)) {
+					zend_value_error("deepclone_from_array(): malformed payload, named-closure references unknown id " ZEND_LONG_FMT, id);
+					return;
+				}
 				target = zend_hash_index_find(refs, -id);
 				if (!target) {
 					zend_value_error("deepclone_from_array(): malformed payload, named-closure references unknown id " ZEND_LONG_FMT, id);
@@ -2670,6 +2680,14 @@ PHP_FUNCTION(deepclone_from_array)
 				DC_INVALID("deepclone_from_array(): Argument #1 ($data) failed to unserialize object %u", id);
 			}
 			PHP_VAR_UNSERIALIZE_DESTROY(var_hash);
+			/* The result is later dereferenced as a zend_object*; a malformed
+			 * payload can carry any serialize form (i:…, s:…, a:…), so reject
+			 * anything that did not decode to an object before storing it. */
+			if (UNEXPECTED(Z_TYPE(obj_zval) != IS_OBJECT)) {
+				const char *got = zend_zval_value_name(&obj_zval);
+				zval_ptr_dtor(&obj_zval);
+				DC_INVALID("deepclone_from_array(): Argument #1 ($data) object %u did not unserialize to an object, %s given", id, got);
+			}
 		} else {
 			/* class_ces is lazily populated — fill on miss. */
 			zend_class_entry *ce = class_ces[cid];
@@ -3009,6 +3027,10 @@ PHP_FUNCTION(deepclone_from_array)
 			zval *obj = &objects[id];
 			ZVAL_COPY(return_value, obj);
 		} else {
+			/* Guard against ZEND_LONG_MIN — negating it is signed-overflow UB. */
+			if (UNEXPECTED(id <= ZEND_LONG_MIN)) {
+				DC_INVALID("deepclone_from_array(): Argument #1 ($data) \"prepared\" references unknown ref id out of range");
+			}
 			zval *ref = zend_hash_index_find(&refs, -id);
 			if (!ref) {
 				DC_INVALID("deepclone_from_array(): Argument #1 ($data) \"prepared\" references unknown ref id " ZEND_LONG_FMT, -id);

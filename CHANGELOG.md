@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `deepclone_from_array()` now rejects a malformed payload whose serialized
+  class-name blob (a string whose second byte is `:`) decodes to a non-object
+  via `unserialize()`, instead of storing the scalar/array result and later
+  dereferencing it as a `zend_object*`. Such a payload now throws the documented
+  `\ValueError`.
+- `deepclone_from_array()` no longer negates a `PHP_INT_MIN` reference id while
+  resolving the object-reference, named-closure, and top-level `prepared`
+  paths. Negating `ZEND_LONG_MIN` is signed-overflow undefined behaviour; the
+  guard already present on the hard-ref path is now applied to the three sibling
+  sites, which reject the malformed id with a `\ValueError`.
 - Numeric property names (e.g. `$o->{'999'}`) now round-trip through
   `deepclone_to_array()` / `deepclone_from_array()`, matching
   `serialize()`/`unserialize()` (symfony/symfony#64548). `deepclone_to_array()`
