@@ -5,6 +5,21 @@ All notable changes to this extension will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- Numeric property names (e.g. `$o->{'999'}`) now round-trip through
+  `deepclone_to_array()` / `deepclone_from_array()`, matching
+  `serialize()`/`unserialize()` (symfony/symfony#64548). `deepclone_to_array()`
+  emitted such names as a non-canonical string array key, which both differed
+  from the polyfill's `(array)`-cast output and broke as soon as the payload
+  passed through `var_export()`/`require` (the OPcache cache-file use case) or
+  JSON, where `"999"` re-normalizes to the integer `999` — a key
+  `deepclone_from_array()` then rejected. Numeric names are now stored as the
+  canonical integer key on output and accepted as integer keys on input.
+  Non-canonical names such as `"007"` correctly remain strings.
+
 ## [0.6.0] - 2026-04-26
 
 ### Removed

@@ -650,6 +650,52 @@ static zend_always_inline bool dc_is_std_scope_property(zend_property_info *pi)
 		&& !(pi->flags & (ZEND_ACC_PROTECTED_SET | ZEND_ACC_PRIVATE_SET));
 }
 
+/* Find-or-create the per-name [id] sub-array inside a properties/resolve
+ * [scope] table, normalizing numeric property names to integer keys exactly
+ * as PHP arrays do. An object property named "999" lives in the object's
+ * property table as a verbatim string, but the array-shaped payload must use
+ * the integer key 999 so it matches the polyfill's (array)-cast output and
+ * survives a var_export()/JSON round-trip (both re-normalize "999" → 999).
+ * Non-canonical names like "007" are not integer keys and stay strings.
+ *
+ * Only dynamic property names can be numeric (a declared property can't be
+ * named like an integer), so callers that emit declared-only names pass
+ * may_be_numeric=false to skip the ZEND_HANDLE_NUMERIC() probe entirely. */
+static zend_always_inline zval *dc_name_subarray(HashTable *scope_ht, zend_string *name, bool may_be_numeric)
+{
+	zend_ulong idx;
+	zval *slot;
+	if (may_be_numeric && ZEND_HANDLE_NUMERIC(name, idx)) {
+		slot = zend_hash_index_find(scope_ht, idx);
+		if (!slot) {
+			zval new_ht;
+			array_init_size(&new_ht, 1);
+			slot = zend_hash_index_add_new(scope_ht, idx, &new_ht);
+		}
+	} else {
+		slot = zend_hash_find_known_hash(scope_ht, name);
+		if (!slot) {
+			zval new_ht;
+			array_init_size(&new_ht, 1);
+			slot = zend_hash_add_new(scope_ht, name, &new_ht);
+		}
+	}
+	return slot;
+}
+
+/* Numeric-name-aware lookup of an existing per-name sub-array (no insert),
+ * used to re-find a bucket after a recursive walk may have grown the table.
+ * Mirrors dc_name_subarray()'s key handling, including the may_be_numeric
+ * opt-out for declared-only names. */
+static zend_always_inline zval *dc_name_subarray_find(HashTable *scope_ht, zend_string *name, bool may_be_numeric)
+{
+	zend_ulong idx;
+	if (may_be_numeric && ZEND_HANDLE_NUMERIC(name, idx)) {
+		return zend_hash_index_find(scope_ht, idx);
+	}
+	return zend_hash_find_known_hash(scope_ht, name);
+}
+
 #if PHP_VERSION_ID >= 80400
 /* fn_proxy slot cached across calls — first invocation fills it via method
  * lookup; subsequent invocations reuse the resolved zend_function*. */
@@ -1174,6 +1220,13 @@ static void dc_process_object(dc_ctx *ctx, zval *src, zval *dst, zval *mask_dst)
 	zval props_zval, retval;
 	bool has_unserialize, need_release_array_value = false;
 	HashTable *sleep_set = NULL;
+	/* Whether this object's property names can include numeric ones. Only
+	 * dynamic properties can be named like an integer, so the declared-only
+	 * fast path below clears this and the transpose skips the per-name
+	 * numeric-key probe entirely. Declared at function scope (not mid-body)
+	 * so the goto paths into build_scoped_props/prepare_props can't bypass
+	 * its initializer. */
+	bool may_have_numeric_names = true;
 
 	/* Reject disallowed classes before any allocation. */
 	if (!dc_class_allowed(ctx->allowed_ht, ce->name)) {
@@ -1321,6 +1374,8 @@ static void dc_process_object(dc_ctx *ctx, zval *src, zval *dst, zval *mask_dst)
 	 && Z_OBJ_HT_P(src)->get_properties_for == NULL
 	 && Z_OBJ_HT_P(src)->get_properties == zend_std_get_properties
 	 && !zend_object_is_lazy(obj)) {
+		/* Declared properties only — none can be numeric. */
+		may_have_numeric_names = false;
 		/* Direct property slot access — compare with prototype slots */
 		zend_property_info *prop_info;
 		zval *prop;
@@ -1638,12 +1693,7 @@ prepare_props:
 					array_init_size(&new_ht, 4);
 					out_scope = zend_hash_add_new(Z_ARRVAL(ctx->properties), scope, &new_ht);
 				}
-				zval *out_name = zend_hash_find_known_hash(Z_ARRVAL_P(out_scope), name);
-				if (!out_name) {
-					zval new_ht;
-					array_init_size(&new_ht, 1);
-					out_name = zend_hash_add_new(Z_ARRVAL_P(out_scope), name, &new_ht);
-				}
+				zval *out_name = dc_name_subarray(Z_ARRVAL_P(out_scope), name, may_have_numeric_names);
 
 				/* Fast path: scalar values can't mutate ctx, so no placeholder,
 				 * no recursion, no re-lookup. This covers IS_UNDEF/IS_NULL/
@@ -1676,7 +1726,7 @@ prepare_props:
 				dc_mask_cleanup(&mask_slot_zv);
 
 				out_scope = zend_hash_find_known_hash(Z_ARRVAL(ctx->properties), scope);
-				out_name = zend_hash_find_known_hash(Z_ARRVAL_P(out_scope), name);
+				out_name = dc_name_subarray_find(Z_ARRVAL_P(out_scope), name, may_have_numeric_names);
 				zval *dst_slot = zend_hash_index_find(Z_ARRVAL_P(out_name), entry_id);
 				ZVAL_COPY_VALUE(dst_slot, &temp_dst);
 
@@ -1690,12 +1740,7 @@ prepare_props:
 						array_init_size(&new_ht, 1);
 						out_rscope = zend_hash_add_new(Z_ARRVAL(ctx->resolve), scope, &new_ht);
 					}
-					zval *out_rname = zend_hash_find_known_hash(Z_ARRVAL_P(out_rscope), name);
-					if (!out_rname) {
-						zval new_ht;
-						array_init_size(&new_ht, 1);
-						out_rname = zend_hash_add_new(Z_ARRVAL_P(out_rscope), name, &new_ht);
-					}
+					zval *out_rname = dc_name_subarray(Z_ARRVAL_P(out_rscope), name, may_have_numeric_names);
 					zend_hash_index_add_new(Z_ARRVAL_P(out_rname), entry_id, &mask_slot_zv);
 				}
 			} ZEND_HASH_FOREACH_END();
@@ -2401,6 +2446,10 @@ PHP_FUNCTION(deepclone_from_array)
 	uint32_t *obj_class_ids = NULL;
 	int *obj_wakeups = NULL;
 	bool refs_inited = false;
+	/* Holds the string synthesized for a numeric property name during the
+	 * properties walk below, so the shared cleanup label can release it on
+	 * any early-exit path. Only one is live at a time. */
+	zend_string *numeric_prop_tmp = NULL;
 
 	ZEND_PARSE_PARAMETERS_START(1, 2)
 		Z_PARAM_ARRAY_HT(data_ht)
@@ -2729,11 +2778,23 @@ PHP_FUNCTION(deepclone_from_array)
 			}
 
 			zend_string *prop_name;
+			zend_ulong prop_idx;
 			zval *id_values;
-			ZEND_HASH_FOREACH_STR_KEY_VAL(Z_ARRVAL_P(scope_props), prop_name, id_values) {
-				if (!prop_name) {
-					EG(fake_scope) = old_scope;
-					DC_INVALID("deepclone_from_array(): Argument #1 ($data) \"properties\" inner keys must be of type string");
+			ZEND_HASH_FOREACH_KEY_VAL(Z_ARRVAL_P(scope_props), prop_idx, prop_name, id_values) {
+				/* A numeric property name (e.g. $o->{'999'}) arrives as an
+				 * integer key because PHP normalizes numeric string keys.
+				 * Synthesize its string form so the write paths stay uniform;
+				 * such names are always dynamic properties, so the declared-
+				 * property lookup is skipped and resolve markers (transposed
+				 * with the same key) are looked up by the integer index. The
+				 * shared cleanup label releases numeric_prop_tmp on any exit. */
+				bool prop_is_numeric = (prop_name == NULL);
+				if (prop_is_numeric) {
+					prop_name = numeric_prop_tmp = zend_long_to_str((zend_long) prop_idx);
+					/* Force the hash so the zend_hash_find_known_hash() probes
+					 * below (e.g. the stdClass-scoped declared-property lookup on
+					 * a typed object) satisfy their "hash must be known" contract. */
+					zend_string_hash_val(prop_name);
 				}
 				if (Z_TYPE_P(id_values) != IS_ARRAY) {
 					EG(fake_scope) = old_scope;
@@ -2743,7 +2804,9 @@ PHP_FUNCTION(deepclone_from_array)
 				/* Get resolve markers for this property */
 				HashTable *resolve_ids = NULL;
 				if (resolve_scope) {
-					zval *ri = zend_hash_find(resolve_scope, prop_name);
+					zval *ri = prop_is_numeric
+						? zend_hash_index_find(resolve_scope, prop_idx)
+						: zend_hash_find(resolve_scope, prop_name);
 					if (ri) {
 						if (Z_TYPE_P(ri) != IS_ARRAY) {
 							EG(fake_scope) = old_scope;
@@ -2755,9 +2818,10 @@ PHP_FUNCTION(deepclone_from_array)
 
 				/* Hoist property_info lookup — same for all object ids in this
 				 * scope+prop combination. Declared property names are interned
-				 * in &scope_ce->properties_info so _known_hash is safe. */
+				 * in &scope_ce->properties_info so _known_hash is safe. A
+				 * numeric name can never be a declared property, so skip it. */
 				zend_property_info *pi = NULL;
-				if (scope_ce && scope_ce != zend_standard_class_def) {
+				if (!prop_is_numeric && scope_ce && scope_ce != zend_standard_class_def) {
 					zval *zv = zend_hash_find_known_hash(&scope_ce->properties_info, prop_name);
 					if (zv) {
 						zend_property_info *candidate = Z_PTR_P(zv);
@@ -2848,6 +2912,11 @@ PHP_FUNCTION(deepclone_from_array)
 						}
 					}
 				} ZEND_HASH_FOREACH_END();
+
+				if (numeric_prop_tmp) {
+					zend_string_release(numeric_prop_tmp);
+					numeric_prop_tmp = NULL;
+				}
 			} ZEND_HASH_FOREACH_END();
 
 			EG(fake_scope) = old_scope;
@@ -2954,6 +3023,7 @@ PHP_FUNCTION(deepclone_from_array)
 	}
 
 cleanup:
+	if (numeric_prop_tmp) zend_string_release(numeric_prop_tmp);
 	if (allowed_set) { zend_hash_destroy(allowed_set); efree(allowed_set); }
 	if (refs_inited) zend_hash_destroy(&refs);
 	if (objects) {
