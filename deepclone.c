@@ -56,6 +56,7 @@
 # include "Zend/zend_lazy_objects.h"
 #endif
 #include "Zend/zend_enum.h"
+#include "Zend/zend_attributes.h"
 #include "Zend/zend_interfaces.h"
 #include "ext/spl/spl_iterators.h"
 #include "ext/spl/spl_exceptions.h"
@@ -895,15 +896,17 @@ static bool dc_write_backed_property(zend_object *obj, zend_property_info *pi,
 /* ── Core traversal ─────────────────────────────────────────── */
 
 /* Mask markers: TRUE=obj_ref, FALSE=hard_ref, LONG(0)=named_closure,
- * STRING("e")=enum, ARRAY=nested sub-mask. */
-#define DC_MASK_OBJ_REF(m)        ZVAL_TRUE(m)
-#define DC_MASK_HARD_REF(m)       ZVAL_FALSE(m)
-#define DC_MASK_NAMED_CLOSURE(m)  ZVAL_LONG((m), 0)
+ * LONG(1)=constexpr_closure, STRING("e")=enum, ARRAY=nested sub-mask. */
+#define DC_MASK_OBJ_REF(m)           ZVAL_TRUE(m)
+#define DC_MASK_HARD_REF(m)          ZVAL_FALSE(m)
+#define DC_MASK_NAMED_CLOSURE(m)     ZVAL_LONG((m), 0)
+#define DC_MASK_CONSTEXPR_CLOSURE(m) ZVAL_LONG((m), 1)
 
 /* Test whether a mask slot carries a particular marker. */
-#define DC_MASK_IS_OBJ_REF(m)       (Z_TYPE_P(m) == IS_TRUE)
-#define DC_MASK_IS_HARD_REF(m)      (Z_TYPE_P(m) == IS_FALSE)
-#define DC_MASK_IS_NAMED_CLOSURE(m) (Z_TYPE_P(m) == IS_LONG && Z_LVAL_P(m) == 0)
+#define DC_MASK_IS_OBJ_REF(m)           (Z_TYPE_P(m) == IS_TRUE)
+#define DC_MASK_IS_HARD_REF(m)          (Z_TYPE_P(m) == IS_FALSE)
+#define DC_MASK_IS_NAMED_CLOSURE(m)     (Z_TYPE_P(m) == IS_LONG && Z_LVAL_P(m) == 0)
+#define DC_MASK_IS_CONSTEXPR_CLOSURE(m) (Z_TYPE_P(m) == IS_LONG && Z_LVAL_P(m) == 1)
 
 static void dc_copy_value(dc_ctx *ctx, zval *src, zval *dst, zval *mask_dst);
 static void dc_copy_array(dc_ctx *ctx, HashTable *src_ht, zval *dst, zval *mask_dst);
@@ -1012,6 +1015,637 @@ static void dc_mask_cleanup(zval *mask)
 		zval_ptr_dtor(mask);
 		ZVAL_NULL(mask);
 	}
+}
+
+/* ── Const-expr closure references ───────────────────────────
+ *
+ * PHP 8.5 allows anonymous static closures in constant expressions
+ * (attribute arguments, class constants, property and parameter defaults).
+ * Such a closure carries no state, so it is encoded as a reference to its
+ * declaration site: [class, site, attrIndex|null, closureIndex, startLine]
+ * with site one of "" (the class), "NAME" (constant or enum case), "$name"
+ * (property), "name()" (method) or "name()#N" (parameter). Restoring
+ * re-evaluates the addressed constant expression and picks the Nth closure
+ * found by a depth-first walk (arrays in order, objects through their
+ * array-cast properties), then verifies the declaration line still matches.
+ */
+
+typedef struct {
+	const zend_op *needle;      /* locate: opcodes identifying the target closure */
+	uint32_t       want_ord;    /* resolve: ordinal of the closure to extract */
+	uint32_t       ord;         /* running count of closures walked at this site */
+	bool           matched;
+	uint32_t       matched_ord;
+	zval           found;
+	HashTable      seen;        /* visited non-closure objects (cycle guard) */
+} dc_cexpr_walk;
+
+static void dc_cexpr_walk_init(dc_cexpr_walk *w, const zend_op *needle, uint32_t want_ord)
+{
+	w->needle = needle;
+	w->want_ord = want_ord;
+	w->ord = 0;
+	w->matched = false;
+	w->matched_ord = 0;
+	ZVAL_UNDEF(&w->found);
+	zend_hash_init(&w->seen, 0, NULL, NULL, 0);
+}
+
+static void dc_cexpr_walk_dtor(dc_cexpr_walk *w)
+{
+	zend_hash_destroy(&w->seen);
+}
+
+static zend_always_inline bool dc_cexpr_walk_done(const dc_cexpr_walk *w)
+{
+	return w->needle ? w->matched : !Z_ISUNDEF(w->found);
+}
+
+/* Depth-first walk counting every Closure instance. The order must match the
+ * polyfill's walk exactly or payloads stop being interchangeable. */
+static void dc_cexpr_walk_zval(dc_cexpr_walk *w, zval *val)
+{
+	if (UNEXPECTED(dc_check_stack_limit())) {
+		return;
+	}
+	ZVAL_DEREF(val);
+
+	if (Z_TYPE_P(val) == IS_OBJECT) {
+		if (Z_OBJCE_P(val) == zend_ce_closure) {
+			if (w->needle) {
+				const zend_function *f = zend_get_closure_method_def(Z_OBJ_P(val));
+				if (!w->matched && f->type == ZEND_USER_FUNCTION && f->op_array.opcodes == w->needle) {
+					w->matched = true;
+					w->matched_ord = w->ord;
+				}
+			} else if (w->ord == w->want_ord && Z_ISUNDEF(w->found)) {
+				ZVAL_COPY(&w->found, val);
+			}
+			w->ord++;
+			return;
+		}
+		if (!zend_hash_index_add_empty_element(&w->seen, Z_OBJ_HANDLE_P(val))) {
+			return;
+		}
+		HashTable *props = zend_get_properties_for(val, ZEND_PROP_PURPOSE_ARRAY_CAST);
+		if (props) {
+			zval *v;
+			ZEND_HASH_FOREACH_VAL(props, v) {
+				/* Declared properties surface as INDIRECT slots */
+				ZVAL_DEINDIRECT(v);
+				if (Z_TYPE_P(v) == IS_UNDEF) {
+					continue;
+				}
+				dc_cexpr_walk_zval(w, v);
+				if (dc_cexpr_walk_done(w) || EG(exception)) {
+					break;
+				}
+			} ZEND_HASH_FOREACH_END();
+			zend_release_properties(props);
+		}
+		return;
+	}
+
+	if (Z_TYPE_P(val) == IS_ARRAY) {
+		zval *v;
+		ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(val), v) {
+			dc_cexpr_walk_zval(w, v);
+			if (dc_cexpr_walk_done(w) || EG(exception)) {
+				break;
+			}
+		} ZEND_HASH_FOREACH_END();
+	}
+}
+
+/* Evaluate the args of one attribute and walk them. Returns false when the
+ * evaluation failed; with clear_failure the exception is swallowed and the
+ * site skipped, mirroring the polyfill's per-site try/catch. */
+static bool dc_cexpr_walk_attr(dc_cexpr_walk *w, zend_attribute *attr, zend_class_entry *scope, bool clear_failure)
+{
+	uint32_t argc = attr->argc;
+	zval *vals = argc ? safe_emalloc(argc, sizeof(zval), 0) : NULL;
+	uint32_t evaluated = 0;
+	bool ok = true;
+
+	for (; evaluated < argc; evaluated++) {
+		if (FAILURE == zend_get_attribute_value(&vals[evaluated], attr, evaluated, scope)) {
+			ok = false;
+			if (clear_failure && EG(exception)) {
+				zend_clear_exception();
+			}
+			break;
+		}
+	}
+	for (uint32_t i = 0; ok && i < argc && !dc_cexpr_walk_done(w) && !EG(exception); i++) {
+		dc_cexpr_walk_zval(w, &vals[i]);
+	}
+	for (uint32_t i = 0; i < evaluated; i++) {
+		zval_ptr_dtor(&vals[i]);
+	}
+	if (vals) {
+		efree(vals);
+	}
+	return ok;
+}
+
+/* Evaluate one const-expr zval (constant value, property or parameter
+ * default) on a copy and walk the result. */
+static bool dc_cexpr_walk_const(dc_cexpr_walk *w, zval *src, zend_class_entry *scope, bool clear_failure)
+{
+	zval v;
+	ZVAL_COPY(&v, src);
+	if (Z_TYPE(v) == IS_CONSTANT_AST && FAILURE == zval_update_constant_ex(&v, scope)) {
+		zval_ptr_dtor(&v);
+		if (clear_failure && EG(exception)) {
+			zend_clear_exception();
+		}
+		return false;
+	}
+	if (!EG(exception)) {
+		dc_cexpr_walk_zval(w, &v);
+	}
+	zval_ptr_dtor(&v);
+	return true;
+}
+
+static zval *dc_cexpr_prop_default(zend_class_entry *ce, const zend_property_info *prop)
+{
+#ifdef ZEND_ACC_VIRTUAL
+	if (prop->flags & ZEND_ACC_VIRTUAL) {
+		return NULL;
+	}
+#endif
+	if (prop->flags & ZEND_ACC_STATIC) {
+		return ce->default_static_members_table ? &ce->default_static_members_table[prop->offset] : NULL;
+	}
+	return ce->default_properties_table ? &ce->default_properties_table[OBJ_PROP_TO_NUM(prop->offset)] : NULL;
+}
+
+static zval *dc_cexpr_param_default(const zend_op_array *op_array, uint32_t param)
+{
+	for (uint32_t i = 0; i < op_array->last; i++) {
+		const zend_op *op = &op_array->opcodes[i];
+		if (op->opcode == ZEND_RECV_INIT) {
+			if (op->op1.num == param + 1) {
+				return RT_CONSTANT(op, op->op2);
+			}
+		} else if (op->opcode != ZEND_RECV && op->opcode != ZEND_RECV_VARIADIC) {
+			break;
+		}
+	}
+	return NULL;
+}
+
+#if PHP_VERSION_ID >= 80500
+/* Builds [class, site, attrIndex|null, ord, line]; takes ownership of site. */
+static void dc_cexpr_payload(zval *dst, zend_class_entry *ce, zend_string *site, zend_long attr_index, uint32_t ord, uint32_t line)
+{
+	zval tmp;
+	array_init_size(dst, 5);
+	ZVAL_STR_COPY(&tmp, ce->name);
+	zend_hash_index_add_new(Z_ARRVAL_P(dst), 0, &tmp);
+	ZVAL_STR(&tmp, site);
+	zend_hash_index_add_new(Z_ARRVAL_P(dst), 1, &tmp);
+	if (attr_index < 0) {
+		ZVAL_NULL(&tmp);
+	} else {
+		ZVAL_LONG(&tmp, attr_index);
+	}
+	zend_hash_index_add_new(Z_ARRVAL_P(dst), 2, &tmp);
+	ZVAL_LONG(&tmp, (zend_long) ord);
+	zend_hash_index_add_new(Z_ARRVAL_P(dst), 3, &tmp);
+	ZVAL_LONG(&tmp, (zend_long) line);
+	zend_hash_index_add_new(Z_ARRVAL_P(dst), 4, &tmp);
+}
+
+/* Walk one attribute list (entries matching `offset`) looking for the needle.
+ * On match fills *attr_index (ordinal among same-offset entries) and *ord. */
+static bool dc_cexpr_locate_in_attrs(HashTable *attributes, uint32_t offset, zend_class_entry *scope, const zend_op *needle, uint32_t *attr_index, uint32_t *ord)
+{
+	if (!attributes) {
+		return false;
+	}
+	uint32_t idx = 0;
+	zend_attribute *attr;
+	ZEND_HASH_FOREACH_PTR(attributes, attr) {
+		if (attr->offset != offset) {
+			continue;
+		}
+		dc_cexpr_walk w;
+		dc_cexpr_walk_init(&w, needle, 0);
+		dc_cexpr_walk_attr(&w, attr, scope, true);
+		bool matched = w.matched;
+		*ord = w.matched_ord;
+		dc_cexpr_walk_dtor(&w);
+		if (UNEXPECTED(EG(exception))) {
+			return false;
+		}
+		if (matched) {
+			*attr_index = idx;
+			return true;
+		}
+		idx++;
+	} ZEND_HASH_FOREACH_END();
+	return false;
+}
+
+static bool dc_cexpr_locate_in_value(zval *src, zend_class_entry *scope, const zend_op *needle, uint32_t *ord)
+{
+	dc_cexpr_walk w;
+	dc_cexpr_walk_init(&w, needle, 0);
+	dc_cexpr_walk_const(&w, src, scope, true);
+	bool matched = w.matched;
+	*ord = w.matched_ord;
+	dc_cexpr_walk_dtor(&w);
+	return matched && !EG(exception);
+}
+
+/* Try to express an anonymous closure as a reference to the constant
+ * expression that declares it. Identity is exact: the closure's op_array
+ * shares its opcodes with the op_array embedded in the declaring AST.
+ * Sites are scanned in the same order the polyfill indexes them, so both
+ * implementations produce identical payloads. Promoted properties are
+ * skipped: their constructor parameter is the canonical surface. */
+static bool dc_cexpr_locate(const zend_function *target, zval *payload)
+{
+	zend_class_entry *ce = target->common.scope;
+	const zend_op *needle = target->op_array.opcodes;
+	uint32_t line = target->op_array.line_start;
+	uint32_t attr_index, ord;
+	zend_string *name;
+
+	if (!needle) {
+		return false;
+	}
+
+	/* class attributes */
+	if (dc_cexpr_locate_in_attrs(ce->attributes, 0, ce, needle, &attr_index, &ord)) {
+		dc_cexpr_payload(payload, ce, ZSTR_EMPTY_ALLOC(), (zend_long) attr_index, ord, line);
+		return true;
+	}
+	if (UNEXPECTED(EG(exception))) {
+		return false;
+	}
+
+	/* class constants and enum cases: attributes, then the value */
+	zend_class_constant *c;
+	ZEND_HASH_FOREACH_STR_KEY_PTR(&ce->constants_table, name, c) {
+		if (c->ce != ce) {
+			continue;
+		}
+		if (dc_cexpr_locate_in_attrs(c->attributes, 0, ce, needle, &attr_index, &ord)) {
+			dc_cexpr_payload(payload, ce, zend_string_copy(name), (zend_long) attr_index, ord, line);
+			return true;
+		}
+		if (!EG(exception) && dc_cexpr_locate_in_value(&c->value, c->ce, needle, &ord)) {
+			dc_cexpr_payload(payload, ce, zend_string_copy(name), -1, ord, line);
+			return true;
+		}
+		if (UNEXPECTED(EG(exception))) {
+			return false;
+		}
+	} ZEND_HASH_FOREACH_END();
+
+	/* properties: attributes, then the default value */
+	zend_property_info *prop;
+	ZEND_HASH_FOREACH_STR_KEY_PTR(&ce->properties_info, name, prop) {
+		if (prop->ce != ce || (prop->flags & ZEND_ACC_PROMOTED)) {
+			continue;
+		}
+		if (dc_cexpr_locate_in_attrs(prop->attributes, 0, ce, needle, &attr_index, &ord)) {
+			dc_cexpr_payload(payload, ce, zend_strpprintf(0, "$%s", ZSTR_VAL(name)), (zend_long) attr_index, ord, line);
+			return true;
+		}
+		zval *def = dc_cexpr_prop_default(ce, prop);
+		if (!EG(exception) && def && Z_TYPE_P(def) != IS_UNDEF && dc_cexpr_locate_in_value(def, prop->ce, needle, &ord)) {
+			dc_cexpr_payload(payload, ce, zend_strpprintf(0, "$%s", ZSTR_VAL(name)), -1, ord, line);
+			return true;
+		}
+		if (UNEXPECTED(EG(exception))) {
+			return false;
+		}
+		/* property hooks: attributes, then per parameter attributes */
+		if (prop->hooks) {
+			for (uint32_t hk = 0; hk < ZEND_PROPERTY_HOOK_COUNT; hk++) {
+				const zend_function *hfn = prop->hooks[hk];
+				if (!hfn || hfn->type != ZEND_USER_FUNCTION) {
+					continue;
+				}
+				const char *hname = hk == ZEND_PROPERTY_HOOK_GET ? "get" : "set";
+				if (dc_cexpr_locate_in_attrs(hfn->op_array.attributes, 0, ce, needle, &attr_index, &ord)) {
+					dc_cexpr_payload(payload, ce, zend_strpprintf(0, "$%s::%s()", ZSTR_VAL(name), hname), (zend_long) attr_index, ord, line);
+					return true;
+				}
+				if (UNEXPECTED(EG(exception))) {
+					return false;
+				}
+				uint32_t hook_params = hfn->common.num_args + ((hfn->common.fn_flags & ZEND_ACC_VARIADIC) ? 1 : 0);
+				for (uint32_t pi = 0; pi < hook_params; pi++) {
+					if (dc_cexpr_locate_in_attrs(hfn->op_array.attributes, pi + 1, ce, needle, &attr_index, &ord)) {
+						dc_cexpr_payload(payload, ce, zend_strpprintf(0, "$%s::%s()#%u", ZSTR_VAL(name), hname, pi), (zend_long) attr_index, ord, line);
+						return true;
+					}
+					if (UNEXPECTED(EG(exception))) {
+						return false;
+					}
+				}
+			}
+		}
+	} ZEND_HASH_FOREACH_END();
+
+	/* methods: attributes, then per parameter: attributes, then the default */
+	zend_function *fn;
+	ZEND_HASH_FOREACH_PTR(&ce->function_table, fn) {
+		if (fn->common.scope != ce || fn->type != ZEND_USER_FUNCTION) {
+			continue;
+		}
+		const char *fname = ZSTR_VAL(fn->common.function_name);
+		if (dc_cexpr_locate_in_attrs(fn->op_array.attributes, 0, ce, needle, &attr_index, &ord)) {
+			dc_cexpr_payload(payload, ce, zend_strpprintf(0, "%s()", fname), (zend_long) attr_index, ord, line);
+			return true;
+		}
+		if (UNEXPECTED(EG(exception))) {
+			return false;
+		}
+		uint32_t num_params = fn->common.num_args + ((fn->common.fn_flags & ZEND_ACC_VARIADIC) ? 1 : 0);
+		for (uint32_t pi = 0; pi < num_params; pi++) {
+			if (dc_cexpr_locate_in_attrs(fn->op_array.attributes, pi + 1, ce, needle, &attr_index, &ord)) {
+				dc_cexpr_payload(payload, ce, zend_strpprintf(0, "%s()#%u", fname, pi), (zend_long) attr_index, ord, line);
+				return true;
+			}
+			zval *def = dc_cexpr_param_default(&fn->op_array, pi);
+			if (!EG(exception) && def && dc_cexpr_locate_in_value(def, ce, needle, &ord)) {
+				dc_cexpr_payload(payload, ce, zend_strpprintf(0, "%s()#%u", fname, pi), -1, ord, line);
+				return true;
+			}
+			if (UNEXPECTED(EG(exception))) {
+				return false;
+			}
+		}
+	} ZEND_HASH_FOREACH_END();
+
+	return false;
+}
+#endif /* PHP_VERSION_ID >= 80500 */
+
+/* deepclone_from_array() counterpart: resolve a declaration-site reference
+ * back to a live Closure. */
+static void dc_cexpr_resolve(zval *value, HashTable *allowed_set, zval *retval)
+{
+	if (Z_TYPE_P(value) != IS_ARRAY) {
+		zend_value_error("deepclone_from_array(): malformed payload, const-expr-closure value must be of type array, %s given", zend_zval_value_name(value));
+		return;
+	}
+	HashTable *ht = Z_ARRVAL_P(value);
+	zval *zclass = zend_hash_index_find(ht, 0);
+	zval *zsite = zend_hash_index_find(ht, 1);
+	zval *zattr = zend_hash_index_find(ht, 2);
+	zval *zord = zend_hash_index_find(ht, 3);
+	zval *zline = zend_hash_index_find(ht, 4);
+	if (!zclass || !zsite || !zattr || !zord || !zline || zend_hash_num_elements(ht) != 5) {
+		zend_value_error("deepclone_from_array(): malformed payload, const-expr-closure value must have 5 elements");
+		return;
+	}
+	ZVAL_DEREF(zclass);
+	ZVAL_DEREF(zsite);
+	ZVAL_DEREF(zattr);
+	ZVAL_DEREF(zord);
+	ZVAL_DEREF(zline);
+	if (Z_TYPE_P(zclass) != IS_STRING) {
+		zend_value_error("deepclone_from_array(): malformed payload, const-expr-closure class name must be of type string, %s given", zend_zval_value_name(zclass));
+		return;
+	}
+	if (Z_TYPE_P(zsite) != IS_STRING) {
+		zend_value_error("deepclone_from_array(): malformed payload, const-expr-closure site must be of type string, %s given", zend_zval_value_name(zsite));
+		return;
+	}
+	if (Z_TYPE_P(zattr) != IS_NULL && Z_TYPE_P(zattr) != IS_LONG) {
+		zend_value_error("deepclone_from_array(): malformed payload, const-expr-closure attribute index must be of type int or null, %s given", zend_zval_value_name(zattr));
+		return;
+	}
+	if (Z_TYPE_P(zord) != IS_LONG) {
+		zend_value_error("deepclone_from_array(): malformed payload, const-expr-closure closure index must be of type int, %s given", zend_zval_value_name(zord));
+		return;
+	}
+	if (Z_TYPE_P(zline) != IS_LONG) {
+		zend_value_error("deepclone_from_array(): malformed payload, const-expr-closure line must be of type int, %s given", zend_zval_value_name(zline));
+		return;
+	}
+
+	/* Gate before zend_lookup_class(): the payload must not be able to
+	 * autoload, let alone evaluate, classes outside the allow-list. */
+	if (!dc_class_allowed(allowed_set, Z_STR_P(zclass))) {
+		zend_value_error("deepclone_from_array(): class \"%s\" is not allowed", Z_STRVAL_P(zclass));
+		return;
+	}
+
+	zend_class_entry *ce = zend_lookup_class(Z_STR_P(zclass));
+	if (!ce) {
+		zend_value_error("deepclone_from_array(): malformed payload, const-expr-closure references unknown class \"%s\"", Z_STRVAL_P(zclass));
+		return;
+	}
+
+	const char *site = Z_STRVAL_P(zsite);
+	size_t site_len = Z_STRLEN_P(zsite);
+	zend_long attr_index = Z_TYPE_P(zattr) == IS_LONG ? Z_LVAL_P(zattr) : -1;
+	bool attr_site = Z_TYPE_P(zattr) == IS_LONG;
+	zend_long want_ord = Z_LVAL_P(zord);
+	zend_long line = Z_LVAL_P(zline);
+
+	if (want_ord < 0 || want_ord > UINT32_MAX) {
+		zend_value_error("deepclone_from_array(): malformed payload, const-expr-closure references unknown closure index " ZEND_LONG_FMT, want_ord);
+		return;
+	}
+
+	/* Resolve the site to a target: its attribute list + evaluation scope,
+	 * and for value sites the const-expr source zval. */
+	HashTable *attributes = NULL;
+	uint32_t attr_offset = 0;
+	zend_class_entry *scope = ce;
+	zval *const_src = NULL;
+	bool has_value_site = false;
+
+	if (0 == site_len) {
+		attributes = ce->attributes;
+	} else if ('$' == site[0]) {
+		size_t sep = 0;
+		for (size_t i = 1; i + 1 < site_len; i++) {
+			if (':' == site[i] && ':' == site[i + 1]) {
+				sep = i;
+				break;
+			}
+		}
+		if (sep) {
+#if PHP_VERSION_ID < 80400
+			zend_value_error("deepclone_from_array(): malformed payload, const-expr-closure references unknown hook \"%s\"", site);
+			return;
+#else
+			/* property hook: "$prop::get()", "$prop::set()#N" */
+			const zend_function *hfn = NULL;
+			size_t spec_len = site_len - sep - 2;
+			const char *spec = site + sep + 2;
+			uint64_t param = 0;
+			bool has_param = false;
+			bool valid = true;
+			if (spec_len > 5 && ')' == spec[4] && '#' == spec[5]) {
+				has_param = true;
+				valid = spec_len > 6 && ('0' != spec[6] || 7 == spec_len);
+				for (size_t i = 6; valid && i < spec_len; i++) {
+					valid = spec[i] >= '0' && spec[i] <= '9' && (param = param * 10 + (spec[i] - '0')) <= UINT32_MAX;
+				}
+				spec_len = 5;
+			}
+			uint32_t hook_kind = ZEND_PROPERTY_HOOK_COUNT;
+			if (valid && 5 == spec_len && 0 == memcmp(spec + 3, "()", 2)) {
+				if (0 == memcmp(spec, "get", 3)) {
+					hook_kind = ZEND_PROPERTY_HOOK_GET;
+				} else if (0 == memcmp(spec, "set", 3)) {
+					hook_kind = ZEND_PROPERTY_HOOK_SET;
+				}
+			}
+			if (hook_kind < ZEND_PROPERTY_HOOK_COUNT) {
+				zend_property_info *prop = zend_hash_str_find_ptr(&ce->properties_info, site + 1, sep - 1);
+				if (prop && prop->hooks && prop->hooks[hook_kind] && prop->hooks[hook_kind]->type == ZEND_USER_FUNCTION) {
+					hfn = prop->hooks[hook_kind];
+				}
+			}
+			uint32_t hook_params = hfn ? hfn->common.num_args + ((hfn->common.fn_flags & ZEND_ACC_VARIADIC) ? 1 : 0) : 0;
+			if (!hfn || (has_param && param >= hook_params)) {
+				zend_value_error("deepclone_from_array(): malformed payload, const-expr-closure references unknown hook \"%s\"", site);
+				return;
+			}
+			attributes = hfn->op_array.attributes;
+			scope = hfn->common.scope;
+			if (has_param) {
+				attr_offset = (uint32_t) param + 1;
+				const_src = dc_cexpr_param_default(&hfn->op_array, (uint32_t) param);
+				has_value_site = true;
+			}
+#endif
+		} else {
+			zend_property_info *prop = zend_hash_str_find_ptr(&ce->properties_info, site + 1, site_len - 1);
+			if (!prop) {
+				zend_value_error("deepclone_from_array(): malformed payload, const-expr-closure references unknown property \"%s\"", site);
+				return;
+			}
+			attributes = prop->attributes;
+			scope = prop->ce;
+			const_src = dc_cexpr_prop_default(ce, prop);
+			has_value_site = true;
+		}
+	} else {
+		/* "name()#N" parameter site? */
+		size_t paren = 0;
+		for (size_t i = 1; i + 1 < site_len; i++) {
+			if (')' == site[i] && '#' == site[i + 1]) {
+				paren = i;
+				break;
+			}
+		}
+		if (paren) {
+			zend_function *fn = NULL;
+			uint64_t param = 0;
+			bool valid = paren >= 2 && '(' == site[paren - 1] && paren + 2 < site_len
+				&& ('0' != site[paren + 2] || paren + 3 == site_len);
+			for (size_t i = paren + 2; valid && i < site_len; i++) {
+				valid = site[i] >= '0' && site[i] <= '9' && (param = param * 10 + (site[i] - '0')) <= UINT32_MAX;
+			}
+			if (valid) {
+				zend_string *mname = zend_string_init(site, paren - 1, 0);
+				fn = zend_hash_find_ptr_lc(&ce->function_table, mname);
+				zend_string_release(mname);
+			}
+			uint32_t num_params = fn && fn->type == ZEND_USER_FUNCTION
+				? fn->common.num_args + ((fn->common.fn_flags & ZEND_ACC_VARIADIC) ? 1 : 0) : 0;
+			if (!valid || !fn || param >= num_params) {
+				zend_value_error("deepclone_from_array(): malformed payload, const-expr-closure references unknown parameter \"%s\"", site);
+				return;
+			}
+			attributes = fn->op_array.attributes;
+			attr_offset = (uint32_t) param + 1;
+			scope = fn->common.scope;
+			const_src = dc_cexpr_param_default(&fn->op_array, (uint32_t) param);
+			has_value_site = true;
+		} else if (site_len >= 3 && '(' == site[site_len - 2] && ')' == site[site_len - 1]) {
+			zend_string *mname = zend_string_init(site, site_len - 2, 0);
+			zend_function *fn = zend_hash_find_ptr_lc(&ce->function_table, mname);
+			zend_string_release(mname);
+			if (!fn || fn->type != ZEND_USER_FUNCTION) {
+				zend_value_error("deepclone_from_array(): malformed payload, const-expr-closure references unknown method \"%s\"", site);
+				return;
+			}
+			attributes = fn->op_array.attributes;
+			scope = fn->common.scope;
+		} else {
+			zend_class_constant *c = zend_hash_find_ptr(&ce->constants_table, Z_STR_P(zsite));
+			if (!c) {
+				zend_value_error("deepclone_from_array(): malformed payload, const-expr-closure references unknown constant \"%s\"", site);
+				return;
+			}
+			attributes = c->attributes;
+			scope = c->ce;
+			const_src = &c->value;
+			has_value_site = true;
+		}
+	}
+
+	dc_cexpr_walk w;
+	dc_cexpr_walk_init(&w, NULL, (uint32_t) want_ord);
+
+	if (attr_site) {
+		zend_attribute *attr = NULL;
+		if (attr_index >= 0 && attributes) {
+			uint32_t idx = 0;
+			zend_attribute *a;
+			ZEND_HASH_FOREACH_PTR(attributes, a) {
+				if (a->offset != attr_offset) {
+					continue;
+				}
+				if (idx == (uint32_t) attr_index) {
+					attr = a;
+					break;
+				}
+				idx++;
+			} ZEND_HASH_FOREACH_END();
+		}
+		if (!attr) {
+			dc_cexpr_walk_dtor(&w);
+			zend_value_error("deepclone_from_array(): malformed payload, const-expr-closure references unknown attribute index " ZEND_LONG_FMT, attr_index);
+			return;
+		}
+		if (!dc_cexpr_walk_attr(&w, attr, scope, false) || EG(exception)) {
+			dc_cexpr_walk_dtor(&w);
+			zval_ptr_dtor(&w.found);
+			zend_value_error("deepclone_from_array(): malformed payload, const-expr-closure evaluation failed for site \"%s\"", site);
+			return;
+		}
+	} else if (!has_value_site) {
+		dc_cexpr_walk_dtor(&w);
+		zend_value_error("deepclone_from_array(): malformed payload, const-expr-closure attribute index is required for site \"%s\"", site);
+		return;
+	} else if (const_src && Z_TYPE_P(const_src) != IS_UNDEF
+			&& (!dc_cexpr_walk_const(&w, const_src, scope, false) || EG(exception))) {
+		dc_cexpr_walk_dtor(&w);
+		zval_ptr_dtor(&w.found);
+		zend_value_error("deepclone_from_array(): malformed payload, const-expr-closure evaluation failed for site \"%s\"", site);
+		return;
+	}
+
+	dc_cexpr_walk_dtor(&w);
+	if (Z_ISUNDEF(w.found)) {
+		zend_value_error("deepclone_from_array(): malformed payload, const-expr-closure references unknown closure index " ZEND_LONG_FMT, want_ord);
+		return;
+	}
+
+	const zend_function *f = zend_get_closure_method_def(Z_OBJ(w.found));
+	uint32_t found_line = f->type == ZEND_USER_FUNCTION ? f->op_array.line_start : 0;
+	if (line != (zend_long) found_line) {
+		zval_ptr_dtor(&w.found);
+		zend_value_error("deepclone_from_array(): stale payload, const-expr-closure moved from line " ZEND_LONG_FMT " to line %u", line, found_line);
+		return;
+	}
+
+	ZVAL_COPY_VALUE(retval, &w.found);
 }
 
 static void dc_copy_value(dc_ctx *ctx, zval *src, zval *dst, zval *mask_dst)
@@ -1172,7 +1806,32 @@ static void dc_copy_value(dc_ctx *ctx, zval *src, zval *dst, zval *mask_dst)
 			DC_MASK_NAMED_CLOSURE(mask_dst);
 			goto handle_value;
 		}
-		/* Anonymous closure — fall through to regular object handling */
+
+#if PHP_VERSION_ID >= 80500
+		/* Anonymous closure: reference its const-expr declaration site.
+		 * The allow-list is checked first so that disallowing Closure is
+		 * reported before any const-expr of the scope class is evaluated. */
+		if (func && func->type == ZEND_USER_FUNCTION && func->common.scope) {
+			zval *this_ptr = zend_get_closure_this_ptr(src);
+			if (!this_ptr || Z_TYPE_P(this_ptr) != IS_OBJECT) {
+				if (!dc_class_allowed(ctx->allowed_ht, zend_ce_closure->name)) {
+					zend_value_error("deepclone_to_array(): class \"Closure\" is not allowed");
+					return;
+				}
+				zval payload;
+				ZVAL_UNDEF(&payload);
+				if (dc_cexpr_locate(func, &payload)) {
+					ZVAL_COPY_VALUE(dst, &payload);
+					DC_MASK_CONSTEXPR_CLOSURE(mask_dst);
+					goto handle_value;
+				}
+				if (UNEXPECTED(EG(exception))) {
+					return;
+				}
+			}
+		}
+#endif
+		/* Other anonymous closure — fall through to regular object handling */
 	}
 
 	/* ── Regular object processing ──────────────── */
@@ -2145,11 +2804,12 @@ PHP_FUNCTION(deepclone_to_array)
  *   true   object reference     →  objects[value]    (value is the pool id)
  *   false  hard PHP &-reference →  &refs[-value]
  *   0      named closure        →  reconstruct callable from value
+ *   1      const-expr closure   →  re-evaluate its declaration site
  *   'e'    UnitEnum             →  resolve "Class::Case" string
  *   array  nested mask          →  recurse into the array's elements
  *   other  no marker            →  copy value as-is
  */
-static void dc_resolve(zval *value, zval *mask, zval *objects, uint32_t num_objects, HashTable *refs, zval *retval)
+static void dc_resolve(zval *value, zval *mask, zval *objects, uint32_t num_objects, HashTable *refs, HashTable *allowed_set, zval *retval)
 {
 	if (EXPECTED(DC_MASK_IS_OBJ_REF(mask))) {
 		if (UNEXPECTED(Z_TYPE_P(value) != IS_LONG)) {
@@ -2316,6 +2976,11 @@ static void dc_resolve(zval *value, zval *mask, zval *objects, uint32_t num_obje
 		return;
 	}
 
+	if (DC_MASK_IS_CONSTEXPR_CLOSURE(mask)) {
+		dc_cexpr_resolve(value, allowed_set, retval);
+		return;
+	}
+
 	if (Z_TYPE_P(mask) == IS_STRING && ZSTR_LEN(Z_STR_P(mask)) == 1 && ZSTR_VAL(Z_STR_P(mask))[0] == 'e') {
 		/* UnitEnum: parse "Class::Case", resolve via zend_enum_get_case */
 		if (Z_TYPE_P(value) != IS_STRING) {
@@ -2398,7 +3063,7 @@ static void dc_resolve(zval *value, zval *mask, zval *objects, uint32_t num_obje
 		} else {
 			zval resolved;
 			ZVAL_UNDEF(&resolved);
-			dc_resolve(slot, mval, objects, num_objects, refs, &resolved);
+			dc_resolve(slot, mval, objects, num_objects, refs, allowed_set, &resolved);
 			if (EG(exception)) {
 				zval_ptr_dtor(&result);
 				return;
@@ -2420,14 +3085,14 @@ static void dc_resolve(zval *value, zval *mask, zval *objects, uint32_t num_obje
 	} while (0)
 #define DC_REQUIRE(cond, ...) do { if (UNEXPECTED(!(cond))) DC_INVALID(__VA_ARGS__); } while (0)
 
-/* Recursively scan a mask zval tree for LONG(0) entries (named-closure
- * markers). Returns true as soon as one is found. */
+/* Recursively scan a mask zval tree for LONG(0)/LONG(1) entries (named and
+ * const-expr closure markers). Returns true as soon as one is found. */
 static bool dc_mask_has_closure(zval *mask)
 {
 	if (mask == NULL) {
 		return false;
 	}
-	if (DC_MASK_IS_NAMED_CLOSURE(mask)) {
+	if (DC_MASK_IS_NAMED_CLOSURE(mask) || DC_MASK_IS_CONSTEXPR_CLOSURE(mask)) {
 		return true;
 	}
 	if (Z_TYPE_P(mask) != IS_ARRAY) {
@@ -2727,7 +3392,7 @@ PHP_FUNCTION(deepclone_from_array)
 				if (!slot) continue;
 				zval resolved;
 				ZVAL_UNDEF(&resolved);
-				dc_resolve(slot, rmask, objects, num_objects, &refs, &resolved);
+				dc_resolve(slot, rmask, objects, num_objects, &refs, allowed_set, &resolved);
 				if (EG(exception)) goto cleanup;
 				/* Write through reference if slot was made into one (by dc_resolve) */
 				if (Z_ISREF_P(slot)) {
@@ -2870,7 +3535,7 @@ PHP_FUNCTION(deepclone_from_array)
 					zval *marker = resolve_ids ? zend_hash_index_find(resolve_ids, obj_id) : NULL;
 					if (marker) {
 						ZVAL_UNDEF(&final_val);
-						dc_resolve(prop_val, marker, objects, num_objects, &refs, &final_val);
+						dc_resolve(prop_val, marker, objects, num_objects, &refs, allowed_set, &final_val);
 						if (EG(exception)) {
 							EG(fake_scope) = old_scope;
 							goto cleanup;
@@ -2975,7 +3640,7 @@ PHP_FUNCTION(deepclone_from_array)
 				zval resolved_props;
 				if (smask) {
 					ZVAL_UNDEF(&resolved_props);
-					dc_resolve(sprops, smask, objects, num_objects, &refs, &resolved_props);
+					dc_resolve(sprops, smask, objects, num_objects, &refs, allowed_set, &resolved_props);
 					if (EG(exception)) goto cleanup;
 				} else {
 					ZVAL_COPY(&resolved_props, sprops);
@@ -3038,7 +3703,7 @@ PHP_FUNCTION(deepclone_from_array)
 			ZVAL_COPY(return_value, ref);
 		}
 	} else if (zmask) {
-		dc_resolve(zprepared, zmask, objects, num_objects, &refs, return_value);
+		dc_resolve(zprepared, zmask, objects, num_objects, &refs, allowed_set, return_value);
 		if (EG(exception)) goto cleanup;
 	} else {
 		ZVAL_COPY(return_value, zprepared);
