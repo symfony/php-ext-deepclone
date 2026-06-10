@@ -1,5 +1,5 @@
 --TEST--
-deepclone round-trips BcMath\Number, refuses to hydrate it, and never crashes on an uninitialized one (symfony/symfony#64323)
+deepclone round-trips BcMath\Number, refuses to hydrate it, and rejects a payload that would create an uninitialized one (symfony/symfony#64323)
 --EXTENSIONS--
 deepclone
 --SKIPIF--
@@ -37,17 +37,19 @@ try {
     echo $e->getMessage(), "\n";
 }
 
-// ── Defensive: an uninitialized instance (forced here via a hand-mutated
-//    payload that drops the __unserialize replay) must throw a clean Error on
-//    use, never segfault. ──
+// ── A crafted payload that drops the __unserialize replay for a class that
+//    needs it (here by clearing the wakeup flag) is rejected, rather than
+//    building an uninitialized instance that would crash on use. An
+//    uninitialized BcMath\Number cannot be reached from userland, so the
+//    engine offers no guard; the extension must not produce one either. ──
 $d = deepclone_to_array(new Number('1'));
 $d['objectMeta'][0][1] = 0; // clear the __unserialize flag
 $d['states'] = [];          // and drop the replay
-$u = deepclone_from_array($d);
-var_dump($u instanceof Number);
-foreach (['toString' => fn() => (string) $u, 'clone' => fn() => clone $u, 'add' => fn() => $u->add(1)] as $op => $f) {
-    try { $f(); echo "$op: no error\n"; }
-    catch (\Error $e) { echo "$op: ", $e->getMessage(), "\n"; }
+try {
+    deepclone_from_array($d);
+    echo "not rejected\n";
+} catch (\ValueError $e) {
+    echo "rejected with ValueError\n";
 }
 ?>
 --EXPECT--
@@ -62,7 +64,4 @@ string(6) "99.999"
 int(3)
 string(7) "100.499"
 Class "BcMath\Number" is not instantiable.
-bool(true)
-toString: The BcMath\Number object has not been correctly initialized by its constructor
-clone: The BcMath\Number object has not been correctly initialized by its constructor
-add: The BcMath\Number object has not been correctly initialized by its constructor
+rejected with ValueError

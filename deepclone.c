@@ -3365,6 +3365,15 @@ PHP_FUNCTION(deepclone_from_array)
 				}
 				class_ces[cid] = ce;
 			}
+			/* deepclone_to_array() always emits a class that has
+			 * __unserialize() as a negative-wakeup state replay. A payload
+			 * that creates such a class without that flag would leave the bare
+			 * object_init_ex() shell uninitialized — e.g. BcMath\Number's
+			 * bc_num stays NULL and any operation on it crashes. Reject rather
+			 * than build an unusable object. */
+			if (UNEXPECTED(ce->__unserialize != NULL && (!obj_wakeups || obj_wakeups[id] >= 0))) {
+				DC_INVALID("deepclone_from_array(): Argument #1 ($data) object %u of class %s has an __unserialize() method but \"objectMeta\" does not flag it for an __unserialize state", id, ZSTR_VAL(ce->name));
+			}
 			if (UNEXPECTED(object_init_ex(&obj_zval, ce) != SUCCESS)) {
 				goto cleanup;
 			}
