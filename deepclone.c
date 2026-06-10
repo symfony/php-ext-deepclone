@@ -964,6 +964,17 @@ static void dc_copy_array(dc_ctx *ctx, HashTable *src_ht, zval *dst, zval *mask_
 	zend_hash_real_init_mixed(Z_ARRVAL_P(mask_dst));
 
 	ZEND_HASH_FOREACH_KEY_VAL(src_ht, idx, key, src_val) {
+		/* __serialize() may return the object's raw property table (e.g.
+		 * Random\Randomizer before PHP 8.3), where declared properties are
+		 * IS_INDIRECT slots into the object. Resolve them like the native
+		 * serializer does, or the payload would retain pointers that dangle
+		 * once the source object is released. */
+		if (UNEXPECTED(Z_TYPE_P(src_val) == IS_INDIRECT)) {
+			src_val = Z_INDIRECT_P(src_val);
+			if (Z_TYPE_P(src_val) == IS_UNDEF) {
+				continue;
+			}
+		}
 		zval undef, null_marker;
 		ZVAL_UNDEF(&undef);
 		ZVAL_NULL(&null_marker);
