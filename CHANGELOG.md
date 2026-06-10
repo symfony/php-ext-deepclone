@@ -5,6 +5,35 @@ All notable changes to this extension will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.0] - 2026-06-10
+
+### Added
+
+- `deepclone_to_array()` / `deepclone_from_array()` now round-trip closures
+  declared in constant expressions (PHP 8.5+: attribute arguments, class
+  constants, enum cases, property and parameter defaults, and property hooks).
+  Such closures are compile-time-checked to be static and capture-free, so
+  they carry no state and are encoded by their declaration site (a new mask
+  marker) rather than by code. `deepclone_from_array()` re-evaluates the
+  addressed constant expression, selects the closure by a depth-first index,
+  and verifies the declaration line still matches, so a payload that outlived a
+  code change fails loudly with a "stale payload" error instead of resolving to
+  a moved closure. The payload carries names and indices only, never code;
+  `allowed_classes` gates both directions (`Closure` to encode, the declaring
+  class to decode). Closures created at runtime, and any the scanner cannot
+  match, keep throwing `\DeepClone\NotInstantiableException` as before.
+
+### Fixed
+
+- `deepclone_from_array()` now rejects, with a `\ValueError`, a payload that
+  creates an object of a class with `__unserialize()` without flagging it for
+  its negative-wakeup state replay. Such a crafted payload previously built a
+  bare `object_init_ex()` shell that `__unserialize()` never initialized; for
+  `BcMath\Number` the `bc_num` stays `NULL` and any operation on it crashed.
+  `deepclone_to_array()` only ever emits such a class with the replay flag, so
+  well-formed payloads are unaffected (php/php-src#22259 proposed an engine-side
+  guard but was declined, as the state is unreachable from userland).
+
 ## [0.6.1] - 2026-06-09
 
 ### Fixed
