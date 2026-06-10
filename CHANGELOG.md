@@ -5,6 +5,17 @@ All notable changes to this extension will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.2] - 2026-06-10
+
+### Fixed
+
+- `deepclone_to_array()` now resolves the `IS_INDIRECT` slots that internal
+  classes may leave in the state returned by `__serialize()` (e.g.
+  `Random\Randomizer` before PHP 8.3, whose raw property table points into
+  the object). The payload previously retained those pointers, and using it
+  after the source object was released crashed `deepclone_from_array()` on
+  PHP 8.2.
+
 ## [0.7.1] - 2026-06-10
 
 ### Added
