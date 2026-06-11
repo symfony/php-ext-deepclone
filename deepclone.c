@@ -1073,7 +1073,7 @@ static void dc_mask_cleanup(zval *mask)
  */
 
 typedef struct {
-	const zend_op *needle;      /* locate: opcodes identifying the target closure */
+	const zend_function *needle; /* locate: the target function to identify */
 	uint32_t       want_ord;    /* resolve: ordinal of the closure to extract */
 	uint32_t       ord;         /* running count of closures walked at this site */
 	bool           matched;
@@ -1082,7 +1082,24 @@ typedef struct {
 	HashTable      seen;        /* visited non-closure objects (cycle guard) */
 } dc_cexpr_walk;
 
-static void dc_cexpr_walk_init(dc_cexpr_walk *w, const zend_op *needle, uint32_t want_ord)
+/* Identity match between a closure's target and the one being located. User
+ * functions (methods, global functions, anonymous closures) share their
+ * opcodes across closure instances; internal functions have none, so they are
+ * matched by name and scope (a NULL scope is a global function). */
+static bool dc_func_matches(const zend_function *a, const zend_function *b)
+{
+	if (a->type != b->type) {
+		return false;
+	}
+	if (a->type == ZEND_USER_FUNCTION) {
+		return a->op_array.opcodes == b->op_array.opcodes;
+	}
+	return a->common.scope == b->common.scope
+		&& a->common.function_name && b->common.function_name
+		&& zend_string_equals(a->common.function_name, b->common.function_name);
+}
+
+static void dc_cexpr_walk_init(dc_cexpr_walk *w, const zend_function *needle, uint32_t want_ord)
 {
 	w->needle = needle;
 	w->want_ord = want_ord;
@@ -1116,7 +1133,7 @@ static void dc_cexpr_walk_zval(dc_cexpr_walk *w, zval *val)
 		if (Z_OBJCE_P(val) == zend_ce_closure) {
 			if (w->needle) {
 				const zend_function *f = zend_get_closure_method_def(Z_OBJ_P(val));
-				if (!w->matched && f->type == ZEND_USER_FUNCTION && f->op_array.opcodes == w->needle) {
+				if (!w->matched && dc_func_matches(f, w->needle)) {
 					w->matched = true;
 					w->matched_ord = w->ord;
 				}
@@ -1262,7 +1279,7 @@ static void dc_cexpr_payload(zval *dst, zend_class_entry *ce, zend_string *site,
 
 /* Walk one attribute list (entries matching `offset`) looking for the needle.
  * On match fills *attr_index (ordinal among same-offset entries) and *ord. */
-static bool dc_cexpr_locate_in_attrs(HashTable *attributes, uint32_t offset, zend_class_entry *scope, const zend_op *needle, uint32_t *attr_index, uint32_t *ord)
+static bool dc_cexpr_locate_in_attrs(HashTable *attributes, uint32_t offset, zend_class_entry *scope, const zend_function *needle, uint32_t *attr_index, uint32_t *ord)
 {
 	if (!attributes) {
 		return false;
@@ -1291,7 +1308,7 @@ static bool dc_cexpr_locate_in_attrs(HashTable *attributes, uint32_t offset, zen
 	return false;
 }
 
-static bool dc_cexpr_locate_in_value(zval *src, zend_class_entry *scope, const zend_op *needle, uint32_t *ord)
+static bool dc_cexpr_locate_in_value(zval *src, zend_class_entry *scope, const zend_function *needle, uint32_t *ord)
 {
 	dc_cexpr_walk w;
 	dc_cexpr_walk_init(&w, needle, 0);
@@ -1308,15 +1325,20 @@ static bool dc_cexpr_locate_in_value(zval *src, zend_class_entry *scope, const z
  * Sites are scanned in the same order the polyfill indexes them, so both
  * implementations produce identical payloads. Promoted properties are
  * skipped: their constructor parameter is the canonical surface. */
-static bool dc_cexpr_locate(const zend_function *target, zval *payload)
+/* Locate `target` as a closure declared in the constant expressions of an
+ * explicit class `ce`. For an anonymous closure ce is its own scope; for a
+ * first-class callable it is the declaring class, which differs from the
+ * target's scope on cross-class references. */
+static bool dc_cexpr_locate_ce(const zend_function *target, zend_class_entry *ce, zval *payload)
 {
-	zend_class_entry *ce = target->common.scope;
-	const zend_op *needle = target->op_array.opcodes;
-	uint32_t line = target->op_array.line_start;
+	const zend_function *needle = target;
+	/* Internal functions have no line; resolution computes 0 for them, so the
+	 * staleness check matches. */
+	uint32_t line = target->type == ZEND_USER_FUNCTION ? target->op_array.line_start : 0;
 	uint32_t attr_index, ord;
 	zend_string *name;
 
-	if (!needle) {
+	if (!ce) {
 		return false;
 	}
 
@@ -1427,6 +1449,210 @@ static bool dc_cexpr_locate(const zend_function *target, zval *payload)
 	} ZEND_HASH_FOREACH_END();
 
 	return false;
+}
+
+/* Try to express a closure as a reference to the constant expression that
+ * declares it, deriving the declaring class from the closure's own scope.
+ * Covers anonymous closures and first-class callables over a method of their
+ * own declaring class. */
+static bool dc_cexpr_locate(const zend_function *target, zval *payload)
+{
+	return dc_cexpr_locate_ce(target, target->common.scope, payload);
+}
+
+/* ── Cross-class first-class-callable provenance (PHP 8.5, experimental) ──
+ *
+ * A first-class callable declared in a constant expression of class A but
+ * referencing a method of class B (e.g. #[When(Validators::check(...))]) has
+ * no link back to A on its closure object: its scope is B. PHP 8.6 records the
+ * declaring class as engine provenance (ReflectionFunction::getConstExprClass);
+ * 8.5 does not. To recover it without that API, we instrument
+ * ReflectionAttribute::getArguments() and ::newInstance() (the paths frameworks
+ * use to read attribute metadata) and record, for every cross-class FCC they
+ * produce, a name-keyed map from the target to its declaring class. It is built
+ * lazily and consulted only when the scope-based locate above fails. */
+
+/* zif_handler carries ZEND_FASTCALL, a distinct calling convention on Windows;
+ * match it so the handler swaps type-check under MSVC. */
+static zif_handler dc_orig_attr_get_arguments = NULL;
+static zif_handler dc_orig_attr_new_instance = NULL;
+
+/* Mirrors ext/reflection's private object layout so we can read a
+ * ReflectionAttribute's declaring-class scope. Must track the engine structs;
+ * validated against the build at hand. */
+typedef struct {
+	zval               obj;
+	void              *ptr;
+	zend_class_entry  *ce;
+	int                ref_type;   /* reflection_type_t */
+	zend_object        zo;
+} dc_refl_object_layout;
+
+typedef struct {
+	HashTable         *attributes;
+	zend_attribute    *data;
+	zend_class_entry  *scope;
+	zend_string       *filename;
+	uint32_t           target;
+} dc_attr_ref_layout;
+
+static zend_class_entry *dc_attr_declaring_scope(zend_object *obj)
+{
+	dc_refl_object_layout *ro = (dc_refl_object_layout *)
+		((char *) obj - offsetof(dc_refl_object_layout, zo));
+	dc_attr_ref_layout *ar = (dc_attr_ref_layout *) ro->ptr;
+	return ar ? ar->scope : NULL;
+}
+
+/* The index persists across requests (per worker), so it is keyed and valued
+ * by NAMES, not pointers: op_arrays and class entries are recompiled and freed
+ * every request (without opcache), so a pointer index would dangle. Names
+ * survive that churn, and the declaring class is re-resolved (without
+ * autoloading) and re-located at serialization time, so a stale entry simply
+ * misses instead of mis-resolving. Both keys and values are persistent strings
+ * because a persistent HashTable only addref's the keys it is given. */
+static void dc_provenance_dtor(zval *zv)
+{
+	zend_string_release((zend_string *) Z_PTR_P(zv));
+}
+
+/* Lowercased "targetClass\0method" — a request-lived, non-interned key. A NULL
+ * target class (a global function) uses an empty class part, which no real
+ * class can collide with. */
+static zend_string *dc_provenance_key(zend_class_entry *target_ce, zend_string *method)
+{
+	size_t cl = target_ce ? ZSTR_LEN(target_ce->name) : 0, ml = ZSTR_LEN(method);
+	zend_string *key = zend_string_alloc(cl + 1 + ml, 0);
+	if (target_ce) {
+		zend_str_tolower_copy(ZSTR_VAL(key), ZSTR_VAL(target_ce->name), cl);
+	}
+	ZSTR_VAL(key)[cl] = '\0';
+	zend_str_tolower_copy(ZSTR_VAL(key) + cl + 1, ZSTR_VAL(method), ml);
+	ZSTR_VAL(key)[cl + 1 + ml] = '\0';
+	return key;
+}
+
+static void dc_provenance_store(zend_class_entry *target_ce, zend_string *method, zend_class_entry *scope)
+{
+	HashTable *idx = &DC_G(attr_provenance);
+	if (!idx->nTableSize) {
+		zend_hash_init(idx, 8, NULL, dc_provenance_dtor, 1);
+	}
+	zend_string *key = dc_provenance_key(target_ce, method);
+	/* First declaring site wins; every site for one target is equivalent. */
+	if (!zend_hash_exists(idx, key)) {
+		zend_string *pkey = zend_string_dup(key, 1);
+		zend_string *pval = zend_string_init(ZSTR_VAL(scope->name), ZSTR_LEN(scope->name), 1);
+		zend_hash_add_ptr(idx, pkey, pval);
+		zend_string_release(pkey);   /* the table holds its own reference */
+	}
+	zend_string_release(key);
+}
+
+static zend_class_entry *dc_provenance_lookup(zend_class_entry *target_ce, zend_string *method)
+{
+	HashTable *idx = &DC_G(attr_provenance);
+	if (!idx->nTableSize) {
+		return NULL;
+	}
+	zend_string *key = dc_provenance_key(target_ce, method);
+	zend_string *decl = zend_hash_find_ptr(idx, key);
+	zend_string_release(key);
+	if (!decl) {
+		return NULL;
+	}
+	/* No autoload: serialization must not load classes as a side effect.
+	 * Under opcache.preload the declaring class is resident across requests. */
+	return zend_lookup_class_ex(decl, NULL, ZEND_FETCH_CLASS_NO_AUTOLOAD);
+}
+
+/* Walk a value (a getArguments() argument, or a newInstance() attribute object
+ * and its properties), recording every cross-class FCC against `scope`. The
+ * `seen` set guards cycles: getArguments() values are acyclic constant
+ * expressions, but a newInstance() object is built by an arbitrary attribute
+ * constructor and may be cyclic. */
+static void dc_index_closures_rec(HashTable *seen, zval *val, zend_class_entry *scope)
+{
+	if (UNEXPECTED(dc_check_stack_limit())) {
+		return;
+	}
+	ZVAL_DEREF(val);
+
+	if (Z_TYPE_P(val) == IS_OBJECT) {
+		if (Z_OBJCE_P(val) == zend_ce_closure) {
+			const zend_function *f = zend_get_closure_method_def(Z_OBJ_P(val));
+			/* Capture first-class callables the scope-based locate cannot find:
+			 * cross-class methods (target scope differs from `scope`) and global
+			 * functions (no scope at all), internal or user. An FCC over a method
+			 * of `scope` itself is already found by the scope-based locate, and
+			 * anonymous closures are not fake closures. */
+			if (f && (f->common.fn_flags & ZEND_ACC_FAKE_CLOSURE)
+					&& f->common.function_name && f->common.scope != scope) {
+				dc_provenance_store(f->common.scope, f->common.function_name, scope);
+			}
+			return;
+		}
+		if (!zend_hash_index_add_empty_element(seen, Z_OBJ_HANDLE_P(val))) {
+			return;
+		}
+		HashTable *props = zend_get_properties_for(val, ZEND_PROP_PURPOSE_ARRAY_CAST);
+		if (props) {
+			zval *v;
+			ZEND_HASH_FOREACH_VAL(props, v) {
+				ZVAL_DEINDIRECT(v);
+				if (Z_TYPE_P(v) != IS_UNDEF) {
+					dc_index_closures_rec(seen, v, scope);
+				}
+			} ZEND_HASH_FOREACH_END();
+			zend_release_properties(props);
+		}
+		return;
+	}
+
+	if (Z_TYPE_P(val) == IS_ARRAY) {
+		zval *v;
+		ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(val), v) {
+			dc_index_closures_rec(seen, v, scope);
+		} ZEND_HASH_FOREACH_END();
+	}
+}
+
+/* Common tail of both hooks: index the cross-class FCCs reachable from `val`
+ * against the declaring class of the ReflectionAttribute `this`. */
+static void dc_index_attr_closures(zval *this_zv, zval *val)
+{
+	if (!DC_G(capture_attribute_closures) || EG(exception)
+			|| Z_TYPE_P(this_zv) != IS_OBJECT) {
+		return;
+	}
+	zend_class_entry *scope = dc_attr_declaring_scope(Z_OBJ_P(this_zv));
+	if (!scope) {
+		return;
+	}
+	HashTable seen;
+	zend_hash_init(&seen, 8, NULL, NULL, 0);
+	dc_index_closures_rec(&seen, val, scope);
+	zend_hash_destroy(&seen);
+}
+
+/* Instrumented ReflectionAttribute::getArguments(): the FCCs are the returned
+ * argument values. */
+static void ZEND_FASTCALL dc_attr_get_arguments_wrapper(INTERNAL_FUNCTION_PARAMETERS)
+{
+	dc_orig_attr_get_arguments(INTERNAL_FUNCTION_PARAM_PASSTHRU);
+	if (Z_TYPE_P(return_value) == IS_ARRAY) {
+		dc_index_attr_closures(ZEND_THIS, return_value);
+	}
+}
+
+/* Instrumented ReflectionAttribute::newInstance(): the FCCs are properties of
+ * the returned attribute instance. */
+static void ZEND_FASTCALL dc_attr_new_instance_wrapper(INTERNAL_FUNCTION_PARAMETERS)
+{
+	dc_orig_attr_new_instance(INTERNAL_FUNCTION_PARAM_PASSTHRU);
+	if (Z_TYPE_P(return_value) == IS_OBJECT) {
+		dc_index_attr_closures(ZEND_THIS, return_value);
+	}
 }
 #endif /* PHP_VERSION_ID >= 80500 */
 
@@ -1814,6 +2040,51 @@ static void dc_copy_value(dc_ctx *ctx, zval *src, zval *dst, zval *mask_dst)
 				}
 				if (UNEXPECTED(EG(exception))) {
 					return;
+				}
+				/* Cross-class first-class callable: the declaring class is not
+				 * the closure's scope, so the locate above (which walks the
+				 * scope) misses. On 8.5 there is no engine provenance; fall back
+				 * to a declaring class captured from ReflectionAttribute, if
+				 * any, and locate the site there. */
+				if (DC_G(capture_attribute_closures) && func->common.scope && func->common.function_name) {
+					zend_class_entry *decl = dc_provenance_lookup(func->common.scope, func->common.function_name);
+					if (decl && decl != func->common.scope && dc_cexpr_locate_ce(func, decl, &payload)) {
+						ZVAL_COPY_VALUE(dst, &payload);
+						DC_MASK_CONSTEXPR_CLOSURE(mask_dst);
+						goto handle_value;
+					}
+					if (UNEXPECTED(EG(exception))) {
+						return;
+					}
+				}
+			}
+		}
+
+		/* Global-function first-class callable (no scope, internal or user):
+		 * the declaring class can only come from captured provenance. Same
+		 * declaration-site reference and Closure gating as above; unresolved
+		 * ones fall through to the by-name path. */
+		if (func && (func->common.fn_flags & ZEND_ACC_FAKE_CLOSURE)
+				&& !func->common.scope && func->common.function_name
+				&& DC_G(capture_attribute_closures)) {
+			zval *this_ptr = zend_get_closure_this_ptr(src);
+			if (!this_ptr || Z_TYPE_P(this_ptr) != IS_OBJECT) {
+				zend_class_entry *decl = dc_provenance_lookup(NULL, func->common.function_name);
+				if (decl) {
+					if (!dc_class_allowed(ctx->allowed_ht, zend_ce_closure->name)) {
+						zend_value_error("deepclone_to_array(): class \"Closure\" is not allowed");
+						return;
+					}
+					zval payload;
+					ZVAL_UNDEF(&payload);
+					if (dc_cexpr_locate_ce(func, decl, &payload)) {
+						ZVAL_COPY_VALUE(dst, &payload);
+						DC_MASK_CONSTEXPR_CLOSURE(mask_dst);
+						goto handle_value;
+					}
+					if (UNEXPECTED(EG(exception))) {
+						return;
+					}
 				}
 			}
 		}
@@ -5178,6 +5449,73 @@ PHP_MINIT_FUNCTION(deepclone)
 
 	register_deepclone_symbols(module_number);
 
+#if PHP_VERSION_ID >= 80500
+	/* Cross-class first-class-callable provenance: on PHP 8.5 the engine records
+	 * no declaring-class provenance for const-expr FCCs, so we recover it by
+	 * instrumenting ReflectionAttribute. When the engine exposes it natively
+	 * (ReflectionFunction::getConstExprClass, the serializable-closures patch),
+	 * the engine-id path resolves cross-class FCCs directly and this is left
+	 * off. There is no INI knob: it is simply how deepclone behaves on a build
+	 * without native provenance. */
+	zend_class_entry *rf_ce = zend_hash_str_find_ptr(CG(class_table),
+		"reflectionfunction", sizeof("reflectionfunction") - 1);
+	bool native_provenance = rf_ce && zend_hash_str_exists(&rf_ce->function_table,
+		"getconstexprclass", sizeof("getconstexprclass") - 1);
+	DC_G(capture_attribute_closures) = !native_provenance;
+
+	if (DC_G(capture_attribute_closures)) {
+		/* reflection is a required dependency, so its classes exist. The
+		 * closures frameworks read travel through getArguments() (raw values)
+		 * or newInstance() (as attribute-instance properties); hook both. */
+		zend_class_entry *attr_ce = zend_hash_str_find_ptr(CG(class_table),
+			"reflectionattribute", sizeof("reflectionattribute") - 1);
+		if (attr_ce) {
+			zend_function *fn = zend_hash_str_find_ptr(&attr_ce->function_table,
+				"getarguments", sizeof("getarguments") - 1);
+			if (fn && fn->type == ZEND_INTERNAL_FUNCTION) {
+				dc_orig_attr_get_arguments = fn->internal_function.handler;
+				fn->internal_function.handler = dc_attr_get_arguments_wrapper;
+			}
+			fn = zend_hash_str_find_ptr(&attr_ce->function_table,
+				"newinstance", sizeof("newinstance") - 1);
+			if (fn && fn->type == ZEND_INTERNAL_FUNCTION) {
+				dc_orig_attr_new_instance = fn->internal_function.handler;
+				fn->internal_function.handler = dc_attr_new_instance_wrapper;
+			}
+		}
+	}
+#endif
+
+	return SUCCESS;
+}
+
+PHP_MSHUTDOWN_FUNCTION(deepclone)
+{
+#if PHP_VERSION_ID >= 80500
+	/* Restore the original handlers if we replaced them. reflection shuts down
+	 * after us (we depend on it), so its class table is still valid here. */
+	if (dc_orig_attr_get_arguments || dc_orig_attr_new_instance) {
+		zend_class_entry *attr_ce = zend_hash_str_find_ptr(CG(class_table),
+			"reflectionattribute", sizeof("reflectionattribute") - 1);
+		if (attr_ce) {
+			zend_function *fn = zend_hash_str_find_ptr(&attr_ce->function_table,
+				"getarguments", sizeof("getarguments") - 1);
+			if (fn && fn->type == ZEND_INTERNAL_FUNCTION
+					&& fn->internal_function.handler == dc_attr_get_arguments_wrapper) {
+				fn->internal_function.handler = dc_orig_attr_get_arguments;
+			}
+			fn = zend_hash_str_find_ptr(&attr_ce->function_table,
+				"newinstance", sizeof("newinstance") - 1);
+			if (fn && fn->type == ZEND_INTERNAL_FUNCTION
+					&& fn->internal_function.handler == dc_attr_new_instance_wrapper) {
+				fn->internal_function.handler = dc_orig_attr_new_instance;
+			}
+		}
+		dc_orig_attr_get_arguments = NULL;
+		dc_orig_attr_new_instance = NULL;
+	}
+#endif
+
 	return SUCCESS;
 }
 
@@ -5198,11 +5536,19 @@ static PHP_GINIT_FUNCTION(deepclone)
 	/* lazy_init_refl_cache holds zend_object* (request-scoped). Initialized
 	 * lazily on first use in RINIT-equivalent flow; cleared in RSHUTDOWN. */
 	memset(&deepclone_globals->lazy_init_refl_cache, 0, sizeof(HashTable));
+	/* attr_provenance is a persistent, cross-request cache initialized lazily
+	 * on first capture and freed in GSHUTDOWN. capture_attribute_closures is
+	 * decided at MINIT by whether the engine exposes native provenance. */
+	memset(&deepclone_globals->attr_provenance, 0, sizeof(HashTable));
+	deepclone_globals->capture_attribute_closures = 0;
 }
 
 static PHP_GSHUTDOWN_FUNCTION(deepclone)
 {
 	zend_hash_destroy(&deepclone_globals->hydrate_cache);
+	if (deepclone_globals->attr_provenance.nTableSize) {
+		zend_hash_destroy(&deepclone_globals->attr_provenance);
+	}
 }
 
 #if PHP_VERSION_ID >= 80400
@@ -5219,6 +5565,8 @@ static PHP_RSHUTDOWN_FUNCTION(deepclone)
 		zend_hash_destroy(cache);
 		memset(cache, 0, sizeof(HashTable));
 	}
+	/* attr_provenance is NOT cleared here: it is a persistent, per-worker
+	 * cache that survives across requests (freed in GSHUTDOWN). */
 	return SUCCESS;
 }
 
@@ -5237,7 +5585,7 @@ zend_module_entry deepclone_module_entry = {
 	"deepclone",
 	ext_functions,
 	PHP_MINIT(deepclone),
-	NULL, /* MSHUTDOWN */
+	PHP_MSHUTDOWN(deepclone),
 	NULL, /* RINIT */
 	PHP_RSHUTDOWN(deepclone),
 	PHP_MINFO(deepclone),

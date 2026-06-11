@@ -12,6 +12,12 @@ ZEND_BEGIN_MODULE_GLOBALS(deepclone)
 	 * by zend_property_info pointer. Used to amortize the construction cost in
 	 * the DEEPCLONE_HYDRATE_NO_LAZY_INIT path. */
 	HashTable lazy_init_refl_cache;
+	/* PHP 8.5 cross-class first-class-callable provenance (experimental).
+	 * Maps a const-expr-declared FCC's target op_array.opcodes pointer to the
+	 * class whose constant expression declares it, captured by instrumenting
+	 * ReflectionAttribute::getArguments(). Lazily initialized; request-scoped. */
+	HashTable attr_provenance;
+	zend_bool capture_attribute_closures;
 ZEND_END_MODULE_GLOBALS(deepclone)
 
 ZEND_EXTERN_MODULE_GLOBALS(deepclone)
