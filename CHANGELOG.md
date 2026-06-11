@@ -5,6 +5,57 @@ All notable changes to this extension will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- On PHP 8.4+, `deepclone_from_array()` now creates object nodes whose
+  payload slots or replayed `__unserialize` state carry a named-closure or
+  const-expr-closure marker as
+  native lazy ghosts: all object identities (back-references, shared `&`
+  references, `===`) exist when the call returns, but those nodes' property
+  hydration, closure resolution included, is deferred until the engine
+  first touches each of them. Resolving closures (fake-closure creation,
+  attribute-args re-evaluation) is the measurably expensive part of
+  hydration, so deferral is restricted to the nodes that carry them; plain
+  value slots hydrate eagerly as before (copy-on-write makes them cheaper
+  to hydrate than to ghost), as do internal classes, `stdClass` and
+  zero-declared-property classes, all mixing freely with lazy ones.
+  Closure-bearing `__wakeup`/`__unserialize` nodes defer too: their hook
+  runs at the end of their own initialization instead of in the global
+  children-first replay sequence, while per-entry validation stays inside
+  the call. On PHP 8.2/8.3 everything keeps hydrating eagerly. Structural
+  validation and `$allowed_classes` enforcement (including the
+  const-expr-closure gate) remain eager; only value-level resolution errors
+  (e.g. a stale const-expr closure line, a named-closure target that no
+  longer exists) surface at first access instead of inside
+  `deepclone_from_array()`, where the engine reverts the ghost and keeps it
+  retryable. The shared hydration state lives in the new internal-only
+  `DeepClone\HydrationContext` class;
+  `ReflectionClass::getLazyInitializer()` returns a Closure bound to it.
+  Abandoned half-hydrated graphs are reclaimed by the cycle collector. One
+  documented deferral residue: type sources for shared `&` references bound
+  to typed properties are registered per node as it hydrates, so a write
+  through such a reference is only checked against the already-hydrated
+  holders (see README).
+
+### Fixed
+
+- Binding a shared `&` reference to a *typed* declared property aborted
+  debug builds (engine deref assertion) and skipped type-source registration
+  on release builds, so later writes through the reference bypassed the
+  property type. `deepclone_from_array()` and
+  `deepclone_hydrate(..., DEEPCLONE_HYDRATE_PRESERVE_REFS)` now mirror
+  `unserialize()`: the referenced value is verified against the property
+  type and the property is registered as a type source of the reference.
+- Resolving an object-ref marker (`true`) against a *ref id* returned either
+  an alias or a by-value snapshot of the shared slot depending on which
+  consumer resolved first. It is now always a by-value snapshot (deref
+  before copy), making the result independent of hydration order, a
+  prerequisite for lazy mode, where that order is the user's touch order.
+  Such payloads are only ever hand-crafted: `deepclone_to_array()` never
+  emits object-ref markers with negative ids.
+
 ## [0.7.2] - 2026-06-10
 
 ### Fixed

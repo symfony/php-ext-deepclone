@@ -155,6 +155,12 @@ static zend_always_inline zend_class_entry *dc_register_internal_class_with_flag
 #define DEEPCLONE_HYDRATE_FLAGS_MASK \
 	(DEEPCLONE_HYDRATE_CALL_HOOKS | DEEPCLONE_HYDRATE_NO_LAZY_INIT | DEEPCLONE_HYDRATE_PRESERVE_REFS)
 
+/* IS_PROP_REINITABLE (readonly clone-with bookkeeping) landed in PHP 8.3.
+ * On 8.2 there is no such flag; clearing 0 bits is a no-op. */
+#ifndef IS_PROP_REINITABLE
+# define IS_PROP_REINITABLE (0)
+#endif
+
 /* The stub-generated header relies on the compat shims above (specifically
  * zend_register_internal_class_with_flags on PHP < 8.4), so it has to be
  * included after this point. */
@@ -872,6 +878,29 @@ static bool dc_write_backed_property(zend_object *obj, zend_property_info *pi,
 		zval old;
 		ZVAL_COPY_VALUE(&old, slot);
 		ZVAL_COPY(slot, value);
+		zval_ptr_dtor(&old);
+	}
+	else if (UNEXPECTED(Z_ISREF_P(value)) && !DC_PROP_HAS_HOOKS(pi)) {
+		/* Binding a shared PHP &-reference to a typed declared property:
+		 * zend_std_write_property() only accepts dereferenced values (debug
+		 * builds assert on it), so mirror unserialize(): verify the current
+		 * referenced value against the property type, install the reference
+		 * itself in the slot, and record the property as a type source so
+		 * later writes through the reference keep being type-checked. */
+		if (UNEXPECTED(!zend_verify_prop_assignable_by_ref(pi, value, /* strict */ 1))) {
+			return false;
+		}
+		zval old;
+		ZVAL_COPY_VALUE(&old, slot);
+		ZVAL_COPY(slot, value);
+		Z_PROP_FLAG_P(slot) &= ~(IS_PROP_UNINIT | IS_PROP_REINITABLE);
+		ZEND_REF_ADD_TYPE_SOURCE(Z_REF_P(value), pi);
+		if (UNEXPECTED(Z_ISREF(old))) {
+			/* The replaced reference was necessarily bound to this property
+			 * (every path that stores a reference in a typed slot adds the
+			 * type source); unbind it before releasing. */
+			ZEND_REF_DEL_TYPE_SOURCE(Z_REF(old), pi);
+		}
 		zval_ptr_dtor(&old);
 	}
 #if PHP_VERSION_ID >= 80400
@@ -2835,6 +2864,12 @@ static void dc_resolve(zval *value, zval *mask, zval *objects, uint32_t num_obje
 				return;
 			}
 			target = &objects[id];
+			if (UNEXPECTED(Z_TYPE_P(target) != IS_OBJECT)) {
+				/* Object slots are filled before any value resolution runs;
+				 * an unmaterialized slot means a reentrant resolution. */
+				zend_value_error("deepclone_from_array(): malformed payload, object id " ZEND_LONG_FMT " is not materialized", id);
+				return;
+			}
 		} else {
 			/* Guard against ZEND_LONG_MIN — negating it is signed-overflow UB. */
 			if (UNEXPECTED(id <= ZEND_LONG_MIN)) {
@@ -2846,6 +2881,12 @@ static void dc_resolve(zval *value, zval *mask, zval *objects, uint32_t num_obje
 				zend_value_error("deepclone_from_array(): malformed payload, unknown ref id " ZEND_LONG_FMT, -id);
 				return;
 			}
+			/* A hard-ref consumer (mask false) may already have reified this
+			 * slot into a zend_reference. The object-ref marker is a by-value
+			 * link: deref so the result does not depend on which consumer
+			 * resolved first; under lazy hydration that order is the user's
+			 * touch order. */
+			ZVAL_DEREF(target);
 		}
 		ZVAL_COPY(retval, target);
 		return;
@@ -2923,7 +2964,8 @@ static void dc_resolve(zval *value, zval *mask, zval *objects, uint32_t num_obje
 			zend_long id = Z_LVAL_P(zobj);
 			zval *target;
 			if (id >= 0) {
-				if ((zend_ulong) id >= num_objects) {
+				if ((zend_ulong) id >= num_objects
+				 || Z_TYPE(objects[id]) != IS_OBJECT) {
 					zend_value_error("deepclone_from_array(): malformed payload, named-closure references unknown id " ZEND_LONG_FMT, id);
 					return;
 				}
@@ -2939,6 +2981,8 @@ static void dc_resolve(zval *value, zval *mask, zval *objects, uint32_t num_obje
 					zend_value_error("deepclone_from_array(): malformed payload, named-closure references unknown id " ZEND_LONG_FMT, id);
 					return;
 				}
+				/* By-value link: see the object-ref marker above. */
+				ZVAL_DEREF(target);
 			}
 			ZVAL_COPY(&resolved_obj, target);
 		} else {
@@ -3089,6 +3133,611 @@ static void dc_resolve(zval *value, zval *mask, zval *objects, uint32_t num_obje
 	ZVAL_COPY_VALUE(retval, &result);
 }
 
+/* ── Lazy hydration via native lazy ghosts ───────────────────
+ *
+ * On PHP 8.4+, deepclone_from_array() creates the object nodes that are
+ * expensive to hydrate as uninitialized lazy ghosts whose property hydration
+ * is deferred until the engine first needs them (on older versions
+ * everything hydrates eagerly). Every zend_object identity still exists
+ * when deepclone_from_array() returns: back-references and shared hard refs
+ * bind to the ghosts, and === stays correct under any realization order.
+ * Only the per-object property work is deferred: payload zval copies, engine
+ * property writes and value-marker resolution (named closures, const-expr
+ * closure re-evaluation, enum cases).
+ *
+ * Eligibility (everything else hydrates eagerly; mixing is the design):
+ *   - at least one named-closure or const-expr-closure marker among the
+ *     node's property slots or in its deferred __unserialize state mask:
+ *     resolving those (fake-closure creation, attribute-args
+ *     re-evaluation) is the hydration work worth deferring.
+ *     Plain value slots are cheaper to hydrate than to ghost (COW makes
+ *     them refcount bumps), so nodes without closure markers gain nothing
+ *     and stay eager;
+ *   - user classes with no internal ancestor besides stdClass (engine
+ *     limitation, mirrors zend_class_can_be_lazy());
+ *   - at least one declared property: the engine silently downgrades
+ *     zero-declared-prop instances (stdClass included) to non-lazy;
+ *   - not a native-serialize ("X:"-prefixed) node.
+ * Closure-bearing __wakeup/__unserialize nodes do qualify: their hook runs
+ * at the end of their own initialization instead of in the global,
+ * children-first phase-9 sequence (the per-entry validation stays eager,
+ * only the calls move).
+ *
+ * All shared state lives in a DeepClone\HydrationContext instance. The
+ * ghosts' initializer is a Closure bound to the context (its private
+ * hydrate() method, implemented in C below), so
+ * ReflectionClass::getLazyInitializer() returns a genuine Closure and every
+ * uninitialized ghost keeps the context alive. The
+ * context in turn retains the payload (the slot index points into it), the
+ * object table (back-reference targets must outlive the call), the shared
+ * refs table and a copy of the allow-list. The resulting context↔ghost
+ * reference cycle is visible to the GC through dc_lazy_ctx_get_gc() and the
+ * engine's lazy-object get_gc, so abandoned graphs are collectable.
+ *
+ * Structural validation (object ids, scopes, declared-property matches) and
+ * the const-expr-closure allow-list gate stay eager: malformed payloads keep
+ * failing inside deepclone_from_array(). What can surface lazily, at first
+ * access, are value-level resolution errors (unknown class or enum case,
+ * stale const-expr line, type errors), like any native lazy-object
+ * initializer. A failing initializer is reverted by the engine and the
+ * ghost stays uninitialized and retryable. */
+
+typedef struct {
+	zend_class_entry   *scope_ce;   /* resolved scope (zend_standard_class_def for public scope) */
+	zend_property_info *pi;         /* backed declared property, or NULL → dynamic write */
+	zend_string        *name;       /* property name (owned iff name_owned) */
+	zval               *value;      /* borrowed pointer into the retained payload */
+	zval               *mask;       /* borrowed resolve marker, or NULL */
+	bool                name_owned;
+} dc_lazy_slot;
+
+/* Deferred __wakeup/__unserialize replay of one ghost: the hook runs at the
+ * end of the ghost's initialization instead of in the global phase-9
+ * sequence. Phase 9 still validates every entry eagerly; only the calls
+ * move. */
+typedef struct {
+	zval *props;    /* __unserialize argument (borrowed payload pointer), or NULL */
+	zval *mask;     /* its resolve mask, or NULL */
+	bool  wakeup;   /* call __wakeup() after replaying the slots */
+} dc_lazy_state;
+
+typedef struct {
+	zval          payload;          /* the $data array, retained: keeps slot pointers alive */
+	zval         *objects;          /* strong refs, dense by object id */
+	uint32_t      num_objects;
+	HashTable     refs;             /* rid => value (shared zend_references once reified) */
+	HashTable    *allowed_set;      /* owned copy of the lowercased allow-list, or NULL */
+	HashTable     handle_to_id;     /* ghost handle => object id; removed once hydrated */
+	dc_lazy_slot *slots;            /* property slots of ghost ids, grouped by id */
+	uint32_t     *slot_off;         /* id => slots[slot_off[id] .. slot_off[id+1]) */
+	uint32_t      num_slots;        /* filled extent of slots[]; NOT derived from
+	                                 * slot_off/num_objects, which the error-path
+	                                 * teardown resets while owned slot names still
+	                                 * need releasing */
+	dc_lazy_state *states;          /* per-id deferred state replays, or NULL */
+	zend_object   std;
+} dc_lazy_ctx;
+
+/* Set on a handle_to_id value while that id's slots are being replayed, so a
+ * re-entrant manual initializer call on the same object (from an autoloader or any
+ * user code the hydration runs) cannot hydrate it a second time and delete
+ * the handle mid-initialization. Width-relative bit: object ids are memory
+ * bound (every id owns a zval slot) far below 2^30 on 32-bit zend_long and
+ * below 2^62 on 64-bit. */
+#define DC_LAZY_HYDRATING (((zend_long) 1) << (SIZEOF_ZEND_LONG * 8 - 2))
+
+static zend_class_entry *dc_lazy_ctx_ce;
+static zend_object_handlers dc_lazy_ctx_handlers;
+static zend_function *dc_lazy_hydrate_fn;
+
+static zend_always_inline dc_lazy_ctx *dc_lazy_ctx_from_obj(zend_object *obj)
+{
+	return (dc_lazy_ctx *)((char *) obj - offsetof(dc_lazy_ctx, std));
+}
+
+static zend_object *dc_lazy_ctx_create(zend_class_entry *ce)
+{
+	dc_lazy_ctx *ctx = zend_object_alloc(sizeof(dc_lazy_ctx), ce);
+
+	ZVAL_UNDEF(&ctx->payload);
+	ctx->objects = NULL;
+	ctx->num_objects = 0;
+	ctx->allowed_set = NULL;
+	ctx->slots = NULL;
+	ctx->slot_off = NULL;
+	ctx->num_slots = 0;
+	ctx->states = NULL;
+	zend_hash_init(&ctx->refs, 4, NULL, ZVAL_PTR_DTOR, 0);
+	zend_hash_init(&ctx->handle_to_id, 8, NULL, NULL, 0);
+
+	zend_object_std_init(&ctx->std, ce);
+	object_properties_init(&ctx->std, ce);
+	ctx->std.handlers = &dc_lazy_ctx_handlers;
+
+	return &ctx->std;
+}
+
+static void dc_lazy_ctx_free(zend_object *object)
+{
+	dc_lazy_ctx *ctx = dc_lazy_ctx_from_obj(object);
+
+	if (ctx->objects) {
+		for (uint32_t i = 0; i < ctx->num_objects; i++) {
+			zval_ptr_dtor(&ctx->objects[i]);
+		}
+		efree(ctx->objects);
+	}
+	if (ctx->slots) {
+		for (uint32_t i = 0; i < ctx->num_slots; i++) {
+			if (ctx->slots[i].name_owned) {
+				zend_string_release(ctx->slots[i].name);
+			}
+		}
+		efree(ctx->slots);
+	}
+	if (ctx->slot_off) {
+		efree(ctx->slot_off);
+	}
+	if (ctx->states) {
+		efree(ctx->states);
+	}
+	zend_hash_destroy(&ctx->refs);
+	zend_hash_destroy(&ctx->handle_to_id);
+	zval_ptr_dtor(&ctx->payload);
+	if (ctx->allowed_set) {
+		zend_hash_destroy(ctx->allowed_set);
+		efree(ctx->allowed_set);
+	}
+	zend_object_std_dtor(&ctx->std);
+}
+
+/* Reported edges: the payload, every object slot (eager instances and
+ * ghosts), and, through the returned table, the shared refs. This is what
+ * makes the context↔ghost cycle collectable once a graph is abandoned. */
+static HashTable *dc_lazy_ctx_get_gc(zend_object *object, zval **table, int *n)
+{
+	dc_lazy_ctx *ctx = dc_lazy_ctx_from_obj(object);
+	zend_get_gc_buffer *gc_buffer = zend_get_gc_buffer_create();
+
+	zend_get_gc_buffer_add_zval(gc_buffer, &ctx->payload);
+	for (uint32_t i = 0; i < ctx->num_objects; i++) {
+		zend_get_gc_buffer_add_zval(gc_buffer, &ctx->objects[i]);
+	}
+	zend_get_gc_buffer_use(gc_buffer, table, n);
+
+	return &ctx->refs;
+}
+
+#if PHP_VERSION_ID >= 80400
+/* Ghost creation and the slot-index build only exist where native lazy
+ * objects do; on older versions everything below compiles out and
+ * deepclone_from_array() stays fully eager. */
+
+/* Engine eligibility, mirroring zend_object_make_lazy(): internal classes
+ * (stdClass excepted) and internal ancestors are rejected; classes without
+ * declared properties are silently created non-lazy, so treat them as
+ * eager upfront. */
+static bool dc_class_can_be_ghost(const zend_class_entry *ce)
+{
+	if (ce->type != ZEND_USER_CLASS
+	 || ce->default_properties_count == 0
+	 || (ce->ce_flags & ZEND_ACC_UNINSTANTIABLE)) {
+		return false;
+	}
+	for (const zend_class_entry *parent = ce->parent; parent; parent = parent->parent) {
+		if (parent->type == ZEND_INTERNAL_CLASS && parent != zend_standard_class_def) {
+			return false;
+		}
+	}
+	return true;
+}
+
+/* Eagerly enforce the allow-list on const-expr-closure markers inside a
+ * deferred slot, replicating the gate dc_cexpr_resolve() applies before
+ * zend_lookup_class(). Without this, lazy mode would delay the "class not
+ * allowed" error to an arbitrary later point in the program. Only
+ * well-shaped entries are checked: shape errors keep failing at resolve
+ * time, exactly like the eager path reports them. */
+static void dc_lazy_gate_cexpr(zval *value, zval *mask, HashTable *allowed_set)
+{
+	if (UNEXPECTED(dc_check_stack_limit())) {
+		return;
+	}
+	if (DC_MASK_IS_CONSTEXPR_CLOSURE(mask)) {
+		if (Z_TYPE_P(value) == IS_ARRAY) {
+			zval *zclass = zend_hash_index_find(Z_ARRVAL_P(value), 0);
+			if (zclass) {
+				ZVAL_DEREF(zclass);
+				if (Z_TYPE_P(zclass) == IS_STRING
+				 && !dc_class_allowed(allowed_set, Z_STR_P(zclass))) {
+					zend_value_error("deepclone_from_array(): class \"%s\" is not allowed", Z_STRVAL_P(zclass));
+				}
+			}
+		}
+		return;
+	}
+	if (Z_TYPE_P(mask) != IS_ARRAY || Z_TYPE_P(value) != IS_ARRAY) {
+		return;
+	}
+	zend_string *mkey;
+	zend_ulong midx;
+	zval *mval;
+	ZEND_HASH_FOREACH_KEY_VAL(Z_ARRVAL_P(mask), midx, mkey, mval) {
+		zval *slot = mkey
+			? zend_hash_find(Z_ARRVAL_P(value), mkey)
+			: zend_hash_index_find(Z_ARRVAL_P(value), midx);
+		if (!slot) continue;
+		dc_lazy_gate_cexpr(slot, mval, allowed_set);
+		if (UNEXPECTED(EG(exception))) {
+			return;
+		}
+	} ZEND_HASH_FOREACH_END();
+}
+
+/* Build the per-object slot index: one pass over the transposed
+ * [scope][name][id] payload columns, mirroring the eager phase-8 walk.
+ * Per-column scope and declared-property resolution is hoisted and cached
+ * in the slots; per-ghost-id structural validation (scope instanceof,
+ * declared-property match) runs here, eagerly, with the same error messages
+ * as the eager path; phase 8 still validates everything for eager ids.
+ * Slot value/mask pointers point into the payload, which the context
+ * retains and nothing ever mutates.
+ *
+ * The capacity per id was pre-counted (lazy_slot_counts) with the exact
+ * skip conditions used here; columns that error out in phase 8 anyway
+ * (non-string scope keys, non-array levels) are skipped consistently by
+ * both passes. */
+static bool dc_lazy_index_build(dc_lazy_ctx *ctx, HashTable *properties_ht, HashTable *resolve_ht,
+	zend_string **class_names, zend_class_entry **class_ces, uint32_t num_classes,
+	const bool *is_ghost, const uint32_t *lazy_slot_counts)
+{
+	HashTable *allowed_set = ctx->allowed_set;
+	uint32_t num_objects = ctx->num_objects;
+	uint32_t total = 0;
+
+	ctx->slot_off = safe_emalloc(num_objects + 1, sizeof(uint32_t), 0);
+	for (uint32_t id = 0; id < num_objects; id++) {
+		ctx->slot_off[id] = total;
+		if (is_ghost[id]) {
+			/* Reaching this requires ~2^32 resident payload buckets, but the
+			 * accumulation must not wrap into an undersized buffer (the
+			 * objectMeta count carries the same kind of sanity cap). */
+			if (UNEXPECTED(lazy_slot_counts[id] > UINT32_MAX - total)) {
+				zend_value_error("deepclone_from_array(): Argument #1 ($data) \"properties\" slot count out of range");
+				return false;
+			}
+			total += lazy_slot_counts[id];
+		}
+	}
+	ctx->slot_off[num_objects] = total;
+	/* Zero-filled so that the free path (and a partially filled index on an
+	 * error path) only ever sees NULL names / unowned slots. num_slots is the
+	 * allocated extent: the fill below is sparse (per-id cursors), so the
+	 * release loop must walk the whole zeroed capacity. */
+	ctx->slots = ecalloc(total ? total : 1, sizeof(dc_lazy_slot));
+	ctx->num_slots = total;
+
+	if (!properties_ht) {
+		/* Ghosts whose only deferred work is a state replay: empty index. */
+		return true;
+	}
+
+	uint32_t *cursor = safe_emalloc(num_objects ? num_objects : 1, sizeof(uint32_t), 0);
+	memcpy(cursor, ctx->slot_off, num_objects * sizeof(uint32_t));
+
+	bool ok = false;
+	zend_string *scope_name;
+	zval *scope_props;
+	ZEND_HASH_FOREACH_STR_KEY_VAL(properties_ht, scope_name, scope_props) {
+		if (!scope_name || Z_TYPE_P(scope_props) != IS_ARRAY) {
+			continue; /* phase 8 reports these */
+		}
+
+		HashTable *resolve_scope = NULL;
+		if (resolve_ht) {
+			zval *rs = zend_hash_find(resolve_ht, scope_name);
+			if (rs && Z_TYPE_P(rs) == IS_ARRAY) {
+				resolve_scope = Z_ARRVAL_P(rs);
+			}
+		}
+
+		zend_class_entry *scope_ce = NULL;
+		for (uint32_t ci = 0; ci < num_classes; ci++) {
+			if (zend_string_equals(class_names[ci], scope_name)) {
+				scope_ce = class_ces[ci];
+				break;
+			}
+		}
+		if (!scope_ce) {
+			scope_ce = zend_lookup_class_ex(scope_name, NULL, ZEND_FETCH_CLASS_NO_AUTOLOAD);
+		}
+		if (UNEXPECTED(!scope_ce)) {
+			zend_value_error("deepclone_from_array(): Argument #1 ($data) \"properties\" scope \"%s\" is not a loaded class name",
+				ZSTR_VAL(scope_name));
+			goto done;
+		}
+		bool scope_is_std = scope_ce == zend_standard_class_def;
+
+		zend_string *prop_name;
+		zend_ulong prop_idx;
+		zval *id_values;
+		ZEND_HASH_FOREACH_KEY_VAL(Z_ARRVAL_P(scope_props), prop_idx, prop_name, id_values) {
+			if (Z_TYPE_P(id_values) != IS_ARRAY) {
+				continue; /* phase 8 reports it */
+			}
+			bool prop_is_numeric = (prop_name == NULL);
+			zend_string *name = prop_name;
+			if (prop_is_numeric) {
+				name = zend_long_to_str((zend_long) prop_idx);
+				/* Satisfy the known-hash probes below. */
+				zend_string_hash_val(name);
+			}
+
+			HashTable *resolve_ids = NULL;
+			if (resolve_scope) {
+				zval *ri = prop_is_numeric
+					? zend_hash_index_find(resolve_scope, prop_idx)
+					: zend_hash_find(resolve_scope, prop_name);
+				if (ri && Z_TYPE_P(ri) == IS_ARRAY) {
+					resolve_ids = Z_ARRVAL_P(ri);
+				}
+			}
+
+			/* Hoisted declared-property lookup, as in phase 8. */
+			zend_property_info *pi = NULL;
+			if (!prop_is_numeric && !scope_is_std) {
+				zval *zv = zend_hash_find_known_hash(&scope_ce->properties_info, prop_name);
+				if (zv) {
+					zend_property_info *candidate = Z_PTR_P(zv);
+					if (!(candidate->flags & ZEND_ACC_STATIC)) {
+						pi = candidate;
+					}
+				}
+			}
+
+			zend_ulong obj_id;
+			zval *prop_val;
+			ZEND_HASH_FOREACH_NUM_KEY_VAL(Z_ARRVAL_P(id_values), obj_id, prop_val) {
+				if (obj_id >= num_objects || !is_ghost[obj_id]) {
+					continue; /* eager ids and bounds errors: phase 8 */
+				}
+				zend_object *obj = Z_OBJ(ctx->objects[obj_id]);
+
+				if (!scope_is_std && !instanceof_function(obj->ce, scope_ce)) {
+					zend_value_error("deepclone_from_array(): Argument #1 ($data) \"properties\" scope \"%s\" is not a parent of object id " ZEND_ULONG_FMT " (%s)",
+						ZSTR_VAL(scope_name), obj_id, ZSTR_VAL(obj->ce->name));
+					goto prop_err;
+				}
+
+				zend_property_info *use_pi = pi;
+				if (!use_pi && scope_is_std && obj->ce != zend_standard_class_def) {
+					zval *zv = zend_hash_find_known_hash(&obj->ce->properties_info, name);
+					if (zv) {
+						zend_property_info *candidate = Z_PTR_P(zv);
+						if (dc_is_std_scope_property(candidate)) {
+							use_pi = candidate;
+						} else {
+							zend_value_error("deepclone_from_array(): Argument #1 ($data) \"properties\" value for \"%s::%s\" targets a non-public declared property on object id " ZEND_ULONG_FMT,
+								ZSTR_VAL(scope_name), ZSTR_VAL(name), obj_id);
+							goto prop_err;
+						}
+					}
+				} else if (!use_pi && !scope_is_std) {
+					zend_value_error("deepclone_from_array(): Argument #1 ($data) \"properties\" value for \"%s::%s\" does not match a declared property on object id " ZEND_ULONG_FMT,
+						ZSTR_VAL(scope_name), ZSTR_VAL(name), obj_id);
+					goto prop_err;
+				}
+
+				zval *marker = resolve_ids ? zend_hash_index_find(resolve_ids, obj_id) : NULL;
+				if (marker && allowed_set) {
+					dc_lazy_gate_cexpr(prop_val, marker, allowed_set);
+					if (UNEXPECTED(EG(exception))) {
+						goto prop_err;
+					}
+				}
+
+				dc_lazy_slot *slot = &ctx->slots[cursor[obj_id]++];
+				slot->scope_ce = scope_ce;
+				slot->pi = dc_is_backed_declared_property(use_pi) ? use_pi : NULL;
+				slot->name = prop_is_numeric ? zend_string_copy(name) : name;
+				slot->name_owned = prop_is_numeric;
+				slot->value = prop_val;
+				slot->mask = marker;
+			} ZEND_HASH_FOREACH_END();
+
+			if (prop_is_numeric) {
+				zend_string_release(name);
+			}
+			continue;
+
+prop_err:
+			if (prop_is_numeric) {
+				zend_string_release(name);
+			}
+			goto done;
+		} ZEND_HASH_FOREACH_END();
+	} ZEND_HASH_FOREACH_END();
+
+	ok = true;
+done:
+	efree(cursor);
+	return ok;
+}
+#endif /* PHP_VERSION_ID >= 80400 */
+
+/* Replay the property slots of one object id, mirroring the eager phase-8
+ * write semantics, then run its deferred __wakeup/__unserialize replay
+ * (the phase-9 work for this node, so user code may execute here). Runs
+ * with the caller's EG(fake_scope) cleared: initialization can be
+ * triggered from anywhere, including code that has a fake scope set, and
+ * the engine does not reset it around initializer calls. */
+static void dc_lazy_hydrate(dc_lazy_ctx *ctx, zend_object *obj, uint32_t id)
+{
+#if PHP_VERSION_ID >= 80500
+	const zend_class_entry *saved_scope = EG(fake_scope);
+#else
+	zend_class_entry *saved_scope = EG(fake_scope);
+#endif
+	EG(fake_scope) = NULL;
+
+	uint32_t end = ctx->slot_off[id + 1];
+	for (uint32_t i = ctx->slot_off[id]; i < end; i++) {
+		dc_lazy_slot *slot = &ctx->slots[i];
+		if (UNEXPECTED(!slot->name)) {
+			continue; /* unfilled defensive gap, cannot happen on success paths */
+		}
+
+		zval final_val;
+		if (slot->mask) {
+			ZVAL_UNDEF(&final_val);
+			dc_resolve(slot->value, slot->mask, ctx->objects, ctx->num_objects,
+				&ctx->refs, ctx->allowed_set, &final_val);
+			if (UNEXPECTED(EG(exception))) {
+				goto restore;
+			}
+		} else {
+			ZVAL_COPY(&final_val, slot->value);
+		}
+
+		if (slot->pi) {
+			EG(fake_scope) = slot->scope_ce != zend_standard_class_def ? slot->scope_ce : NULL;
+			bool ok = dc_write_backed_property(obj, slot->pi, slot->name, &final_val, 0);
+			EG(fake_scope) = NULL;
+			zval_ptr_dtor(&final_val);
+			if (UNEXPECTED(!ok)) {
+				goto restore;
+			}
+		} else {
+			/* Dynamic property: same engine route as the eager path. */
+			zend_update_property_ex(slot->scope_ce, obj, slot->name, &final_val);
+			zval_ptr_dtor(&final_val);
+			if (UNEXPECTED(EG(exception))) {
+				goto restore;
+			}
+		}
+	}
+
+	/* Deferred state replay: same resolution and calls as phase 9, scoped to
+	 * this node, after its slots. The hook may transparently initialize
+	 * other ghosts it reaches. */
+	if (ctx->states) {
+		dc_lazy_state *st = &ctx->states[id];
+		if (st->props) {
+			zval resolved;
+			if (st->mask) {
+				ZVAL_UNDEF(&resolved);
+				dc_resolve(st->props, st->mask, ctx->objects, ctx->num_objects,
+					&ctx->refs, ctx->allowed_set, &resolved);
+				if (UNEXPECTED(EG(exception))) {
+					goto restore;
+				}
+			} else {
+				ZVAL_COPY(&resolved, st->props);
+			}
+			/* Flagged-but-method-less classes are rejected by the eager
+			 * phase-9 validation; the guard only matters for initializers
+			 * triggered before phase 9 ran, where the whole call is about
+			 * to fail anyway. */
+			if (EXPECTED(obj->ce->__unserialize != NULL)) {
+				zend_call_method_with_1_params(obj, obj->ce,
+					&obj->ce->__unserialize, "__unserialize", NULL, &resolved);
+			}
+			zval_ptr_dtor(&resolved);
+			if (UNEXPECTED(EG(exception))) {
+				goto restore;
+			}
+		} else if (st->wakeup) {
+			zend_function *wakeup_fn = zend_hash_find_ptr(&obj->ce->function_table, ZSTR_KNOWN(ZEND_STR_WAKEUP));
+			if (wakeup_fn) {
+				zend_call_method_with_0_params(obj, obj->ce, &wakeup_fn, "__wakeup", NULL);
+				if (UNEXPECTED(EG(exception))) {
+					goto restore;
+				}
+			}
+		}
+	}
+
+restore:
+	EG(fake_scope) = saved_scope;
+}
+
+ZEND_METHOD(DeepClone_HydrationContext, __construct)
+{
+	ZEND_PARSE_PARAMETERS_NONE();
+	/* Private and internal-only; unreachable from userland. */
+	zend_throw_error(NULL, "Cannot directly construct DeepClone\\HydrationContext");
+}
+
+ZEND_METHOD(DeepClone_HydrationContext, hydrate)
+{
+	zend_object *target;
+
+	ZEND_PARSE_PARAMETERS_START(1, 1)
+		Z_PARAM_OBJ(target)
+	ZEND_PARSE_PARAMETERS_END();
+
+	dc_lazy_ctx *ctx = dc_lazy_ctx_from_obj(Z_OBJ_P(ZEND_THIS));
+	zval *zid = zend_hash_index_find(&ctx->handle_to_id, target->handle);
+	if (UNEXPECTED(!zid || !ctx->slot_off)) {
+		zend_value_error("DeepClone\\HydrationContext::hydrate(): Argument #1 ($object) is not an uninitialized lazy ghost of this context");
+		RETURN_THROWS();
+	}
+
+#if PHP_VERSION_ID >= 80400
+	if (zend_object_is_lazy(target)) {
+		/* Direct call on a still-lazy ghost (e.g. obtained through
+		 * ReflectionClass::getLazyInitializer()): route through the engine
+		 * so property snapshots, rollback and flag bookkeeping happen
+		 * exactly once; it calls back into this method. */
+		zend_lazy_object_init(target);
+		return;
+	}
+
+	/* The target is not lazy. The only state in which hydrating is correct
+	 * is the engine's in-flight initializer invocation: the uninitialized
+	 * flag is already cleared but the lazy info is still attached (it is
+	 * dropped on success, and a revert re-sets the flag). An object realized
+	 * by other means (ReflectionClass::markLazyObjectAsInitialized(),
+	 * setRawValueWithoutLazyInitialization() draining the lazy props) has no
+	 * info left and must not be hydrated over. */
+	if (UNEXPECTED(!zend_hash_index_exists(&EG(lazy_objects_store).infos, target->handle))) {
+		zend_value_error("DeepClone\\HydrationContext::hydrate(): Argument #1 ($object) is not an uninitialized lazy ghost of this context");
+		RETURN_THROWS();
+	}
+#endif
+
+	/* Re-entrancy: user code run by the hydration below (autoloaders fired
+	 * from marker resolution, __set on dynamic props) could call back with
+	 * the same object, which at this point is indistinguishable from the
+	 * engine's initializer invocation. A second hydration would double-apply
+	 * markers and, worse, delete the handle while the outer attempt can
+	 * still fail and be reverted, leaving the ghost permanently
+	 * un-hydratable. */
+	if (UNEXPECTED(Z_LVAL_P(zid) & DC_LAZY_HYDRATING)) {
+		zend_value_error("DeepClone\\HydrationContext::hydrate(): Argument #1 ($object) is already being hydrated");
+		RETURN_THROWS();
+	}
+	uint32_t id = (uint32_t) Z_LVAL_P(zid);
+	Z_LVAL_P(zid) |= DC_LAZY_HYDRATING;
+
+	dc_lazy_hydrate(ctx, target, id);
+
+	/* Re-find the entry: nested hydrations of other ghosts may have deleted
+	 * entries from the table in the meantime. */
+	zid = zend_hash_index_find(&ctx->handle_to_id, target->handle);
+	if (UNEXPECTED(EG(exception))) {
+		if (EXPECTED(zid != NULL)) {
+			Z_LVAL_P(zid) &= ~DC_LAZY_HYDRATING;
+		}
+		RETURN_THROWS();
+	}
+
+	/* Hydrated: the engine drops the initializer (and with it its references
+	 * on this context); drop the handle mapping so a stray second call
+	 * cannot hydrate the same object twice. */
+	zend_hash_index_del(&ctx->handle_to_id, target->handle);
+}
+
 /* Throw a ValueError describing malformed input and jump to the cleanup label. */
 #define DC_INVALID(...) do { \
 		zend_value_error(__VA_ARGS__); \
@@ -3123,7 +3772,8 @@ PHP_FUNCTION(deepclone_from_array)
 	HashTable *data_ht;
 	HashTable *allowed_ht = NULL;
 	HashTable *allowed_set = NULL;
-	HashTable refs;
+	HashTable refs_local;
+	HashTable *refs = NULL;
 	zend_string **class_names = NULL;
 	uint32_t num_classes = 0;
 	zend_class_entry **class_ces = NULL;
@@ -3132,6 +3782,14 @@ PHP_FUNCTION(deepclone_from_array)
 	uint32_t *obj_class_ids = NULL;
 	int *obj_wakeups = NULL;
 	bool refs_inited = false;
+	/* Lazy hydration: non-NULL once at least one node is ghost-eligible.
+	 * The context then owns objects/refs/allowed_set: ghost initializers
+	 * must keep seeing them after this call returns. */
+	dc_lazy_ctx *lazy_ctx = NULL;
+	zval lazy_ctx_zv;
+	zval lazy_init_zv;
+	bool *is_ghost = NULL;
+	uint32_t *lazy_slot_counts = NULL;
 	/* Holds the string synthesized for a numeric property name during the
 	 * properties walk below, so the shared cleanup label can release it on
 	 * any early-exit path. Only one is live at a time. */
@@ -3326,15 +3984,169 @@ PHP_FUNCTION(deepclone_from_array)
 		class_ces = ecalloc(num_classes, sizeof(zend_class_entry *));
 	}
 
-	/* ── Initialize refs early so cleanup can always destroy it safely ── */
-	zend_hash_init(&refs, 4, NULL, ZVAL_PTR_DTOR, 0);
-	refs_inited = true;
+#if PHP_VERSION_ID >= 80400
+	/* ── Lazy mode: decide per-node ghost eligibility upfront ──
+	 * Only nodes whose hydration includes closure-marker resolution (named
+	 * closures, const-expr closures) become ghosts: that work (fake-closure
+	 * creation, attribute re-evaluation) is what deferral measurably saves,
+	 * while for plain value slots the ghost bookkeeping costs as much as the
+	 * hydration it defers and only adds memory and cycle-collector pressure.
+	 * The markers live in the [scope][name][id] resolve columns and in the
+	 * per-entry "states" masks (for __unserialize state replays), so a
+	 * graph without either table, or without closure markers, is hydrated
+	 * fully eagerly and no context is created. Class lookups for candidate
+	 * nodes happen here instead of in the creation loop below: same lookups,
+	 * same ClassNotFoundException, just earlier in the same call. */
+	if (num_objects && (zresolve || zstates)) {
+		bool *has_closure_slot = ecalloc(num_objects, sizeof(bool));
+		bool any_closure = false;
+		if (zresolve) {
+			zend_string *rs_scope_key;
+			zval *rs_scope;
+			ZEND_HASH_FOREACH_STR_KEY_VAL(Z_ARRVAL_P(zresolve), rs_scope_key, rs_scope) {
+				if (!rs_scope_key || Z_TYPE_P(rs_scope) != IS_ARRAY) continue;
+				zval *rs_ids;
+				ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(rs_scope), rs_ids) {
+					if (Z_TYPE_P(rs_ids) != IS_ARRAY) continue;
+					zend_ulong rs_id;
+					zval *rs_mask;
+					ZEND_HASH_FOREACH_NUM_KEY_VAL(Z_ARRVAL_P(rs_ids), rs_id, rs_mask) {
+						if (rs_id < num_objects && !has_closure_slot[rs_id]
+						 && dc_mask_has_closure(rs_mask)) {
+							has_closure_slot[rs_id] = true;
+							any_closure = true;
+						}
+					} ZEND_HASH_FOREACH_END();
+				} ZEND_HASH_FOREACH_END();
+			} ZEND_HASH_FOREACH_END();
+		}
+		if (zstates) {
+			zval *st_entry;
+			ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(zstates), st_entry) {
+				if (Z_TYPE_P(st_entry) != IS_ARRAY) continue;
+				zval *st_id = zend_hash_index_find(Z_ARRVAL_P(st_entry), 0);
+				zval *st_mask = zend_hash_index_find(Z_ARRVAL_P(st_entry), 2);
+				if (st_id && Z_TYPE_P(st_id) == IS_LONG && st_mask
+				 && Z_LVAL_P(st_id) >= 0 && (zend_ulong) Z_LVAL_P(st_id) < num_objects
+				 && !has_closure_slot[Z_LVAL_P(st_id)]
+				 && dc_mask_has_closure(st_mask)) {
+					has_closure_slot[Z_LVAL_P(st_id)] = true;
+					any_closure = true;
+				}
+			} ZEND_HASH_FOREACH_END();
+		}
+
+		bool any_ghost = false;
+		if (any_closure) {
+			/* Count payload property slots, but only for closure-bearing
+			 * ids: they are the only ones the slot index will hold. The
+			 * skip conditions must stay a superset of the index-build fill
+			 * conditions so capacity always covers the fill. */
+			lazy_slot_counts = ecalloc(num_objects, sizeof(uint32_t));
+			if (zproperties) {
+				zend_string *cnt_scope_key;
+				zval *cnt_scope;
+				ZEND_HASH_FOREACH_STR_KEY_VAL(Z_ARRVAL_P(zproperties), cnt_scope_key, cnt_scope) {
+					if (!cnt_scope_key || Z_TYPE_P(cnt_scope) != IS_ARRAY) continue;
+					zval *cnt_ids;
+					ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(cnt_scope), cnt_ids) {
+						if (Z_TYPE_P(cnt_ids) != IS_ARRAY) continue;
+						zend_ulong cnt_id;
+						zval *cnt_unused;
+						ZEND_HASH_FOREACH_NUM_KEY_VAL(Z_ARRVAL_P(cnt_ids), cnt_id, cnt_unused) {
+							(void) cnt_unused;
+							if (cnt_id < num_objects && has_closure_slot[cnt_id]) {
+								lazy_slot_counts[cnt_id]++;
+							}
+						} ZEND_HASH_FOREACH_END();
+					} ZEND_HASH_FOREACH_END();
+				} ZEND_HASH_FOREACH_END();
+			}
+
+			is_ghost = ecalloc(num_objects, sizeof(bool));
+			for (uint32_t id = 0; id < num_objects; id++) {
+				uint32_t cid = obj_class_ids[id];
+				zend_string *class_name = class_names[cid];
+				/* A node qualifies when it has something to defer: property
+				 * slots, or a __wakeup/__unserialize replay (the hook then
+				 * runs at the end of its own initialization instead of in
+				 * the global phase-9 sequence). */
+				if (!has_closure_slot[id]
+				 || !(lazy_slot_counts[id] || (obj_wakeups && obj_wakeups[id] != 0))
+				 || (ZSTR_LEN(class_name) > 1 && ZSTR_VAL(class_name)[1] == ':')) {
+					continue;
+				}
+				zend_class_entry *ce = class_ces[cid];
+				if (!ce) {
+					ce = zend_lookup_class(class_name);
+					if (!ce) {
+						efree(has_closure_slot);
+						zend_throw_exception_ex(dc_ce_class_not_found_exception, 0,
+							"Class \"%s\" not found.", ZSTR_VAL(class_name));
+						goto cleanup;
+					}
+					class_ces[cid] = ce;
+				}
+				if (dc_class_can_be_ghost(ce)) {
+					is_ghost[id] = true;
+					any_ghost = true;
+				}
+			}
+		}
+		efree(has_closure_slot);
+
+		if (any_ghost) {
+			ZVAL_OBJ(&lazy_ctx_zv, dc_lazy_ctx_create(dc_lazy_ctx_ce));
+			lazy_ctx = dc_lazy_ctx_from_obj(Z_OBJ(lazy_ctx_zv));
+
+			/* Retain the payload: the slot index points into it, and nothing
+			 * mutates it (userland writes COW-separate their own copy). */
+			GC_TRY_ADDREF(data_ht);
+			ZVAL_ARR(&lazy_ctx->payload, data_ht);
+			if (UNEXPECTED(GC_FLAGS(data_ht) & GC_IMMUTABLE)) {
+				Z_TYPE_INFO(lazy_ctx->payload) = IS_ARRAY; /* not refcounted */
+			}
+
+			/* The context owns the allow-list copy from now on: deferred
+			 * dc_resolve() calls must keep seeing it: a NULL set would mean
+			 * allow-all, i.e. a lazy-only filter bypass. */
+			lazy_ctx->allowed_set = allowed_set;
+
+			/* The initializer stored on every ghost: a Closure over the
+			 * context's hydrate() method, so userland introspection
+			 * (ReflectionClass::getLazyInitializer()) sees a plain Closure.
+			 * The engine-side fcc below targets the method directly; the
+			 * Closure is what zend_object_make_lazy() retains as the zv. */
+			zend_create_fake_closure(&lazy_init_zv, dc_lazy_hydrate_fn,
+				dc_lazy_ctx_ce, dc_lazy_ctx_ce, &lazy_ctx_zv);
+		} else if (is_ghost) {
+			efree(is_ghost);
+			is_ghost = NULL;
+		}
+	}
+#endif
+
+	/* ── Initialize refs early so cleanup can always destroy it safely ──
+	 * In lazy mode the table lives in the context: ghost initializers keep
+	 * resolving against the same shared zend_references long after this
+	 * call returned. */
+	if (lazy_ctx) {
+		refs = &lazy_ctx->refs;
+	} else {
+		zend_hash_init(&refs_local, 4, NULL, ZVAL_PTR_DTOR, 0);
+		refs = &refs_local;
+		refs_inited = true;
+	}
 
 	/* ── Create object instances ───────────────── */
 	if (num_objects) {
 		objects = emalloc(num_objects * sizeof(zval));
 		for (uint32_t i = 0; i < num_objects; i++) {
 			ZVAL_UNDEF(&objects[i]);
+		}
+		if (lazy_ctx) {
+			lazy_ctx->objects = objects;
+			lazy_ctx->num_objects = num_objects;
 		}
 	}
 
@@ -3385,6 +4197,36 @@ PHP_FUNCTION(deepclone_from_array)
 			if (UNEXPECTED(ce->__unserialize != NULL && (!obj_wakeups || obj_wakeups[id] >= 0))) {
 				DC_INVALID("deepclone_from_array(): Argument #1 ($data) object %u of class %s has an __unserialize() method but \"objectMeta\" does not flag it for an __unserialize state", id, ZSTR_VAL(ce->name));
 			}
+#if PHP_VERSION_ID >= 80400
+			if (is_ghost && is_ghost[id]) {
+				/* Lazy node: create an uninitialized ghost whose initializer
+				 * is the Closure over the shared context's hydrate() method.
+				 * zend_object_make_lazy() duplicates the fcc and the zv, so
+				 * every ghost holds strong references on the context (via
+				 * the fcc directly, and through the Closure's bound $this)
+				 * until it is initialized (or dies). */
+				zend_fcall_info_cache fcc = empty_fcall_info_cache;
+				fcc.function_handler = dc_lazy_hydrate_fn;
+				fcc.object = Z_OBJ(lazy_ctx_zv);
+				fcc.calling_scope = dc_lazy_ctx_ce;
+				fcc.called_scope = dc_lazy_ctx_ce;
+				zend_object *ghost = zend_object_make_lazy(NULL, ce,
+					&lazy_init_zv, &fcc, ZEND_LAZY_OBJECT_STRATEGY_GHOST);
+				if (UNEXPECTED(!ghost)) {
+					goto cleanup;
+				}
+				ZVAL_OBJ(&obj_zval, ghost);
+				if (EXPECTED(zend_object_is_lazy(ghost))) {
+					zval zid;
+					ZVAL_LONG(&zid, id);
+					zend_hash_index_add_new(&lazy_ctx->handle_to_id, ghost->handle, &zid);
+				} else {
+					/* Engine downgrade (no lazy-able property slots after
+					 * all): the instance is complete; hydrate it eagerly. */
+					is_ghost[id] = false;
+				}
+			} else
+#endif
 			if (UNEXPECTED(object_init_ex(&obj_zval, ce) != SUCCESS)) {
 				goto cleanup;
 			}
@@ -3392,6 +4234,79 @@ PHP_FUNCTION(deepclone_from_array)
 
 		ZVAL_COPY_VALUE(&objects[id], &obj_zval);
 	}
+
+#if PHP_VERSION_ID >= 80400
+	/* ── Lazy mode: build the per-object slot index ──
+	 * Must be complete before anything can trigger a ghost initializer; the
+	 * first such opportunity is user code run from phase 8 writes or phase 9
+	 * state replays, both after this point. */
+	if (lazy_ctx) {
+		if (!dc_lazy_index_build(lazy_ctx,
+				zproperties ? Z_ARRVAL_P(zproperties) : NULL,
+				zresolve ? Z_ARRVAL_P(zresolve) : NULL,
+				class_names, class_ces, num_classes,
+				is_ghost, lazy_slot_counts)) {
+			goto cleanup;
+		}
+
+		/* ── Record deferred __wakeup/__unserialize replays ──
+		 * Recorded before any user code can trigger an initializer (the
+		 * first opportunity is a phase-8 write), so that a ghost touched
+		 * from an eager node's hook mid-call still replays its own state
+		 * even when its "states" entry comes later in the sequence.
+		 * Phase 9 keeps validating every entry eagerly; only the calls are
+		 * skipped for ghosts. Recording mirrors what the eager path would
+		 * actually call: only from existing entries, first one wins, so a
+		 * mid-call touch on a malformed payload (missing or duplicate
+		 * entry) cannot run a hook the eager path would not have run
+		 * before failing. */
+		if (obj_wakeups && zstates) {
+			bool any_deferred = false;
+			for (uint32_t id = 0; id < num_objects; id++) {
+				if (is_ghost[id] && obj_wakeups[id] != 0) {
+					any_deferred = true;
+					break;
+				}
+			}
+			if (any_deferred) {
+				lazy_ctx->states = ecalloc(num_objects, sizeof(dc_lazy_state));
+				zval *st_entry;
+				ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(zstates), st_entry) {
+					if (Z_TYPE_P(st_entry) == IS_LONG) {
+						zend_long wid = Z_LVAL_P(st_entry);
+						if (wid >= 0 && (zend_ulong) wid < num_objects
+						 && is_ghost[wid] && obj_wakeups[wid] > 0) {
+							lazy_ctx->states[wid].wakeup = true;
+						}
+						continue;
+					}
+					if (Z_TYPE_P(st_entry) != IS_ARRAY) continue;
+					zval *st_id = zend_hash_index_find(Z_ARRVAL_P(st_entry), 0);
+					zval *st_props = zend_hash_index_find(Z_ARRVAL_P(st_entry), 1);
+					zval *st_mask = zend_hash_index_find(Z_ARRVAL_P(st_entry), 2);
+					if (!st_id || Z_TYPE_P(st_id) != IS_LONG || !st_props
+					 || Z_LVAL_P(st_id) < 0 || (zend_ulong) Z_LVAL_P(st_id) >= num_objects) {
+						continue; /* phase 9 reports malformed entries */
+					}
+					uint32_t sid = (uint32_t) Z_LVAL_P(st_id);
+					if (!is_ghost[sid] || obj_wakeups[sid] >= 0
+					 || lazy_ctx->states[sid].props != NULL) {
+						continue;
+					}
+					if (st_mask && allowed_set) {
+						/* Same eager const-expr gate as deferred slots. */
+						dc_lazy_gate_cexpr(st_props, st_mask, allowed_set);
+						if (UNEXPECTED(EG(exception))) {
+							goto cleanup;
+						}
+					}
+					lazy_ctx->states[sid].props = st_props;
+					lazy_ctx->states[sid].mask = st_mask;
+				} ZEND_HASH_FOREACH_END();
+			}
+		}
+	}
+#endif
 
 	/* ── Resolve refs ──────────────────────────── */
 	if (zrefs && Z_TYPE_P(zrefs) == IS_ARRAY) {
@@ -3401,18 +4316,18 @@ PHP_FUNCTION(deepclone_from_array)
 		ZEND_HASH_FOREACH_NUM_KEY_VAL(Z_ARRVAL_P(zrefs), rid, rval) {
 			zval copy;
 			ZVAL_COPY(&copy, rval);
-			zend_hash_index_add_new(&refs, rid, &copy);
+			zend_hash_index_add_new(refs, rid, &copy);
 		} ZEND_HASH_FOREACH_END();
 
 		/* Second pass: resolve those with masks, updating in-place */
 		if (zref_masks) {
 			zval *rmask;
 			ZEND_HASH_FOREACH_NUM_KEY_VAL(Z_ARRVAL_P(zref_masks), rid, rmask) {
-				zval *slot = zend_hash_index_find(&refs, rid);
+				zval *slot = zend_hash_index_find(refs, rid);
 				if (!slot) continue;
 				zval resolved;
 				ZVAL_UNDEF(&resolved);
-				dc_resolve(slot, rmask, objects, num_objects, &refs, allowed_set, &resolved);
+				dc_resolve(slot, rmask, objects, num_objects, refs, allowed_set, &resolved);
 				if (EG(exception)) goto cleanup;
 				/* Write through reference if slot was made into one (by dc_resolve) */
 				if (Z_ISREF_P(slot)) {
@@ -3542,6 +4457,15 @@ PHP_FUNCTION(deepclone_from_array)
 						DC_INVALID("deepclone_from_array(): Argument #1 ($data) \"properties\" entry for \"%s::%s\" references unknown object id " ZEND_ULONG_FMT,
 							ZSTR_VAL(scope_name), ZSTR_VAL(prop_name), obj_id);
 					}
+					if (is_ghost && is_ghost[obj_id]) {
+						/* Created as a lazy ghost: its slots are replayed by
+						 * the initializer. Skip by creation-time flag, never
+						 * by current lazy state; user code triggered from an
+						 * earlier write may already have initialized it, and
+						 * hydrating it a second time here would double-apply
+						 * markers. */
+						continue;
+					}
 					zval *obj_zval = &objects[obj_id];
 					zend_object *obj = Z_OBJ_P(obj_zval);
 
@@ -3555,7 +4479,7 @@ PHP_FUNCTION(deepclone_from_array)
 					zval *marker = resolve_ids ? zend_hash_index_find(resolve_ids, obj_id) : NULL;
 					if (marker) {
 						ZVAL_UNDEF(&final_val);
-						dc_resolve(prop_val, marker, objects, num_objects, &refs, allowed_set, &final_val);
+						dc_resolve(prop_val, marker, objects, num_objects, refs, allowed_set, &final_val);
 						if (EG(exception)) {
 							EG(fake_scope) = old_scope;
 							goto cleanup;
@@ -3657,10 +4581,14 @@ PHP_FUNCTION(deepclone_from_array)
 				if (!unser_ce->__unserialize) {
 					DC_INVALID("deepclone_from_array(): Argument #1 ($data) \"states\" entry references object id " ZEND_LONG_FMT " whose class %s has no __unserialize() method", Z_LVAL_P(zid), ZSTR_VAL(unser_ce->name));
 				}
+				if (is_ghost && is_ghost[Z_LVAL_P(zid)]) {
+					/* Deferred into the ghost's initializer. */
+					continue;
+				}
 				zval resolved_props;
 				if (smask) {
 					ZVAL_UNDEF(&resolved_props);
-					dc_resolve(sprops, smask, objects, num_objects, &refs, allowed_set, &resolved_props);
+					dc_resolve(sprops, smask, objects, num_objects, refs, allowed_set, &resolved_props);
 					if (EG(exception)) goto cleanup;
 				} else {
 					ZVAL_COPY(&resolved_props, sprops);
@@ -3678,6 +4606,10 @@ PHP_FUNCTION(deepclone_from_array)
 					DC_INVALID("deepclone_from_array(): Argument #1 ($data) \"states\" has a __wakeup entry for object id " ZEND_LONG_FMT " but \"objectMeta\" does not flag it for __wakeup", Z_LVAL_P(state));
 				}
 				obj_wakeups[Z_LVAL_P(state)] = 0;
+				if (is_ghost && is_ghost[Z_LVAL_P(state)]) {
+					/* Deferred into the ghost's initializer. */
+					continue;
+				}
 				zval *obj_zval = &objects[Z_LVAL_P(state)];
 				zend_class_entry *wakeup_ce = Z_OBJCE_P(obj_zval);
 				zend_function *wakeup_fn = zend_hash_find_ptr(&wakeup_ce->function_table, ZSTR_KNOWN(ZEND_STR_WAKEUP));
@@ -3716,14 +4648,18 @@ PHP_FUNCTION(deepclone_from_array)
 			if (UNEXPECTED(id <= ZEND_LONG_MIN)) {
 				DC_INVALID("deepclone_from_array(): Argument #1 ($data) \"prepared\" references unknown ref id out of range");
 			}
-			zval *ref = zend_hash_index_find(&refs, -id);
+			zval *ref = zend_hash_index_find(refs, -id);
 			if (!ref) {
 				DC_INVALID("deepclone_from_array(): Argument #1 ($data) \"prepared\" references unknown ref id " ZEND_LONG_FMT, -id);
 			}
+			/* By-value link, like the object-ref marker in dc_resolve():
+			 * deref so a slot already reified by a hard-ref consumer yields
+			 * the same value as an untouched one. */
+			ZVAL_DEREF(ref);
 			ZVAL_COPY(return_value, ref);
 		}
 	} else if (zmask) {
-		dc_resolve(zprepared, zmask, objects, num_objects, &refs, allowed_set, return_value);
+		dc_resolve(zprepared, zmask, objects, num_objects, refs, allowed_set, return_value);
 		if (EG(exception)) goto cleanup;
 	} else {
 		ZVAL_COPY(return_value, zprepared);
@@ -3731,14 +4667,42 @@ PHP_FUNCTION(deepclone_from_array)
 
 cleanup:
 	if (numeric_prop_tmp) zend_string_release(numeric_prop_tmp);
-	if (allowed_set) { zend_hash_destroy(allowed_set); efree(allowed_set); }
-	if (refs_inited) zend_hash_destroy(&refs);
-	if (objects) {
-		for (uint32_t i = 0; i < num_objects; i++) {
-			zval_ptr_dtor(&objects[i]);
+	if (lazy_ctx) {
+		/* The context owns objects/refs/allowed_set; every uninitialized
+		 * ghost keeps it alive, and the last one to go releases the whole
+		 * graph (or the GC collects the context↔ghost cycle). */
+		if (UNEXPECTED(EG(exception))) {
+			/* Failed mid-hydration: break the cycle deterministically so the
+			 * partial graph is freed now, not at the next GC run. Releasing
+			 * uninitialized ghosts runs no destructors and drops their
+			 * initializer references on the context. */
+			zend_hash_clean(&lazy_ctx->refs);
+			zval *ctx_objects = lazy_ctx->objects;
+			uint32_t ctx_num = lazy_ctx->num_objects;
+			lazy_ctx->objects = NULL;
+			lazy_ctx->num_objects = 0;
+			objects = NULL;
+			if (ctx_objects) {
+				for (uint32_t i = 0; i < ctx_num; i++) {
+					zval_ptr_dtor(&ctx_objects[i]);
+				}
+				efree(ctx_objects);
+			}
 		}
-		efree(objects);
+		zval_ptr_dtor(&lazy_init_zv);
+		zval_ptr_dtor(&lazy_ctx_zv);
+	} else {
+		if (allowed_set) { zend_hash_destroy(allowed_set); efree(allowed_set); }
+		if (refs_inited) zend_hash_destroy(refs);
+		if (objects) {
+			for (uint32_t i = 0; i < num_objects; i++) {
+				zval_ptr_dtor(&objects[i]);
+			}
+			efree(objects);
+		}
 	}
+	if (is_ghost) efree(is_ghost);
+	if (lazy_slot_counts) efree(lazy_slot_counts);
 	if (obj_class_ids) efree(obj_class_ids);
 	if (obj_wakeups) efree(obj_wakeups);
 	if (class_ces)   efree(class_ces);
@@ -4091,6 +5055,22 @@ PHP_MINIT_FUNCTION(deepclone)
 		register_class_DeepClone_NotInstantiableException(spl_ce_InvalidArgumentException);
 	dc_ce_class_not_found_exception =
 		register_class_DeepClone_ClassNotFoundException(spl_ce_InvalidArgumentException);
+
+	/* DeepClone\HydrationContext: internal-only object behind lazy ghosts.
+	 * Instances are created through dc_lazy_ctx_create() exclusively: the
+	 * private constructor blocks `new`, and being an internal FINAL class
+	 * with a custom create_object makes the engine refuse
+	 * ReflectionClass::newInstanceWithoutConstructor(). */
+	dc_lazy_ctx_ce = register_class_DeepClone_HydrationContext();
+	dc_lazy_ctx_ce->create_object = dc_lazy_ctx_create;
+	memcpy(&dc_lazy_ctx_handlers, &std_object_handlers, sizeof(zend_object_handlers));
+	dc_lazy_ctx_handlers.offset = offsetof(dc_lazy_ctx, std);
+	dc_lazy_ctx_handlers.free_obj = dc_lazy_ctx_free;
+	dc_lazy_ctx_handlers.get_gc = dc_lazy_ctx_get_gc;
+	dc_lazy_ctx_handlers.clone_obj = NULL;
+	dc_lazy_hydrate_fn = zend_hash_str_find_ptr(&dc_lazy_ctx_ce->function_table,
+		"hydrate", sizeof("hydrate") - 1);
+	ZEND_ASSERT(dc_lazy_hydrate_fn != NULL);
 
 	register_deepclone_symbols(module_number);
 

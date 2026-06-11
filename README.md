@@ -87,6 +87,73 @@ function deepclone_hydrate(object|string $object_or_class, array $vars = [], int
 (`null` = allow all, `[]` = allow none). Case-insensitive, matching
 `unserialize()`'s `allowed_classes` option.
 
+### Lazy hydration of closure-bearing nodes (PHP 8.4+)
+
+`deepclone_from_array()` creates the object nodes that are expensive to
+hydrate as
+[native lazy ghosts](https://www.php.net/manual/en/language.oop5.lazy-objects.php):
+nodes whose payload slots or replayed `__unserialize` state carry a
+named-closure or (PHP 8.5) const-expr-closure marker, since resolving those
+(fake-closure creation, attribute-args re-evaluation) is where hydration
+time actually goes. Every
+object identity exists when the call returns (back-references, shared `&`
+references and `===` behave exactly as for eager nodes), but a ghost's
+property hydration, closure resolution included, is deferred until the
+engine first touches it.
+
+```php
+$clone = deepclone_from_array($payload);
+// closure-bearing nodes are uninitialized ghosts; reading any property
+// of such a node hydrates that node only.
+```
+
+All other nodes hydrate eagerly: nodes without closure markers (plain value
+slots are cheaper to hydrate than to ghost, since copy-on-write makes them
+refcount bumps), internal classes (and classes inheriting one, `stdClass`
+descendants excepted), and `stdClass` itself and other classes without
+declared properties. A graph without closure markers is hydrated fully
+eagerly and carries zero lazy-mode overhead, and on PHP older than 8.4 (no
+native lazy objects) everything hydrates eagerly. Mixing lazy and eager
+nodes in one graph is the normal mode of operation.
+
+Closure-bearing nodes that replay `__wakeup`/`__unserialize` are deferred
+too: their hook runs at the end of their own initialization instead of in
+the global, children-first replay sequence (each entry is still validated
+inside the call; only the hook calls move). State-replaying nodes without
+closure markers keep their eager, ordered replay.
+
+Semantics of deferred nodes (the usual native lazy-object rules):
+
+- Whole-graph operations (`serialize()`, `json_encode()`, `foreach`, `==`,
+  `clone`, `var_export()`) initialize every node they visit; `var_dump()`,
+  `===`, `spl_object_id()` and `instanceof` do not initialize.
+- Structural payload errors (unknown ids, bad scopes, unknown declared
+  properties) and `$allowed_classes` violations still throw inside
+  `deepclone_from_array()`. Value-level resolution errors (a class or enum
+  case that no longer exists, a stale const-expr closure line, a type
+  mismatch) surface at first access instead; the failing ghost is rolled
+  back by the engine, stays uninitialized, and rethrows on every retry.
+- A never-initialized ghost's destructor is not called.
+- Type enforcement on a shared `&` reference is registered per node as it
+  hydrates. While some holders of the reference are still uninitialized, a
+  write through it is checked only against the already-hydrated ones; if the
+  written value violates a pending node's property type, that node's first
+  touch throws instead (eager mode rejects such a write at the assignment).
+- The payload and every object of the graph stay pinned in memory until the
+  last ghost initializes or dies: `ReflectionClass::getLazyInitializer()`
+  returns a `Closure` bound to a shared internal
+  `DeepClone\HydrationContext` object that holds them. Abandoned graphs are
+  reclaimed by the cycle collector.
+
+Cost model, measured against the previous fully-eager implementation
+(20k-node graphs, PHP 8.4 release build): closure-rich graphs hydrate 4-6x
+faster on creation and partial consumption, occupy 2-3x less memory while
+untouched (lazy shells plus the slot index weigh less than materialized
+closures), and tear down about 2x faster when dropped untouched. A fully
+traversed graph pays a comparable total (+12% in the worst measured case),
+at first touch instead of inside the call. Graphs without closure markers
+take the eager path bit for bit.
+
 `deepclone_hydrate()` accepts either an object to hydrate in place or a class
 name to instantiate without calling its constructor. By default, PHP `&`
 references in `$vars` are dropped on write; pass `DEEPCLONE_HYDRATE_PRESERVE_REFS`

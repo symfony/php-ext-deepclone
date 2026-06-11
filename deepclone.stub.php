@@ -8,6 +8,24 @@ namespace DeepClone {
     class NotInstantiableException extends \InvalidArgumentException {}
 
     class ClassNotFoundException extends \InvalidArgumentException {}
+
+    /**
+     * Shared hydration state behind the lazy ghosts deepclone_from_array()
+     * creates for closure-bearing object nodes: retains the payload, the
+     * object table, the shared references and the allow-list until every
+     * ghost has been initialized. Instances are created internally only;
+     * the ghosts' initializer (as returned by
+     * ReflectionClass::getLazyInitializer()) is a Closure bound to one.
+     *
+     * @strict-properties
+     * @not-serializable
+     */
+    final class HydrationContext
+    {
+        private function __construct() {}
+
+        private function hydrate(object $object): void {}
+    }
 }
 
 namespace {
