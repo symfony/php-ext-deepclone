@@ -145,14 +145,13 @@ Semantics of deferred nodes (the usual native lazy-object rules):
   `DeepClone\HydrationContext` object that holds them. Abandoned graphs are
   reclaimed by the cycle collector.
 
-Cost model, measured against the previous fully-eager implementation
-(20k-node graphs, PHP 8.4 release build): closure-rich graphs hydrate 4-6x
-faster on creation and partial consumption, occupy 2-3x less memory while
+Cost model (20k-node graphs, PHP 8.4 release build): compared with
+resolving every closure inside the call, deferral makes closure-rich
+graphs 4-6x faster to create and partially consume, 2-3x smaller while
 untouched (lazy shells plus the slot index weigh less than materialized
-closures), and tear down about 2x faster when dropped untouched. A fully
-traversed graph pays a comparable total (+12% in the worst measured case),
-at first touch instead of inside the call. Graphs without closure markers
-take the eager path bit for bit.
+closures), and about 2x faster to tear down when dropped untouched. A
+fully traversed graph pays a comparable total, at first touch instead of
+inside the call. Graphs without closure markers take the eager path.
 
 `deepclone_hydrate()` accepts either an object to hydrate in place or a class
 name to instantiate without calling its constructor. By default, PHP `&`
