@@ -38,22 +38,22 @@ function ghostPayload(array $extraProps = [], array $extraResolve = []): array
 }
 
 // ── allowed_classes filtering stays eager ──
-expectError(fn () => deepclone_from_array(ghostPayload(), ['Other']));
+expectError(fn () => deepclone_from_array(ghostPayload(), ['Other'], true));
 
 // ── Structural validation of deferred slots stays eager:
 //    scope that is not a parent of the (would-be lazy) object ──
 expectError(fn () => deepclone_from_array(
-    ghostPayload(['Other' => ['x' => [0 => 1]]])));
+    ghostPayload(['Other' => ['x' => [0 => 1]]]), null, true));
 
 //    unknown declared property on a (would-be lazy) object ──
 expectError(fn () => deepclone_from_array(
-    ghostPayload(['Node' => ['nope' => [0 => 1]]])));
+    ghostPayload(['Node' => ['nope' => [0 => 1]]]), null, true));
 
 // ── Value-level resolution errors defer to first access; the engine
 //    reverts the ghost, which stays uninitialized and retries deterministically ──
 $obj = deepclone_from_array(
     ghostPayload(['stdClass' => ['w' => [0 => [null, 'no_such_function_xyz']]]],
-                 ['stdClass' => ['w' => [0 => 0]]]));
+                 ['stdClass' => ['w' => [0 => 0]]]), null, true);
 $rc = new ReflectionClass(Node::class);
 var_dump($rc->isUninitializedLazyObject($obj));
 expectError(fn () => $obj->w);
@@ -67,7 +67,7 @@ expectError(fn () => new DeepClone\HydrationContext);
 $lazy = deepclone_from_array(deepclone_to_array((function () {
     $n = new Node; $n->v = strtoupper(...);
     return $n;
-})()));
+})(), null, true), null, true);
 $init = $rc->getLazyInitializer($lazy);
 var_dump($init instanceof Closure);
 expectError(fn () => serialize($init));
@@ -88,7 +88,7 @@ var_dump(($lazy->v)('ok'));
 $lazy2 = deepclone_from_array(deepclone_to_array((function () {
     $n = new Node; $n->v = strtoupper(...);
     return $n;
-})()));
+})(), null, true), null, true);
 $init2 = $rc->getLazyInitializer($lazy2);
 $rc->markLazyObjectAsInitialized($lazy2);
 $lazy2->v = 'mine';

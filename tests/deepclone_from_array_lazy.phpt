@@ -42,10 +42,10 @@ function uninit(object $o): bool
     return (new ReflectionClass($o))->isUninitializedLazyObject($o);
 }
 
-$payload = deepclone_to_array(new Outer('hello', new Inner(42, strlen(...))));
+$payload = deepclone_to_array(new Outer('hello', new Inner(42, strlen(...))), allow_named_closures: true);
 
 // ── Root comes back as an uninitialized ghost ──
-$copy = deepclone_from_array($payload);
+$copy = deepclone_from_array($payload, allow_named_closures: true);
 var_dump(uninit($copy));
 
 // ── var_dump does not initialize ──
@@ -69,7 +69,7 @@ var_dump(uninit($copy->getInner()));
 
 // ── getLazyInitializer() returns a Closure over the shared context;
 //    calling it hydrates ──
-$lazy = deepclone_from_array($payload);
+$lazy = deepclone_from_array($payload, allow_named_closures: true);
 $init = (new ReflectionClass(Outer::class))->getLazyInitializer($lazy);
 var_dump($init instanceof Closure);
 $init($lazy);
@@ -77,18 +77,18 @@ var_dump(uninit($lazy), $lazy->getName());
 
 // ── The Closure is created once per call: identical across all ghosts of
 //    one call, distinct across calls ──
-$lazy = deepclone_from_array($payload);
+$lazy = deepclone_from_array($payload, allow_named_closures: true);
 $initOuter = (new ReflectionClass(Outer::class))->getLazyInitializer($lazy);
 $initInner = (new ReflectionClass(Inner::class))->getLazyInitializer($lazy->getInner());
 var_dump($initOuter === $initInner);
-var_dump($initOuter === (new ReflectionClass(Outer::class))->getLazyInitializer(deepclone_from_array($payload)));
+var_dump($initOuter === (new ReflectionClass(Outer::class))->getLazyInitializer(deepclone_from_array($payload, allow_named_closures: true)));
 
 // ── Nodes without closure markers gain nothing from deferral: they always
 //    hydrate eagerly (plain value slots are cheaper to hydrate than to
 //    ghost) ──
 class ScalarOnly { public int $s = 0; public string $t = ''; }
 $s = new ScalarOnly; $s->s = 5; $s->t = 'x';
-$s2 = deepclone_from_array(deepclone_to_array([$s, new Inner(3, trim(...))]));
+$s2 = deepclone_from_array(deepclone_to_array([$s, new Inner(3, trim(...))], allow_named_closures: true), allow_named_closures: true);
 var_dump(uninit($s2[0]), $s2[0]->s);
 var_dump(uninit($s2[1]), $s2[1]->n);
 
@@ -100,7 +100,7 @@ $o2 = deepclone_from_array(deepclone_to_array($o));
 var_dump($o2->x->y);
 
 // ── clone initializes the ghost and produces a hydrated copy ──
-$lazy = deepclone_from_array($payload);
+$lazy = deepclone_from_array($payload, allow_named_closures: true);
 $clone = clone $lazy;
 var_dump(uninit($lazy));
 var_dump($clone->getName(), ($clone->fn)('ok'));

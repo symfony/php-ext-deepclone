@@ -77,7 +77,7 @@ var_dump(array_key_exists('value', $d));
 var_dump($d['value'] === [[123]]);
 
 // ── Named closure (global function) ──
-$d = deepclone_to_array(strlen(...));
+$d = deepclone_to_array(strlen(...), allow_named_closures: true);
 var_dump($d['prepared'] === [null, 'strlen']);
 var_dump($d['mask'] === 0);
 

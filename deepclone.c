@@ -265,6 +265,7 @@ struct _dc_ctx {
 	uint32_t       next_obj_id;
 	uint32_t       objects_count;
 	bool           is_static;
+	bool           allow_named_closures; /* opt-in: encode closures over named callables by name */
 	HashTable     *allowed_ht;     /* allowed class names set (or NULL = all) */
 
 	/* Output structures built incrementally during traversal */
@@ -311,6 +312,7 @@ static void dc_ctx_init(dc_ctx *ctx) {
 	ctx->next_obj_id = 0;
 	ctx->objects_count = 0;
 	ctx->is_static = 1;
+	ctx->allow_named_closures = false;
 	ctx->allowed_ht = NULL;
 	zend_hash_init(&ctx->scope_cache, 4, NULL, ZVAL_PTR_DTOR, 0);
 	zend_hash_init(&ctx->class_info, 4, NULL, NULL, 0);
@@ -1782,10 +1784,54 @@ static void dc_copy_value(dc_ctx *ctx, zval *src, zval *dst, zval *mask_dst)
 		}
 	}
 
-	/* ── Named closure ──────────────────────────── */
+	/* ── Closures ───────────────────────────────── */
 	if (Z_OBJCE_P(src) == zend_ce_closure) {
 		const zend_function *func = zend_get_closure_method_def(Z_OBJ_P(src));
+
+#if PHP_VERSION_ID >= 80500
+		/* Const-expr declaration-site reference. This covers anonymous static
+		 * closures and first-class callables over a method of their own
+		 * declaring class (e.g. #[When(self::isStrict(...))]). It is attempted
+		 * before the by-name encoding so that such closures serialize as a
+		 * declaration-site reference — resolvable only to what the class
+		 * itself declares — and therefore round-trip without requiring the
+		 * allow_named_closures opt-in. The allow-list is checked first so that
+		 * disallowing Closure is reported before any const-expr of the scope
+		 * class is evaluated. */
+		if (func && func->type == ZEND_USER_FUNCTION && func->common.scope) {
+			zval *this_ptr = zend_get_closure_this_ptr(src);
+			if (!this_ptr || Z_TYPE_P(this_ptr) != IS_OBJECT) {
+				if (!dc_class_allowed(ctx->allowed_ht, zend_ce_closure->name)) {
+					zend_value_error("deepclone_to_array(): class \"Closure\" is not allowed");
+					return;
+				}
+				zval payload;
+				ZVAL_UNDEF(&payload);
+				if (dc_cexpr_locate(func, &payload)) {
+					ZVAL_COPY_VALUE(dst, &payload);
+					DC_MASK_CONSTEXPR_CLOSURE(mask_dst);
+					goto handle_value;
+				}
+				if (UNEXPECTED(EG(exception))) {
+					return;
+				}
+			}
+		}
+#endif
+
+		/* Named closure: a first-class callable that is not addressable as a
+		 * declaration-site reference (one created at runtime, or whose target
+		 * lives outside its declaring class, or over an internal/global
+		 * function). Encoding it stores the callable by name, which lets
+		 * deepclone_from_array() mint a Closure over any function or method of
+		 * that name — including internal functions such as system(). It is
+		 * therefore gated behind the allow_named_closures opt-in, which both
+		 * ends must enable. */
 		if (func && (func->common.fn_flags & ZEND_ACC_FAKE_CLOSURE)) {
+			if (!ctx->allow_named_closures) {
+				zend_value_error("deepclone_to_array(): serializing a closure over the named callable \"%s\" requires enabling the allow_named_closures option", ZSTR_VAL(func->common.function_name));
+				return;
+			}
 			if (!dc_class_allowed(ctx->allowed_ht, zend_ce_closure->name)) {
 				zend_value_error("deepclone_to_array(): class \"Closure\" is not allowed");
 				return;
@@ -1846,32 +1892,8 @@ static void dc_copy_value(dc_ctx *ctx, zval *src, zval *dst, zval *mask_dst)
 			DC_MASK_NAMED_CLOSURE(mask_dst);
 			goto handle_value;
 		}
-
-#if PHP_VERSION_ID >= 80500
-		/* Anonymous closure: reference its const-expr declaration site.
-		 * The allow-list is checked first so that disallowing Closure is
-		 * reported before any const-expr of the scope class is evaluated. */
-		if (func && func->type == ZEND_USER_FUNCTION && func->common.scope) {
-			zval *this_ptr = zend_get_closure_this_ptr(src);
-			if (!this_ptr || Z_TYPE_P(this_ptr) != IS_OBJECT) {
-				if (!dc_class_allowed(ctx->allowed_ht, zend_ce_closure->name)) {
-					zend_value_error("deepclone_to_array(): class \"Closure\" is not allowed");
-					return;
-				}
-				zval payload;
-				ZVAL_UNDEF(&payload);
-				if (dc_cexpr_locate(func, &payload)) {
-					ZVAL_COPY_VALUE(dst, &payload);
-					DC_MASK_CONSTEXPR_CLOSURE(mask_dst);
-					goto handle_value;
-				}
-				if (UNEXPECTED(EG(exception))) {
-					return;
-				}
-			}
-		}
-#endif
-		/* Other anonymous closure — fall through to regular object handling */
+		/* Other closure (runtime anonymous, arrow fn) — fall through to
+		 * regular object handling, which refuses it as non-instantiable. */
 	}
 
 	/* ── Regular object processing ──────────────── */
@@ -2722,11 +2744,13 @@ PHP_FUNCTION(deepclone_to_array)
 {
 	zval *value;
 	HashTable *allowed_ht = NULL;
+	bool allow_named_closures = false;
 
-	ZEND_PARSE_PARAMETERS_START(1, 2)
+	ZEND_PARSE_PARAMETERS_START(1, 3)
 		Z_PARAM_ZVAL(value)
 		Z_PARAM_OPTIONAL
 		Z_PARAM_ARRAY_HT_OR_NULL(allowed_ht)
+		Z_PARAM_BOOL(allow_named_closures)
 	ZEND_PARSE_PARAMETERS_END();
 
 	/* Reject resources at the top level just like the walker does mid-tree.
@@ -2755,6 +2779,7 @@ PHP_FUNCTION(deepclone_to_array)
 
 	dc_ctx ctx;
 	dc_ctx_init(&ctx);
+	ctx.allow_named_closures = allow_named_closures;
 	if (allowed_ht) {
 		ctx.allowed_ht = dc_build_allowed_set(allowed_ht, "deepclone_to_array");
 		if (!ctx.allowed_ht) {
@@ -3767,11 +3792,77 @@ static bool dc_mask_has_closure(zval *mask)
 	return false;
 }
 
+/* Like dc_mask_has_closure() but matches only the named-closure marker
+ * (LONG(0)), ignoring const-expr-closure references (LONG(1)). */
+static bool dc_mask_has_named_closure(zval *mask)
+{
+	if (mask == NULL) {
+		return false;
+	}
+	if (DC_MASK_IS_NAMED_CLOSURE(mask)) {
+		return true;
+	}
+	if (Z_TYPE_P(mask) != IS_ARRAY) {
+		return false;
+	}
+	zval *v;
+	ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(mask), v) {
+		if (dc_mask_has_named_closure(v)) {
+			return true;
+		}
+	} ZEND_HASH_FOREACH_END();
+	return false;
+}
+
+/* Scan the four payload regions that can carry closure markers — the top
+ * mask, the resolve table, the reference masks and the replayed state masks —
+ * for a named-closure marker. Mirrors the region set used by the
+ * allowed_classes "Closure" gate below. */
+static bool dc_payload_has_named_closure(zval *zmask, zval *zresolve, zval *zref_masks, zval *zstates)
+{
+	if (dc_mask_has_named_closure(zmask)) {
+		return true;
+	}
+	if (zresolve) {
+		zval *scope;
+		ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(zresolve), scope) {
+			if (Z_TYPE_P(scope) != IS_ARRAY) continue;
+			zval *name;
+			ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(scope), name) {
+				if (dc_mask_has_named_closure(name)) {
+					return true;
+				}
+			} ZEND_HASH_FOREACH_END();
+		} ZEND_HASH_FOREACH_END();
+	}
+	if (zref_masks) {
+		zval *rmask;
+		ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(zref_masks), rmask) {
+			if (dc_mask_has_named_closure(rmask)) {
+				return true;
+			}
+		} ZEND_HASH_FOREACH_END();
+	}
+	if (zstates) {
+		zval *state;
+		ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(zstates), state) {
+			if (Z_TYPE_P(state) == IS_ARRAY) {
+				zval *smask = zend_hash_index_find(Z_ARRVAL_P(state), 2);
+				if (smask && dc_mask_has_named_closure(smask)) {
+					return true;
+				}
+			}
+		} ZEND_HASH_FOREACH_END();
+	}
+	return false;
+}
+
 PHP_FUNCTION(deepclone_from_array)
 {
 	HashTable *data_ht;
 	HashTable *allowed_ht = NULL;
 	HashTable *allowed_set = NULL;
+	bool allow_named_closures = false;
 	HashTable refs_local;
 	HashTable *refs = NULL;
 	zend_string **class_names = NULL;
@@ -3795,10 +3886,11 @@ PHP_FUNCTION(deepclone_from_array)
 	 * any early-exit path. Only one is live at a time. */
 	zend_string *numeric_prop_tmp = NULL;
 
-	ZEND_PARSE_PARAMETERS_START(1, 2)
+	ZEND_PARSE_PARAMETERS_START(1, 3)
 		Z_PARAM_ARRAY_HT(data_ht)
 		Z_PARAM_OPTIONAL
 		Z_PARAM_ARRAY_HT_OR_NULL(allowed_ht)
+		Z_PARAM_BOOL(allow_named_closures)
 	ZEND_PARSE_PARAMETERS_END();
 
 	/* Static value: return data['value'] */
@@ -3912,6 +4004,18 @@ PHP_FUNCTION(deepclone_from_array)
 				} ZEND_HASH_FOREACH_END();
 			}
 		}
+	}
+
+	/* Named closures (the by-name marker, LONG(0)) let a payload mint a
+	 * Closure over any function or method by name; they resolve only when the
+	 * caller opts in via allow_named_closures, which the producer must also
+	 * have set. Const-expr-closure references (LONG(1)) are unaffected: they
+	 * resolve only to closures the named class itself declares. The scan runs
+	 * before any object is instantiated, so a payload carrying a named closure
+	 * is rejected wholesale rather than failing mid-hydration. */
+	if (!allow_named_closures
+			&& dc_payload_has_named_closure(zmask, zresolve, zref_masks, zstates)) {
+		DC_INVALID("deepclone_from_array(): resolving a closure over a named callable requires enabling the allow_named_closures option");
 	}
 
 	/* ── Build objectMeta ── */

@@ -47,12 +47,12 @@ try {
 }
 
 // ── to_array: Closure allowed ──
-$d = deepclone_to_array(strlen(...), ['Closure']);
+$d = deepclone_to_array(strlen(...), ['Closure'], true);
 var_dump(isset($d['mask']));
 
 // ── to_array: Closure rejected ──
 try {
-    deepclone_to_array(strlen(...), []);
+    deepclone_to_array(strlen(...), [], true);
 } catch (ValueError $e) {
     var_dump(str_contains($e->getMessage(), '"Closure" is not allowed'));
 }
@@ -78,9 +78,9 @@ try {
 }
 
 // ── from_array: Closure in mask rejected ──
-$d = deepclone_to_array(strlen(...));
+$d = deepclone_to_array(strlen(...), allow_named_closures: true);
 try {
-    deepclone_from_array($d, ['stdClass']);
+    deepclone_from_array($d, ['stdClass'], true);
 } catch (ValueError $e) {
     var_dump(str_contains($e->getMessage(), '"Closure" is not allowed'));
 }

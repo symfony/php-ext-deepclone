@@ -19,14 +19,14 @@ function build(): array
     $a->cb = strlen(...); $b->cb = strrev(...);   // makes both nodes ghosts
     $a->peer = $b; $b->peer = $a;
     $a->v = 'av'; $b->v = 'bv';
-    return deepclone_to_array($a);
+    return deepclone_to_array($a, allow_named_closures: true);
 }
 
 // ── A half-lazy graph that goes out of scope is a context↔ghost cycle;
 //    the GC must reclaim it ──
 $weak = null;
 (function () use (&$weak) {
-    $a = deepclone_from_array(build());
+    $a = deepclone_from_array(build(), allow_named_closures: true);
     $weak = WeakReference::create($a);
     $a->v; // hydrate the root, leave the peer lazy
 })();
@@ -35,7 +35,7 @@ var_dump($weak->get());
 
 // ── Fully-lazy abandoned graph too ──
 (function () use (&$weak) {
-    $a = deepclone_from_array(build());
+    $a = deepclone_from_array(build(), allow_named_closures: true);
     $weak = WeakReference::create($a);
 })();
 gc_collect_cycles();
@@ -51,10 +51,10 @@ class Dtor {
 $src = [new Dtor, new Dtor];
 $src[0]->x = 1; $src[0]->cb = strlen(...);
 $src[1]->x = 2; $src[1]->cb = strrev(...);
-$payload = deepclone_to_array($src);
+$payload = deepclone_to_array($src, allow_named_closures: true);
 unset($src); // "dtor 1", "dtor 2": the sources go away
 (function () use ($payload) {
-    [$a, $b] = deepclone_from_array($payload);
+    [$a, $b] = deepclone_from_array($payload, allow_named_closures: true);
     var_dump($a->x); // initializes $a only
 })();
 // The still-uninitialized ghost of $b pins the whole graph (the context
@@ -83,12 +83,12 @@ class U {
 }
 
 $w = new W; $w->child = new Node; $w->child->v = 'cw'; $w->child->cb = strlen(...);
-$w2 = deepclone_from_array(deepclone_to_array($w));
+$w2 = deepclone_from_array(deepclone_to_array($w, allow_named_closures: true), allow_named_closures: true);
 var_dump((new ReflectionClass(W::class))->isUninitializedLazyObject($w2));
 var_dump($w2->seen);
 
 $u = new U; $u->child = new Node; $u->child->v = 'cu'; $u->child->cb = strlen(...);
-$u2 = deepclone_from_array(deepclone_to_array($u));
+$u2 = deepclone_from_array(deepclone_to_array($u, allow_named_closures: true), allow_named_closures: true);
 var_dump((new ReflectionClass(U::class))->isUninitializedLazyObject($u2));
 var_dump($u2->seen);
 

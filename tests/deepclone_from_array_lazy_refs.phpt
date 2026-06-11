@@ -23,11 +23,11 @@ function buildNodes(): array
     $shared = 'initial';
     $a->v = &$shared; $b->v = &$shared;
     $a->peer = $b; $b->peer = $a;
-    return deepclone_to_array($a);
+    return deepclone_to_array($a, allow_named_closures: true);
 }
 
 foreach (['root-first', 'peer-first'] as $order) {
-    $root = deepclone_from_array(buildNodes());
+    $root = deepclone_from_array(buildNodes(), allow_named_closures: true);
     var_dump((new ReflectionClass(Node::class))->isUninitializedLazyObject($root));
     if ($order === 'peer-first') {
         $r = &$root->peer->v;   // hydrates root (peer read), then peer (v read)
@@ -44,7 +44,7 @@ $a->cb = strlen(...); $b->cb = strrev(...);
 $shared = 1;
 $a->a = &$shared; $b->a = &$shared;
 $a->peer = $b; $b->peer = $a;
-$root = deepclone_from_array(deepclone_to_array($a));
+$root = deepclone_from_array(deepclone_to_array($a, allow_named_closures: true), allow_named_closures: true);
 var_dump((new ReflectionClass(Typed::class))->isUninitializedLazyObject($root));
 $w = &$root->peer->a;
 $w = 11;

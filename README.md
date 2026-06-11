@@ -78,14 +78,29 @@ deepclone_hydrate($existingUser, ['name' => 'Bob']);
 ## API
 
 ```php
-function deepclone_to_array(mixed $value, ?array $allowed_classes = null): array;
-function deepclone_from_array(array $data, ?array $allowed_classes = null): mixed;
+function deepclone_to_array(mixed $value, ?array $allowed_classes = null, bool $allow_named_closures = false): array;
+function deepclone_from_array(array $data, ?array $allowed_classes = null, bool $allow_named_closures = false): mixed;
 function deepclone_hydrate(object|string $object_or_class, array $vars = [], int $flags = 0): object;
 ```
 
 `$allowed_classes` restricts which classes may be serialized or deserialized
 (`null` = allow all, `[]` = allow none). Case-insensitive, matching
 `unserialize()`'s `allowed_classes` option.
+
+`$allow_named_closures` controls the by-name encoding of closures over named
+callables (first-class callables such as `strlen(...)`, `$obj->method(...)`
+or `Cls::method(...)`, and `Closure::fromCallable()`). It defaults to
+`false`, and **both ends must enable it**: `deepclone_to_array()` refuses to
+encode such a closure unless it is set, and `deepclone_from_array()` refuses
+to resolve a by-name closure payload unless it is set. The reason is that a
+by-name payload can mint a `Closure` over *any* function or method of that
+name, including internal functions like `system()`, so it should only travel
+between ends that trust each other. Closures declared in constant
+expressions (anonymous static closures and first-class callables over a
+method of their own declaring class, e.g. `#[When(self::isStrict(...))]`)
+are **not** affected: they serialize as a reference to their declaration
+site, resolvable only to what the named class itself declares, and round-trip
+without this option.
 
 ### Lazy hydration of closure-bearing nodes (PHP 8.4+)
 
@@ -257,7 +272,12 @@ $s->__unserialize([[$obj1, 'info1', $obj2, 'info2'], []]);
 - Cycles in the object graph
 - Private/protected properties across inheritance
 - `__serialize` / `__unserialize` / `__sleep` / `__wakeup` semantics
-- Named closures (first-class callables like `strlen(...)`)
+- Closures declared in constant expressions (anonymous static closures and
+  first-class callables over a method of their declaring class, as found in
+  attribute arguments and parameter defaults), as a reference to their
+  declaration site
+- Closures over named callables (first-class callables like `strlen(...)`),
+  by name, when `$allow_named_closures` is enabled on both ends
 - Enum values
 - Copy-on-write for strings and scalar arrays
 

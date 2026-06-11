@@ -27,7 +27,7 @@ class U {
     }
 }
 $u = new U; $u->cb = strlen(...);
-$copy = deepclone_from_array(deepclone_to_array($u));
+$copy = deepclone_from_array(deepclone_to_array($u, allow_named_closures: true), allow_named_closures: true);
 var_dump(uninit($copy));
 var_dump($copy->seen);   // first touch runs __unserialize
 var_dump(uninit($copy));
@@ -39,7 +39,7 @@ class W {
     public function __wakeup(): void { $this->seen = 'woke:' . ($this->cb)('xy'); }
 }
 $w = new W; $w->cb = strrev(...);
-$copy = deepclone_from_array(deepclone_to_array($w));
+$copy = deepclone_from_array(deepclone_to_array($w, allow_named_closures: true), allow_named_closures: true);
 var_dump(uninit($copy));
 var_dump($copy->seen);
 
@@ -56,9 +56,9 @@ class EagerU {
 }
 $g = new U; $g->cb = strlen(...);
 $e = new EagerU; $e->peer = $g;
-$payload = deepclone_to_array($e);
+$payload = deepclone_to_array($e, allow_named_closures: true);
 foreach ([$payload, ['states' => array_reverse($payload['states'], true)] + $payload] as $p) {
-    var_dump(deepclone_from_array($p)->got);
+    var_dump(deepclone_from_array($p, allow_named_closures: true)->got);
 }
 
 // ── Nested deferral: a deferred-state ghost whose __unserialize touches a
@@ -78,9 +78,9 @@ class Pair {
 $a = new Pair; $b = new Pair;
 $a->cb = strlen(...); $b->cb = strrev(...);
 $a->peer = $b; $b->peer = 'leaf-b';
-$payload = deepclone_to_array($a);
+$payload = deepclone_to_array($a, allow_named_closures: true);
 foreach ([$payload, ['states' => array_reverse($payload['states'], true)] + $payload] as $p) {
-    $copy = deepclone_from_array($p);
+    $copy = deepclone_from_array($p, allow_named_closures: true);
     var_dump(uninit($copy));
     var_dump($copy->seen);          // hydrates $a; reading peer->seen nests into $b
     var_dump($copy->peer->seen);
@@ -97,9 +97,9 @@ class Combo {
         $this->seen .= 'ran:' . ($this->cb)('abc');
     }
 }
-$payload = deepclone_to_array((function () { $c = new Combo; $c->cb = strlen(...); return $c; })());
+$payload = deepclone_to_array((function () { $c = new Combo; $c->cb = strlen(...); return $c; })(), allow_named_closures: true);
 $payload['properties'] = ['stdClass' => ['seen' => [0 => 'slot-written+']]];
-$copy = deepclone_from_array($payload);
+$copy = deepclone_from_array($payload, allow_named_closures: true);
 var_dump(uninit($copy));
 var_dump($copy->seen); // slot value first, then the appending hook
 
@@ -110,13 +110,13 @@ class V {
     public function __unserialize(array $d): void { $this->cb = $d['cb']; }
 }
 $v = new V; $v->cb = strlen(...);
-$payload = deepclone_to_array($v);
+$payload = deepclone_to_array($v, allow_named_closures: true);
 
 // flagged for replay but no states entry
 $broken = $payload;
 unset($broken['states']);
 try {
-    deepclone_from_array($broken);
+    deepclone_from_array($broken, allow_named_closures: true);
     echo "no error?!\n";
 } catch (ValueError $err) {
     echo $err->getMessage(), "\n";
@@ -140,11 +140,11 @@ class Toucher {
 }
 $g = new NoisyWakeup; $g->cb = strlen(...);
 $t = new Toucher; $t->peer = $g;
-$broken = deepclone_to_array($t);
+$broken = deepclone_to_array($t, allow_named_closures: true);
 // drop the ghost's __wakeup entry (the only int entry), keep its flag
 $broken['states'] = array_filter($broken['states'], fn ($e) => !is_int($e));
 try {
-    deepclone_from_array($broken);
+    deepclone_from_array($broken, allow_named_closures: true);
     echo "no error?!\n";
 } catch (ValueError $err) {
     echo $err->getMessage(), "\n";
@@ -154,7 +154,7 @@ try {
 $broken = $payload;
 $broken['states'][] = $broken['states'][1];
 try {
-    deepclone_from_array($broken);
+    deepclone_from_array($broken, allow_named_closures: true);
     echo "no error?!\n";
 } catch (ValueError $err) {
     echo $err->getMessage(), "\n";
@@ -170,7 +170,7 @@ function deepmap(array $a): array
     }
     return $r;
 }
-$ghost = deepclone_from_array(deepmap($payload));
+$ghost = deepclone_from_array(deepmap($payload), allow_named_closures: true);
 var_dump(uninit($ghost));
 foreach ([1, 2] as $try) {
     try {

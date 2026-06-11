@@ -9,6 +9,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `deepclone_to_array()` and `deepclone_from_array()` gained a third
+  parameter, `bool $allow_named_closures = false`, gating the by-name
+  encoding of closures over named callables (first-class callables such as
+  `strlen(...)`, `$obj->method(...)`, `Cls::method(...)`, and
+  `Closure::fromCallable()`). Both ends must enable it: with it off (the
+  default) `deepclone_to_array()` refuses to encode such a closure and
+  `deepclone_from_array()` rejects any payload carrying a by-name closure
+  marker, before instantiating anything. A by-name payload can mint a
+  `Closure` over any function or method of that name, including internal
+  functions like `system()`, so it is restricted to ends that trust each
+  other. See SECURITY.md.
+- On PHP 8.5+, first-class callables over a method of their own declaring
+  class declared in a constant expression (e.g.
+  `#[When(self::isStrict(...))]`) now serialize as a reference to their
+  declaration site (the same code-free, `allowed_classes`-gated payload as
+  anonymous const-expr closures), instead of by name. They round-trip
+  without `$allow_named_closures`, restoring the attribute-cache use case for
+  first-class-callable arguments. References whose declaring class cannot be
+  derived from the closure (cross-class or global-function callables,
+  inherited methods, runtime-created callables) still take the by-name path
+  and require the opt-in.
+
+### Changed
+
+- **BC break.** Closures over named callables no longer serialize or resolve
+  by default; they now require `$allow_named_closures` on both
+  `deepclone_to_array()` and `deepclone_from_array()` (see Added). Code that
+  relied on the previous unconditional by-name behavior must pass the flag.
+  Closures declared in constant expressions are unaffected.
+
 - On PHP 8.4+, `deepclone_from_array()` now creates object nodes whose
   payload slots or replayed `__unserialize` state carry a named-closure or
   const-expr-closure marker as

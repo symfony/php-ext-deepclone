@@ -65,7 +65,14 @@ $clone = deepclone_from_array(deepclone_to_array($v));
 var_dump($clone[0] === $clone);
 
 // ── Named closure (global function) ──
-$clone = deepclone_from_array(deepclone_to_array(strlen(...)));
+// Serializing/resolving a runtime named callable requires the opt-in on both ends.
+try {
+    deepclone_to_array(strlen(...));
+    echo "no throw\n";
+} catch (ValueError $e) {
+    var_dump($e->getMessage() === 'deepclone_to_array(): serializing a closure over the named callable "strlen" requires enabling the allow_named_closures option');
+}
+$clone = deepclone_from_array(deepclone_to_array(strlen(...), allow_named_closures: true), allow_named_closures: true);
 var_dump($clone('hello') === 5);
 
 // ── Wide fixture (50 objects) ──
