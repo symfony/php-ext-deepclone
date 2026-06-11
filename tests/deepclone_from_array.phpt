@@ -70,7 +70,7 @@ try {
     deepclone_to_array(strlen(...));
     echo "no throw\n";
 } catch (ValueError $e) {
-    var_dump($e->getMessage() === 'deepclone_to_array(): serializing a closure over the named callable "strlen" requires enabling the allow_named_closures option');
+    var_dump($e->getMessage() === 'deepclone_to_array(): serializing a closure over the named callable "strlen" requires enabling the "allow_named_closures" option; do it only if you trust the input');
 }
 $clone = deepclone_from_array(deepclone_to_array(strlen(...), allow_named_closures: true), allow_named_closures: true);
 var_dump($clone('hello') === 5);

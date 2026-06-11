@@ -2100,7 +2100,7 @@ static void dc_copy_value(dc_ctx *ctx, zval *src, zval *dst, zval *mask_dst)
 		 * ends must enable. */
 		if (func && (func->common.fn_flags & ZEND_ACC_FAKE_CLOSURE)) {
 			if (!ctx->allow_named_closures) {
-				zend_value_error("deepclone_to_array(): serializing a closure over the named callable \"%s\" requires enabling the allow_named_closures option", ZSTR_VAL(func->common.function_name));
+				zend_value_error("deepclone_to_array(): serializing a closure over the named callable \"%s\" requires enabling the \"allow_named_closures\" option; do it only if you trust the input", ZSTR_VAL(func->common.function_name));
 				return;
 			}
 			if (!dc_class_allowed(ctx->allowed_ht, zend_ce_closure->name)) {

@@ -89,8 +89,8 @@ bool(true)
 bool(true)
 bool(true)
 == 3. a runtime named closure refuses to_array without the opt-in ==
-strlen: ValueError: deepclone_to_array(): serializing a closure over the named callable "strlen" requires enabling the allow_named_closures option
-Helper::pub: ValueError: deepclone_to_array(): serializing a closure over the named callable "pub" requires enabling the allow_named_closures option
+strlen: ValueError: deepclone_to_array(): serializing a closure over the named callable "strlen" requires enabling the "allow_named_closures" option; do it only if you trust the input
+Helper::pub: ValueError: deepclone_to_array(): serializing a closure over the named callable "pub" requires enabling the "allow_named_closures" option; do it only if you trust the input
 == 4. with the opt-in on both ends it round-trips by name ==
 bool(true)
 bool(true)

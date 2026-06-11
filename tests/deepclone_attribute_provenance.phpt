@@ -99,5 +99,5 @@ bool(true)
 bool(true)
 bool(true)
 == 5. a callable no attribute declares stays by-name (needs the opt-in) ==
-uncaptured: ValueError: deepclone_to_array(): serializing a closure over the named callable "loose" requires enabling the allow_named_closures option
+uncaptured: ValueError: deepclone_to_array(): serializing a closure over the named callable "loose" requires enabling the "allow_named_closures" option; do it only if you trust the input
 Done
