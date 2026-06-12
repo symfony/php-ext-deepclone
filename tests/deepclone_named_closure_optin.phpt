@@ -96,11 +96,11 @@ bool(true)
 bool(true)
 bool(true)
 == 5. a by-name payload is refused by from_array without the opt-in ==
-from_array: ValueError: deepclone_from_array(): resolving a closure over a named callable requires enabling the allow_named_closures option
+from_array: ValueError: deepclone_from_array(): resolving a closure over a named callable requires enabling the "allow_named_closures" option; do it only if you trust the input; alternatively, install the "deepclone" extension, which can reference callables declared in constant expressions
 == 6. a hostile system() payload is refused by default ==
-system: ValueError: deepclone_from_array(): resolving a closure over a named callable requires enabling the allow_named_closures option
+system: ValueError: deepclone_from_array(): resolving a closure over a named callable requires enabling the "allow_named_closures" option; do it only if you trust the input; alternatively, install the "deepclone" extension, which can reference callables declared in constant expressions
 == 7. a named closure nested in an object graph is refused wholesale (before instantiation) ==
-nested: ValueError: deepclone_from_array(): resolving a closure over a named callable requires enabling the allow_named_closures option
+nested: ValueError: deepclone_from_array(): resolving a closure over a named callable requires enabling the "allow_named_closures" option; do it only if you trust the input; alternatively, install the "deepclone" extension, which can reference callables declared in constant expressions
 bool(true)
 bool(true)
 == 8. allowed_classes still gates Closure even with the opt-in ==

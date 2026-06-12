@@ -4286,7 +4286,7 @@ PHP_FUNCTION(deepclone_from_array)
 	 * is rejected wholesale rather than failing mid-hydration. */
 	if (!allow_named_closures
 			&& dc_payload_has_named_closure(zmask, zresolve, zref_masks, zstates)) {
-		DC_INVALID("deepclone_from_array(): resolving a closure over a named callable requires enabling the allow_named_closures option");
+		DC_INVALID("deepclone_from_array(): resolving a closure over a named callable requires enabling the \"allow_named_closures\" option; do it only if you trust the input; alternatively, install the "deepclone" extension, which can reference callables declared in constant expressions");
 	}
 
 	/* ── Build objectMeta ── */
