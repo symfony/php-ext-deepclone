@@ -5,6 +5,19 @@ All notable changes to this extension will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.2] - 2026-06-30
+
+### Changed
+
+- On PHP 8.6+, hydration writes route through the new
+  `zend_reflection_property_set_raw_value()` and
+  `zend_reflection_property_set_raw_value_without_lazy_initialization()`
+  PHPAPI helpers exposed by ext/reflection
+  ([php/php-src#21763](https://github.com/php/php-src/pull/21763)), replacing
+  the userland `ReflectionProperty` round-trip previously used to set raw
+  values on typed, hooked, and lazy properties. Behavior is unchanged; PHP
+  8.4 / 8.5 keep the userland fallback.
+
 ## [0.8.1] - 2026-06-12
 
 ### Fixed
