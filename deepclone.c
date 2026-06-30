@@ -1597,6 +1597,26 @@ static zend_class_entry *dc_provenance_lookup(zend_class_entry *target_ce, zend_
 	return zend_lookup_class_ex(decl, NULL, ZEND_FETCH_CLASS_NO_AUTOLOAD);
 }
 
+/* The class whose constant expression declares this first-class callable. On
+ * PHP 8.6 the engine records it (zend_constexpr_closure_ref), so it is exact
+ * and needs no capture; on 8.5 it comes from the ReflectionAttribute-captured
+ * index. Either way it feeds the same site-based (5-element) reference, which
+ * is interchangeable with the polyfill — unlike the engine-id form, whose fcc
+ * line userland cannot reproduce. */
+static zend_class_entry *dc_declaring_class(zval *src, const zend_function *func)
+{
+#if PHP_VERSION_ID >= 80600
+	zend_class_entry *ce;
+	uint32_t id, line;
+	if (zend_constexpr_closure_ref(Z_OBJ_P(src), &ce, &id, &line) == SUCCESS) {
+		return ce;
+	}
+#endif
+	return func->common.function_name
+		? dc_provenance_lookup(func->common.scope, func->common.function_name)
+		: NULL;
+}
+
 /* Walk a value (a getArguments() argument, or a newInstance() attribute object
  * and its properties), recording every cross-class FCC against `scope`. The
  * `seen` set guards cycles: getArguments() values are acyclic constant
@@ -1687,6 +1707,66 @@ static void ZEND_FASTCALL dc_attr_new_instance_wrapper(INTERNAL_FUNCTION_PARAMET
 }
 #endif /* PHP_VERSION_ID >= 80500 */
 
+/* deepclone_from_array() counterpart for engine-id references [class, id,
+ * line], emitted on PHP >= 8.6: the id is the engine's canonical per-class
+ * const-expr closure id (see Closure::fromConstExpr()). */
+static void dc_cexpr_resolve_id(HashTable *ht, HashTable *allowed_set, zval *retval)
+{
+	zval *zclass = zend_hash_index_find(ht, 0);
+	zval *zid = zend_hash_index_find(ht, 1);
+	zval *zline = zend_hash_index_find(ht, 2);
+	if (!zclass || !zid || !zline || zend_hash_num_elements(ht) != 3) {
+		zend_value_error("deepclone_from_array(): malformed payload, const-expr-closure value must have 3 elements");
+		return;
+	}
+	ZVAL_DEREF(zclass);
+	ZVAL_DEREF(zid);
+	ZVAL_DEREF(zline);
+	if (Z_TYPE_P(zclass) != IS_STRING) {
+		zend_value_error("deepclone_from_array(): malformed payload, const-expr-closure class name must be of type string, %s given", zend_zval_value_name(zclass));
+		return;
+	}
+	if (Z_TYPE_P(zline) != IS_LONG) {
+		zend_value_error("deepclone_from_array(): malformed payload, const-expr-closure line must be of type int, %s given", zend_zval_value_name(zline));
+		return;
+	}
+
+	/* Gate before zend_lookup_class(): the payload must not be able to
+	 * autoload, let alone evaluate, classes outside the allow-list. */
+	if (!dc_class_allowed(allowed_set, Z_STR_P(zclass))) {
+		zend_value_error("deepclone_from_array(): class \"%s\" is not allowed", Z_STRVAL_P(zclass));
+		return;
+	}
+
+#if PHP_VERSION_ID >= 80600
+	zend_class_entry *ce = zend_lookup_class(Z_STR_P(zclass));
+	if (!ce) {
+		zend_value_error("deepclone_from_array(): malformed payload, const-expr-closure references unknown class \"%s\"", Z_STRVAL_P(zclass));
+		return;
+	}
+
+	zend_ast *site = zend_constexpr_closure_site_by_id(ce, Z_LVAL_P(zid));
+	if (!site) {
+		zend_value_error("deepclone_from_array(): malformed payload, const-expr-closure references unknown closure id " ZEND_LONG_FMT " in class \"%s\"", Z_LVAL_P(zid), ZSTR_VAL(ce->name));
+		return;
+	}
+	if (site->kind != ZEND_AST_OP_ARRAY) {
+		zend_value_error("deepclone_from_array(): malformed payload, const-expr-closure references a first-class callable site");
+		return;
+	}
+
+	zend_op_array *op = zend_ast_get_op_array(site)->op_array;
+	if (Z_LVAL_P(zline) != (zend_long) op->line_start) {
+		zend_value_error("deepclone_from_array(): stale payload, const-expr-closure moved from line " ZEND_LONG_FMT " to line %u", Z_LVAL_P(zline), op->line_start);
+		return;
+	}
+
+	zend_create_closure(retval, (zend_function *) op, ce, ce, NULL);
+#else
+	zend_value_error("deepclone_from_array(): const-expr-closure payload was created on PHP 8.6 or later and cannot be resolved on PHP %s", PHP_VERSION);
+#endif
+}
+
 /* deepclone_from_array() counterpart: resolve a declaration-site reference
  * back to a live Closure. */
 static void dc_cexpr_resolve(zval *value, HashTable *allowed_set, zval *retval)
@@ -1696,6 +1776,18 @@ static void dc_cexpr_resolve(zval *value, HashTable *allowed_set, zval *retval)
 		return;
 	}
 	HashTable *ht = Z_ARRVAL_P(value);
+
+	zval *zid = zend_hash_index_find(ht, 1);
+	if (zid) {
+		ZVAL_DEREF(zid);
+	}
+	if (zid && Z_TYPE_P(zid) == IS_LONG) {
+		/* The type of element 1 (int id vs string site) discriminates
+		 * engine-id references from site-based ones. */
+		dc_cexpr_resolve_id(ht, allowed_set, retval);
+		return;
+	}
+
 	zval *zclass = zend_hash_index_find(ht, 0);
 	zval *zsite = zend_hash_index_find(ht, 1);
 	zval *zattr = zend_hash_index_find(ht, 2);
@@ -2062,6 +2154,31 @@ static void dc_copy_value(dc_ctx *ctx, zval *src, zval *dst, zval *mask_dst)
 					zend_value_error("deepclone_to_array(): class \"Closure\" is not allowed");
 					return;
 				}
+#if PHP_VERSION_ID >= 80600
+				/* The engine assigns a canonical per-class id to anonymous closures
+				 * declared in attribute arguments and parameter default values; prefer
+				 * it to the site-based reference below. First-class callables are
+				 * excluded: their engine id resolves to an fcc site the decode side
+				 * cannot recreate, so they keep the site-based and by-name paths.
+				 * Closures in class constant values and property defaults have no id
+				 * and also fall through. */
+				if (!(func->common.fn_flags & ZEND_ACC_FAKE_CLOSURE)) {
+					zend_class_entry *site_ce;
+					uint32_t cexpr_id, cexpr_line;
+					if (zend_constexpr_closure_ref(Z_OBJ_P(src), &site_ce, &cexpr_id, &cexpr_line) == SUCCESS) {
+						zval tmp;
+						array_init_size(dst, 3);
+						ZVAL_STR_COPY(&tmp, site_ce->name);
+						zend_hash_index_add_new(Z_ARRVAL_P(dst), 0, &tmp);
+						ZVAL_LONG(&tmp, (zend_long) cexpr_id);
+						zend_hash_index_add_new(Z_ARRVAL_P(dst), 1, &tmp);
+						ZVAL_LONG(&tmp, (zend_long) cexpr_line);
+						zend_hash_index_add_new(Z_ARRVAL_P(dst), 2, &tmp);
+						DC_MASK_CONSTEXPR_CLOSURE(mask_dst);
+						goto handle_value;
+					}
+				}
+#endif
 				zval payload;
 				ZVAL_UNDEF(&payload);
 				if (dc_cexpr_locate(func, &payload)) {
@@ -2077,8 +2194,8 @@ static void dc_copy_value(dc_ctx *ctx, zval *src, zval *dst, zval *mask_dst)
 				 * scope) misses. On 8.5 there is no engine provenance; fall back
 				 * to a declaring class captured from ReflectionAttribute, if
 				 * any, and locate the site there. */
-				if (DC_G(capture_attribute_closures) && func->common.scope && func->common.function_name) {
-					zend_class_entry *decl = dc_provenance_lookup(func->common.scope, func->common.function_name);
+				if (func->common.function_name) {
+					zend_class_entry *decl = dc_declaring_class(src, func);
 					if (decl && decl != func->common.scope && dc_cexpr_locate_ce(func, decl, &payload)) {
 						ZVAL_COPY_VALUE(dst, &payload);
 						DC_MASK_CONSTEXPR_CLOSURE(mask_dst);
@@ -2092,15 +2209,15 @@ static void dc_copy_value(dc_ctx *ctx, zval *src, zval *dst, zval *mask_dst)
 		}
 
 		/* Global-function first-class callable (no scope, internal or user):
-		 * the declaring class can only come from captured provenance. Same
+		 * the declaring class comes from the engine (8.6) or captured
+		 * provenance (8.5). Same
 		 * declaration-site reference and Closure gating as above; unresolved
 		 * ones fall through to the by-name path. */
 		if (func && (func->common.fn_flags & ZEND_ACC_FAKE_CLOSURE)
-				&& !func->common.scope && func->common.function_name
-				&& DC_G(capture_attribute_closures)) {
+				&& !func->common.scope && func->common.function_name) {
 			zval *this_ptr = zend_get_closure_this_ptr(src);
 			if (!this_ptr || Z_TYPE_P(this_ptr) != IS_OBJECT) {
-				zend_class_entry *decl = dc_provenance_lookup(NULL, func->common.function_name);
+				zend_class_entry *decl = dc_declaring_class(src, func);
 				if (decl) {
 					if (!dc_class_allowed(ctx->allowed_ht, zend_ce_closure->name)) {
 						zend_value_error("deepclone_to_array(): class \"Closure\" is not allowed");

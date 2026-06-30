@@ -47,6 +47,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   relied on the previous unconditional by-name behavior must pass the flag.
   Closures declared in constant expressions are unaffected.
 
+- On PHP 8.6, `deepclone_to_array()` references anonymous closures declared in
+  attribute arguments and parameter default values as `[class, id, line]`, where
+  `id` is the engine's canonical const-expr closure id (see
+  `Closure::fromConstExpr()`). This replaces the per-call declaration-site scan
+  with the engine's non-evaluating walk. `deepclone_from_array()` accepts both
+  this and the site-based form: site-based payloads written on PHP 8.5 keep
+  resolving on 8.6, and engine-id payloads fail with an explicit message on older
+  PHP.
+- On PHP 8.6, first-class callables declared in a constant expression of another
+  class (`#[When(Validators::check(...))]`) or over a global function
+  (`#[When(strlen(...))]`) get their declaring class from the engine and
+  serialize as a (site-based) declaration-site reference with no
+  `allow_named_closures` opt-in -- the same payload the extension produces on
+  8.5 through ReflectionAttribute provenance, and that the polyfill produces.
+  (First-class callables keep the site-based form rather than an engine id: an
+  engine id resolves to an fcc site whose source line userland cannot reproduce,
+  which would break interchange with the polyfill.)
+
 - On PHP 8.4+, `deepclone_from_array()` now creates object nodes whose
   payload slots or replayed `__unserialize` state carry a named-closure or
   const-expr-closure marker as
