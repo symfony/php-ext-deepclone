@@ -4,7 +4,6 @@ deepclone references closures declared in constant expressions (PHP 8.5)
 deepclone
 --SKIPIF--
 <?php if (PHP_VERSION_ID < 80500) die('skip requires PHP 8.5'); ?>
-<?php if (PHP_VERSION_ID >= 80600) die('skip PHP 8.6 emits engine-id references, covered by deepclone_constexpr_closures_native.phpt'); ?>
 --FILE--
 <?php
 

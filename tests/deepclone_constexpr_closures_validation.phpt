@@ -41,11 +41,6 @@ $cases = [
     [Fix::class, 'tagged()', null, 0, $line],
     [Fix::class, '$tagged::get()', 0, 0, $line],
     [Fix::class, '$tagged::bad()', 0, 0, $line],
-    // an int element 1 makes the payload an engine-id reference [class, id, line]
-    [Fix::class, 0],
-    [Fix::class, 0, $line, 'x'],
-    [42, 0, $line],
-    [Fix::class, 0, 'x'],
 ];
 
 foreach ($cases as $prepared) {
@@ -62,7 +57,7 @@ deepclone_from_array(): malformed payload, const-expr-closure value must be of t
 deepclone_from_array(): malformed payload, const-expr-closure value must have 5 elements
 deepclone_from_array(): malformed payload, const-expr-closure class name must be of type string, int given
 deepclone_from_array(): malformed payload, const-expr-closure references unknown class "No\Such\ClassAtAll"
-deepclone_from_array(): malformed payload, const-expr-closure value must have 3 elements
+deepclone_from_array(): malformed payload, const-expr-closure site must be of type string, int given
 deepclone_from_array(): malformed payload, const-expr-closure attribute index must be of type int or null, string given
 deepclone_from_array(): malformed payload, const-expr-closure closure index must be of type int, string given
 deepclone_from_array(): malformed payload, const-expr-closure line must be of type int, string given
@@ -79,7 +74,3 @@ deepclone_from_array(): malformed payload, const-expr-closure attribute index is
 deepclone_from_array(): malformed payload, const-expr-closure attribute index is required for site "tagged()"
 deepclone_from_array(): malformed payload, const-expr-closure references unknown hook "$tagged::get()"
 deepclone_from_array(): malformed payload, const-expr-closure references unknown hook "$tagged::bad()"
-deepclone_from_array(): malformed payload, const-expr-closure value must have 3 elements
-deepclone_from_array(): malformed payload, const-expr-closure value must have 3 elements
-deepclone_from_array(): malformed payload, const-expr-closure class name must be of type string, int given
-deepclone_from_array(): malformed payload, const-expr-closure line must be of type int, string given
