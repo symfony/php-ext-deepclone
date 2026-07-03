@@ -22,25 +22,22 @@ $line = (new ReflectionFunction((new ReflectionClass(Fix::class))->getAttributes
 $cases = [
     'foo',
     [Fix::class],
-    [42, '', 0, 0, $line],
-    ['No\Such\ClassAtAll', '', 0, 0, $line],
-    [Fix::class, 42, 0, 0, $line],
-    [Fix::class, '', 'x', 0, $line],
-    [Fix::class, '', 0, 'x', $line],
-    [Fix::class, '', 0, 0, 'x'],
-    [Fix::class, '$nope', 0, 0, $line],
-    [Fix::class, 'nope()', 0, 0, $line],
-    [Fix::class, 'NOPE', 0, 0, $line],
-    [Fix::class, 'tagged()#9', 0, 0, $line],
-    [Fix::class, 'tagged()#01', 0, 0, $line],
-    [Fix::class, '', 9, 0, $line],
-    [Fix::class, '', -1, 0, $line],
-    [Fix::class, '', 0, 9, $line],
-    [Fix::class, '', 0, -1, $line],
-    [Fix::class, '', null, 0, $line],
-    [Fix::class, 'tagged()', null, 0, $line],
-    [Fix::class, '$tagged::get()', 0, 0, $line],
-    [Fix::class, '$tagged::bad()', 0, 0, $line],
+    [Fix::class, '@0', $line, 'x'],
+    [42, '@0', $line],
+    [Fix::class, 0, $line],
+    [Fix::class, '@0', 'x'],
+    [Fix::class, 'nope', $line],
+    [Fix::class, '@', $line],
+    [Fix::class, '@01', $line],
+    [Fix::class, '@1x', $line],
+    ['No\\Such\\ClassAtAll', '@0', $line],
+    [Fix::class, '$nope@0', $line],
+    [Fix::class, 'nope()@0', $line],
+    [Fix::class, 'NOPE@0', $line],
+    [Fix::class, '$tagged::bad()@0', $line],
+    [Fix::class, '$tagged::get()@0', $line],
+    [Fix::class, '@9', $line],
+    [Fix::class, 'tagged()@9', $line],
 ];
 
 foreach ($cases as $prepared) {
@@ -54,23 +51,20 @@ foreach ($cases as $prepared) {
 ?>
 --EXPECT--
 deepclone_from_array(): malformed payload, const-expr-closure value must be of type array, string given
-deepclone_from_array(): malformed payload, const-expr-closure value must have 5 elements
+deepclone_from_array(): malformed payload, const-expr-closure value must have 3 elements
+deepclone_from_array(): malformed payload, const-expr-closure value must have 3 elements
 deepclone_from_array(): malformed payload, const-expr-closure class name must be of type string, int given
-deepclone_from_array(): malformed payload, const-expr-closure references unknown class "No\Such\ClassAtAll"
-deepclone_from_array(): malformed payload, const-expr-closure site must be of type string, int given
-deepclone_from_array(): malformed payload, const-expr-closure attribute index must be of type int or null, string given
-deepclone_from_array(): malformed payload, const-expr-closure closure index must be of type int, string given
+deepclone_from_array(): malformed payload, const-expr-closure id must be of type string, int given
 deepclone_from_array(): malformed payload, const-expr-closure line must be of type int, string given
+deepclone_from_array(): malformed payload, const-expr-closure id must be of the form "<site>@<rank>", "nope" given
+deepclone_from_array(): malformed payload, const-expr-closure id must be of the form "<site>@<rank>", "@" given
+deepclone_from_array(): malformed payload, const-expr-closure id must be of the form "<site>@<rank>", "@01" given
+deepclone_from_array(): malformed payload, const-expr-closure id must be of the form "<site>@<rank>", "@1x" given
+deepclone_from_array(): malformed payload, const-expr-closure references unknown class "No\Such\ClassAtAll"
 deepclone_from_array(): malformed payload, const-expr-closure references unknown property "$nope"
 deepclone_from_array(): malformed payload, const-expr-closure references unknown method "nope()"
 deepclone_from_array(): malformed payload, const-expr-closure references unknown constant "NOPE"
-deepclone_from_array(): malformed payload, const-expr-closure references unknown parameter "tagged()#9"
-deepclone_from_array(): malformed payload, const-expr-closure references unknown parameter "tagged()#01"
-deepclone_from_array(): malformed payload, const-expr-closure references unknown attribute index 9
-deepclone_from_array(): malformed payload, const-expr-closure references unknown attribute index -1
-deepclone_from_array(): malformed payload, const-expr-closure references unknown closure index 9
-deepclone_from_array(): malformed payload, const-expr-closure references unknown closure index -1
-deepclone_from_array(): malformed payload, const-expr-closure attribute index is required for site ""
-deepclone_from_array(): malformed payload, const-expr-closure attribute index is required for site "tagged()"
-deepclone_from_array(): malformed payload, const-expr-closure references unknown hook "$tagged::get()"
 deepclone_from_array(): malformed payload, const-expr-closure references unknown hook "$tagged::bad()"
+deepclone_from_array(): malformed payload, const-expr-closure references unknown hook "$tagged::get()"
+deepclone_from_array(): malformed payload, const-expr-closure references unknown closure id "@9" in class "Fix"
+deepclone_from_array(): malformed payload, const-expr-closure references unknown closure id "tagged()@9" in class "Fix"

@@ -39,15 +39,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   relied on the previous unconditional by-name behavior must pass the flag.
   Closures declared in constant expressions are unaffected.
 
-- Const-expr closures use the site-based (5-element) declaration-site reference
-  `[class, site, attrIndex, ord, line]` on every PHP version. This reference is
-  already element-scoped (the site names the declaring element and the ordinal
-  its position within it) and version-independent, so payloads produced on PHP
-  8.5 and 8.6 and by the polyfill are interchangeable. The engine's own
-  element-scoped id (`getConstExprId()`, a `"<site>@<rank>"` string used by
-  native `serialize()`) is a separate encoding the extension does not emit; on
-  PHP 8.6, `dc_declaring_class()` still consults the engine only to recover the
-  declaring class of a first-class callable.
+- Const-expr closures are referenced as `[class, "<site>@<rank>", line]` on
+  every PHP version: the id names the declaring reflection element (the class,
+  a constant, a property, a property hook or a method, parameters folded into
+  their method) and the closure's rank among the element's closures, in
+  evaluation order (attribute arguments first, nested const-expr surfaces
+  depth-first, then parameter defaults, then the constant or property default
+  value). The id equals the engine's own `getConstExprId()` for the sites the
+  engine addresses, and payloads produced on PHP 8.5, on PHP 8.6 and by the
+  polyfill are identical. On PHP 8.6 encoding uses the engine's non-evaluating
+  walk for anonymous closures and decoding tries `Closure::fromConstExpr()`
+  first, falling back to the evaluating walk (which alone covers constant and
+  property-default values). The previous site-based 5-element reference is
+  gone, with no backward compatibility: it never shipped in a release.
 - On PHP 8.6, first-class callables declared in a constant expression of another
   class (`#[When(Validators::check(...))]`) or over a global function
   (`#[When(strlen(...))]`) get their declaring class from the engine and

@@ -59,7 +59,7 @@ $rc = new ReflectionClass(Fix::class);
 $c = $rc->getAttributes()[0]->getArguments()[0];
 $line = (new ReflectionFunction($c))->getStartLine();
 $d = deepclone_to_array($c);
-var_dump($d['prepared'] === [Fix::class, '', 0, 0, $line]);
+var_dump($d['prepared'] === [Fix::class, '@0', $line]);
 var_dump($d['mask'] === 1);
 $r = deepclone_from_array($d);
 var_dump($r instanceof Closure, $r !== $c, $r() === 'class-secret');
@@ -67,14 +67,14 @@ var_dump($r instanceof Closure, $r !== $c, $r() === 'class-secret');
 // ── Closure nested in an attribute argument array ──
 $c = $rc->getProperty('tagged')->getAttributes()[0]->getArguments()['cb'][1]['x'];
 $d = deepclone_to_array($c);
-var_dump($d['prepared'][1] === '$tagged');
+var_dump($d['prepared'][1] === '$tagged@0');
 var_dump(deepclone_from_array($d)(3) === 6);
 
 // ── Several closures in one attribute ──
 $args = (new ReflectionClassConstant(Fix::class, 'TAGGED'))->getAttributes()[0]->getArguments();
 foreach (['multi-0', 'multi-1'] as $i => $expected) {
     $d = deepclone_to_array($args[$i]);
-    var_dump($d['prepared'][1] === 'TAGGED', $d['prepared'][3] === $i, deepclone_from_array($d)() === $expected);
+    var_dump($d['prepared'][1] === 'TAGGED@'.$i, deepclone_from_array($d)() === $expected);
 }
 
 // ── Repeated attribute, parameter attribute, parameter default ──
@@ -95,10 +95,11 @@ var_dump(deepclone_from_array(deepclone_to_array(FixEnum::FILTER))() === 'enum-c
 // ── Trait method attribute ──
 var_dump(deepclone_from_array(deepclone_to_array((new ReflectionClass(FixTraitUser::class))->getMethod('traitTagged')->getAttributes()[0]->getArguments()[0]))() === 'trait-attr');
 
-// ── Promoted constructor property: parameter surface is canonical ──
+// ── Promoted constructor property: parameter surface is canonical; the
+//    engine names the property surface instead, both resolve everywhere ──
 $c = (new ReflectionProperty(FixPromoted::class, 'promoted'))->getAttributes()[0]->getArguments()[0];
 $d = deepclone_to_array($c);
-var_dump($d['prepared'][1] === '__construct()#0', deepclone_from_array($d)() === 'promoted');
+var_dump($d['prepared'][1] === (PHP_VERSION_ID >= 80600 ? '$promoted@0' : '__construct()@0'), deepclone_from_array($d)() === 'promoted');
 
 // ── Same-line closures are told apart by op_array identity ──
 $args = (new ReflectionClass(FixAmbiguous::class))->getAttributes()[0]->getArguments();
@@ -129,10 +130,10 @@ class FixHooked {
 }
 $c = (new ReflectionProperty(FixHooked::class, 'virtual'))->getHook(PropertyHookType::Get)->getAttributes()[0]->getArguments()[0];
 $d = deepclone_to_array($c);
-var_dump($d['prepared'][1] === '$virtual::get()', deepclone_from_array($d)() === 'get-hook-attr');
+var_dump($d['prepared'][1] === '$virtual::get()@0', deepclone_from_array($d)() === 'get-hook-attr');
 $c = (new ReflectionProperty(FixHooked::class, 'stored'))->getHook(PropertyHookType::Set)->getParameters()[0]->getAttributes()[0]->getArguments()[0];
 $d = deepclone_to_array($c);
-var_dump($d['prepared'][1] === '$stored::set()#0', deepclone_from_array($d)() === 'set-hook-param-attr');
+var_dump($d['prepared'][1] === '$stored::set()@0', deepclone_from_array($d)() === 'set-hook-param-attr');
 
 // ── Factory constant: outer round-trips, inner runtime closure refuses ──
 class FixFactory { public const FACTORY = static function (): Closure { return static function (): string { return 'inner'; }; }; }
@@ -175,7 +176,7 @@ var_dump(deepclone_from_array($d, ['Closure', 'Fix'])() === 'class-secret');
 
 // ── Stale payload ──
 $d = deepclone_to_array($rc->getAttributes()[0]->getArguments()[0]);
-$d['prepared'][4]++;
+$d['prepared'][2]++;
 try {
     deepclone_from_array($d);
 } catch (\ValueError $e) {
@@ -183,8 +184,6 @@ try {
 }
 ?>
 --EXPECT--
-bool(true)
-bool(true)
 bool(true)
 bool(true)
 bool(true)
