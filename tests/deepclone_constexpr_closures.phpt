@@ -57,7 +57,8 @@ $rc = new ReflectionClass(Fix::class);
 
 // ── Wire format: class attribute ──
 $c = $rc->getAttributes()[0]->getArguments()[0];
-$line = (new ReflectionFunction($c))->getStartLine();
+// The stored line is relative to the declaring class.
+$line = (new ReflectionFunction($c))->getStartLine() - $rc->getStartLine();
 $d = deepclone_to_array($c);
 var_dump($d['prepared'] === [Fix::class, '@0', $line]);
 var_dump($d['mask'] === 1);
@@ -180,7 +181,7 @@ $d['prepared'][2]++;
 try {
     deepclone_from_array($d);
 } catch (\ValueError $e) {
-    var_dump(str_contains($e->getMessage(), 'stale payload, const-expr-closure moved from line'));
+    var_dump(str_contains($e->getMessage(), 'stale payload, const-expr-closure moved from class-relative line'));
 }
 ?>
 --EXPECT--

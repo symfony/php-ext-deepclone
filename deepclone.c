@@ -1290,8 +1290,10 @@ static void dc_cexpr_walk_closure_surface(dc_cexpr_walk *w, const zend_op_array 
 	}
 }
 
-/* Builds [class, "<site>@<rank>", line]; takes ownership of site. */
-static void dc_cexpr_payload(zval *dst, zend_class_entry *ce, zend_string *site, uint32_t rank, uint32_t line)
+/* Builds [class, "<site>@<rank>", line]; takes ownership of site. The line is
+ * relative to the declaring class, so an edit above the class leaves it
+ * unchanged (see dc_cexpr_locate_ce). */
+static void dc_cexpr_payload(zval *dst, zend_class_entry *ce, zend_string *site, uint32_t rank, zend_long line)
 {
 	zval tmp;
 	array_init_size(dst, 3);
@@ -1339,9 +1341,11 @@ static bool dc_cexpr_elem_attrs(dc_cexpr_walk *w, HashTable *attributes, zend_cl
 static bool dc_cexpr_locate_ce(const zend_function *target, zend_class_entry *ce, zval *payload)
 {
 	const zend_function *needle = target;
-	/* Internal functions have no line; resolution computes 0 for them, so the
-	 * staleness check matches. */
-	uint32_t line = target->type == ZEND_USER_FUNCTION ? target->op_array.line_start : 0;
+	/* Staleness line, relative to the declaring class so edits above the class
+	 * do not invalidate the reference. Internal functions have no line;
+	 * resolution computes 0 for them, so the check matches. */
+	zend_long line = target->type == ZEND_USER_FUNCTION
+		? (zend_long) target->op_array.line_start - (zend_long) ce->info.user.line_start : 0;
 	zend_string *name;
 	dc_cexpr_walk w;
 
@@ -1560,8 +1564,7 @@ static zend_class_entry *dc_declaring_class(zval *src, const zend_function *func
 #if PHP_VERSION_ID >= 80600
 	zend_class_entry *ce;
 	zend_string *id;
-	uint32_t line;
-	if (zend_constexpr_closure_ref(Z_OBJ_P(src), &ce, &id, &line) == SUCCESS) {
+	if (zend_constexpr_closure_ref(Z_OBJ_P(src), &ce, &id, NULL, NULL) == SUCCESS) {
 		zend_string_release(id);
 		return ce;
 	}
@@ -1745,8 +1748,9 @@ static void dc_cexpr_resolve(zval *value, HashTable *allowed_set, zval *retval)
 				zend_clear_exception();
 			} else if (Z_TYPE(rv) == IS_OBJECT) {
 				const zend_function *ef = zend_get_closure_method_def(Z_OBJ(rv));
-				uint32_t eline = ef->type == ZEND_USER_FUNCTION ? ef->op_array.line_start : 0;
-				if (line == (zend_long) eline) {
+				zend_long eline = ef->type == ZEND_USER_FUNCTION
+					? (zend_long) ef->op_array.line_start - (zend_long) ce->info.user.line_start : 0;
+				if (line == eline) {
 					ZVAL_COPY_VALUE(retval, &rv);
 					return;
 				}
@@ -1873,10 +1877,11 @@ static void dc_cexpr_resolve(zval *value, HashTable *allowed_set, zval *retval)
 	}
 
 	const zend_function *f = zend_get_closure_method_def(Z_OBJ(w.found));
-	uint32_t found_line = f->type == ZEND_USER_FUNCTION ? f->op_array.line_start : 0;
-	if (line != (zend_long) found_line) {
+	zend_long found_line = f->type == ZEND_USER_FUNCTION
+		? (zend_long) f->op_array.line_start - (zend_long) ce->info.user.line_start : 0;
+	if (line != found_line) {
 		zval_ptr_dtor(&w.found);
-		zend_value_error("deepclone_from_array(): stale payload, const-expr-closure moved from line " ZEND_LONG_FMT " to line %u", line, found_line);
+		zend_value_error("deepclone_from_array(): stale payload, const-expr-closure moved from class-relative line " ZEND_LONG_FMT " to " ZEND_LONG_FMT, line, found_line);
 		return;
 	}
 
@@ -2007,15 +2012,17 @@ static void dc_copy_value(dc_ctx *ctx, zval *src, zval *dst, zval *mask_dst)
 				if (!(func->common.fn_flags & ZEND_ACC_FAKE_CLOSURE)) {
 					zend_class_entry *site_ce;
 					zend_string *cexpr_id;
-					uint32_t cexpr_line;
-					if (zend_constexpr_closure_ref(Z_OBJ_P(src), &site_ce, &cexpr_id, &cexpr_line) == SUCCESS) {
+					zend_long cexpr_line;
+					/* The engine returns the line already relative to the
+					 * declaring class, matching dc_cexpr_locate_ce's own walk. */
+					if (zend_constexpr_closure_ref(Z_OBJ_P(src), &site_ce, &cexpr_id, &cexpr_line, NULL) == SUCCESS) {
 						zval tmp;
 						array_init_size(dst, 3);
 						ZVAL_STR_COPY(&tmp, site_ce->name);
 						zend_hash_index_add_new(Z_ARRVAL_P(dst), 0, &tmp);
 						ZVAL_STR(&tmp, cexpr_id);
 						zend_hash_index_add_new(Z_ARRVAL_P(dst), 1, &tmp);
-						ZVAL_LONG(&tmp, (zend_long) cexpr_line);
+						ZVAL_LONG(&tmp, cexpr_line);
 						zend_hash_index_add_new(Z_ARRVAL_P(dst), 2, &tmp);
 						DC_MASK_CONSTEXPR_CLOSURE(mask_dst);
 						goto handle_value;
