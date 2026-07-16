@@ -1290,20 +1290,20 @@ static void dc_cexpr_walk_closure_surface(dc_cexpr_walk *w, const zend_op_array 
 	}
 }
 
-/* Builds [class, "<site>@<rank>", line]; takes ownership of site. The line is
- * relative to the declaring class, so an edit above the class leaves it
- * unchanged (see dc_cexpr_locate_ce). */
-static void dc_cexpr_payload(zval *dst, zend_class_entry *ce, zend_string *site, uint32_t rank, zend_long line)
+/* Builds [class, "<site>@<rank>"]; takes ownership of site. This value-walk
+ * reference carries no code hash (the ext cannot recompute the engine's hash
+ * of the closure's source, which is discarded at compile time), so it resolves
+ * positionally. On PHP 8.6 anonymous closures instead take the engine's
+ * hash-bearing id; see the encoder. */
+static void dc_cexpr_payload(zval *dst, zend_class_entry *ce, zend_string *site, uint32_t rank)
 {
 	zval tmp;
-	array_init_size(dst, 3);
+	array_init_size(dst, 2);
 	ZVAL_STR_COPY(&tmp, ce->name);
 	zend_hash_index_add_new(Z_ARRVAL_P(dst), 0, &tmp);
 	ZVAL_STR(&tmp, zend_strpprintf(0, "%s@%u", ZSTR_VAL(site), rank));
 	zend_hash_index_add_new(Z_ARRVAL_P(dst), 1, &tmp);
 	zend_string_release(site);
-	ZVAL_LONG(&tmp, (zend_long) line);
-	zend_hash_index_add_new(Z_ARRVAL_P(dst), 2, &tmp);
 }
 
 /* Walk every attribute of one reflection element (all offsets, declaration
@@ -1341,11 +1341,6 @@ static bool dc_cexpr_elem_attrs(dc_cexpr_walk *w, HashTable *attributes, zend_cl
 static bool dc_cexpr_locate_ce(const zend_function *target, zend_class_entry *ce, zval *payload)
 {
 	const zend_function *needle = target;
-	/* Staleness line, relative to the declaring class so edits above the class
-	 * do not invalidate the reference. Internal functions have no line;
-	 * resolution computes 0 for them, so the check matches. */
-	zend_long line = target->type == ZEND_USER_FUNCTION
-		? (zend_long) target->op_array.line_start - (zend_long) ce->info.user.line_start : 0;
 	zend_string *name;
 	dc_cexpr_walk w;
 
@@ -1357,7 +1352,7 @@ static bool dc_cexpr_locate_ce(const zend_function *target, zend_class_entry *ce
 		if (w.matched) { \
 			uint32_t _ord = w.matched_ord; \
 			dc_cexpr_walk_dtor(&w); \
-			dc_cexpr_payload(payload, ce, (site_expr), _ord, line); \
+			dc_cexpr_payload(payload, ce, (site_expr), _ord); \
 			return true; \
 		} \
 		dc_cexpr_walk_dtor(&w); \
@@ -1564,7 +1559,7 @@ static zend_class_entry *dc_declaring_class(zval *src, const zend_function *func
 #if PHP_VERSION_ID >= 80600
 	zend_class_entry *ce;
 	zend_string *id;
-	if (zend_constexpr_closure_ref(Z_OBJ_P(src), &ce, &id, NULL, NULL) == SUCCESS) {
+	if (zend_constexpr_closure_ref(Z_OBJ_P(src), &ce, &id) == SUCCESS) {
 		zend_string_release(id);
 		return ce;
 	}
@@ -1675,24 +1670,18 @@ static void dc_cexpr_resolve(zval *value, HashTable *allowed_set, zval *retval)
 	HashTable *ht = Z_ARRVAL_P(value);
 	zval *zclass = zend_hash_index_find(ht, 0);
 	zval *zid = zend_hash_index_find(ht, 1);
-	zval *zline = zend_hash_index_find(ht, 2);
-	if (!zclass || !zid || !zline || zend_hash_num_elements(ht) != 3) {
-		zend_value_error("deepclone_from_array(): malformed payload, const-expr-closure value must have 3 elements");
+	if (!zclass || !zid || zend_hash_num_elements(ht) != 2) {
+		zend_value_error("deepclone_from_array(): malformed payload, const-expr-closure value must have 2 elements");
 		return;
 	}
 	ZVAL_DEREF(zclass);
 	ZVAL_DEREF(zid);
-	ZVAL_DEREF(zline);
 	if (Z_TYPE_P(zclass) != IS_STRING) {
 		zend_value_error("deepclone_from_array(): malformed payload, const-expr-closure class name must be of type string, %s given", zend_zval_value_name(zclass));
 		return;
 	}
 	if (Z_TYPE_P(zid) != IS_STRING) {
 		zend_value_error("deepclone_from_array(): malformed payload, const-expr-closure id must be of type string, %s given", zend_zval_value_name(zid));
-		return;
-	}
-	if (Z_TYPE_P(zline) != IS_LONG) {
-		zend_value_error("deepclone_from_array(): malformed payload, const-expr-closure line must be of type int, %s given", zend_zval_value_name(zline));
 		return;
 	}
 
@@ -1705,9 +1694,17 @@ static void dc_cexpr_resolve(zval *value, HashTable *allowed_set, zval *retval)
 
 	const char *idstr = Z_STRVAL_P(zid);
 	size_t idlen = Z_STRLEN_P(zid);
-	const char *at = idlen ? zend_memrchr(idstr, '@', idlen) : NULL;
+	/* An engine-produced id may carry a "#<hash>" code fingerprint after the
+	 * rank. The ext cannot recompute it (the closure's source is discarded at
+	 * compile time), so on the value-walk below the hash is stripped and the
+	 * reference resolves positionally; on 8.6 the hash-bearing id is verified
+	 * by fromConstExpr first. */
+	const char *sharp = idlen ? zend_memrchr(idstr, '#', idlen) : NULL;
+	bool has_hash = sharp != NULL;
+	size_t coreid_len = has_hash ? (size_t) (sharp - idstr) : idlen;
+	const char *at = coreid_len ? zend_memrchr(idstr, '@', coreid_len) : NULL;
 	size_t site_len = at ? (size_t) (at - idstr) : 0;
-	size_t rank_len = at ? idlen - site_len - 1 : 0;
+	size_t rank_len = at ? coreid_len - site_len - 1 : 0;
 	uint64_t rank = 0;
 	bool rank_ok = at && rank_len > 0 && (rank_len == 1 || idstr[site_len + 1] != '0');
 	for (size_t i = 0; rank_ok && i < rank_len; i++) {
@@ -1719,7 +1716,6 @@ static void dc_cexpr_resolve(zval *value, HashTable *allowed_set, zval *retval)
 		return;
 	}
 	const char *site = idstr;
-	zend_long line = Z_LVAL_P(zline);
 	uint32_t want_ord = (uint32_t) rank;
 
 	zend_class_entry *ce = zend_lookup_class(Z_STR_P(zclass));
@@ -1729,10 +1725,12 @@ static void dc_cexpr_resolve(zval *value, HashTable *allowed_set, zval *retval)
 	}
 
 #if PHP_VERSION_ID >= 80600
-	/* The engine resolves its own ids fastest. Its walk reads the raw constant
-	 * expressions though, while this reference counts evaluated values, so fall
-	 * back to the evaluating walk below when the engine does not know the id or
-	 * resolves it to another line. */
+	/* The engine resolves its own ids, verifying the "#<hash>" fingerprint. Its
+	 * walk reads the raw constant expressions, while this reference counts
+	 * evaluated values, so a hash-less id the engine does not know (a closure
+	 * in a constant or property value) falls through to the evaluating walk. A
+	 * hash-bearing id is fully the engine's to judge: if it rejects one, the
+	 * reference is stale, so we surface that instead of healing positionally. */
 	{
 		zend_function *from_cexpr = zend_hash_str_find_ptr(&zend_ce_closure->function_table, ZEND_STRL("fromconstexpr"));
 		if (from_cexpr) {
@@ -1742,21 +1740,14 @@ static void dc_cexpr_resolve(zval *value, HashTable *allowed_set, zval *retval)
 			ZVAL_STR(&params[1], Z_STR_P(zid));
 			zend_call_known_function(from_cexpr, NULL, zend_ce_closure, &rv, 2, params, NULL);
 			if (EG(exception)) {
-				if (!instanceof_function(EG(exception)->ce, zend_ce_value_error)) {
+				if (has_hash || !instanceof_function(EG(exception)->ce, zend_ce_value_error)) {
 					return;
 				}
 				zend_clear_exception();
-			} else if (Z_TYPE(rv) == IS_OBJECT) {
-				const zend_function *ef = zend_get_closure_method_def(Z_OBJ(rv));
-				zend_long eline = ef->type == ZEND_USER_FUNCTION
-					? (zend_long) ef->op_array.line_start - (zend_long) ce->info.user.line_start : 0;
-				if (line == eline) {
-					ZVAL_COPY_VALUE(retval, &rv);
-					return;
-				}
-				zval_ptr_dtor(&rv);
 			} else {
-				zval_ptr_dtor(&rv);
+				ZEND_ASSERT(Z_TYPE(rv) == IS_OBJECT);
+				ZVAL_COPY_VALUE(retval, &rv);
+				return;
 			}
 		}
 	}
@@ -1876,15 +1867,9 @@ static void dc_cexpr_resolve(zval *value, HashTable *allowed_set, zval *retval)
 		return;
 	}
 
-	const zend_function *f = zend_get_closure_method_def(Z_OBJ(w.found));
-	zend_long found_line = f->type == ZEND_USER_FUNCTION
-		? (zend_long) f->op_array.line_start - (zend_long) ce->info.user.line_start : 0;
-	if (line != found_line) {
-		zval_ptr_dtor(&w.found);
-		zend_value_error("deepclone_from_array(): stale payload, const-expr-closure moved from class-relative line " ZEND_LONG_FMT " to " ZEND_LONG_FMT, line, found_line);
-		return;
-	}
-
+	/* This value-walk resolves positionally: a hash-less id carries no
+	 * staleness check (the ext cannot recompute the engine's code hash), so
+	 * the rank alone selects the closure. */
 	ZVAL_COPY_VALUE(retval, &w.found);
 }
 
@@ -2012,18 +1997,16 @@ static void dc_copy_value(dc_ctx *ctx, zval *src, zval *dst, zval *mask_dst)
 				if (!(func->common.fn_flags & ZEND_ACC_FAKE_CLOSURE)) {
 					zend_class_entry *site_ce;
 					zend_string *cexpr_id;
-					zend_long cexpr_line;
-					/* The engine returns the line already relative to the
-					 * declaring class, matching dc_cexpr_locate_ce's own walk. */
-					if (zend_constexpr_closure_ref(Z_OBJ_P(src), &site_ce, &cexpr_id, &cexpr_line, NULL) == SUCCESS) {
+					/* The engine id already carries a "#<hash>" of the closure's
+					 * code, so the reference is verified on decode without a
+					 * separate line field. */
+					if (zend_constexpr_closure_ref(Z_OBJ_P(src), &site_ce, &cexpr_id) == SUCCESS) {
 						zval tmp;
-						array_init_size(dst, 3);
+						array_init_size(dst, 2);
 						ZVAL_STR_COPY(&tmp, site_ce->name);
 						zend_hash_index_add_new(Z_ARRVAL_P(dst), 0, &tmp);
 						ZVAL_STR(&tmp, cexpr_id);
 						zend_hash_index_add_new(Z_ARRVAL_P(dst), 1, &tmp);
-						ZVAL_LONG(&tmp, cexpr_line);
-						zend_hash_index_add_new(Z_ARRVAL_P(dst), 2, &tmp);
 						DC_MASK_CONSTEXPR_CLOSURE(mask_dst);
 						goto handle_value;
 					}

@@ -55,12 +55,17 @@ class FixTraitUser { use FixTrait; }
 
 $rc = new ReflectionClass(Fix::class);
 
+// The reference is [class, "<site>@<rank>"]; on PHP 8.6 the engine suffixes the
+// rank of an anonymous closure with a "#<hash>" of its code, which the ext
+// propagates. This helper reads the rank id with any such hash stripped.
+$refId = static fn ($d) => preg_replace('/#[0-9a-f]{8}$/', '', $d['prepared'][1]);
+
 // ── Wire format: class attribute ──
 $c = $rc->getAttributes()[0]->getArguments()[0];
-// The stored line is relative to the declaring class.
-$line = (new ReflectionFunction($c))->getStartLine() - $rc->getStartLine();
 $d = deepclone_to_array($c);
-var_dump($d['prepared'] === [Fix::class, '@0', $line]);
+var_dump($d['prepared'][0] === Fix::class);
+var_dump($refId($d) === '@0');
+var_dump(count($d['prepared']) === 2);
 var_dump($d['mask'] === 1);
 $r = deepclone_from_array($d);
 var_dump($r instanceof Closure, $r !== $c, $r() === 'class-secret');
@@ -68,14 +73,14 @@ var_dump($r instanceof Closure, $r !== $c, $r() === 'class-secret');
 // ── Closure nested in an attribute argument array ──
 $c = $rc->getProperty('tagged')->getAttributes()[0]->getArguments()['cb'][1]['x'];
 $d = deepclone_to_array($c);
-var_dump($d['prepared'][1] === '$tagged@0');
+var_dump($refId($d) === '$tagged@0');
 var_dump(deepclone_from_array($d)(3) === 6);
 
 // ── Several closures in one attribute ──
 $args = (new ReflectionClassConstant(Fix::class, 'TAGGED'))->getAttributes()[0]->getArguments();
 foreach (['multi-0', 'multi-1'] as $i => $expected) {
     $d = deepclone_to_array($args[$i]);
-    var_dump($d['prepared'][1] === 'TAGGED@'.$i, deepclone_from_array($d)() === $expected);
+    var_dump($refId($d) === 'TAGGED@'.$i, deepclone_from_array($d)() === $expected);
 }
 
 // ── Repeated attribute, parameter attribute, parameter default ──
@@ -100,7 +105,7 @@ var_dump(deepclone_from_array(deepclone_to_array((new ReflectionClass(FixTraitUs
 //    engine names the property surface instead, both resolve everywhere ──
 $c = (new ReflectionProperty(FixPromoted::class, 'promoted'))->getAttributes()[0]->getArguments()[0];
 $d = deepclone_to_array($c);
-var_dump($d['prepared'][1] === (PHP_VERSION_ID >= 80600 ? '$promoted@0' : '__construct()@0'), deepclone_from_array($d)() === 'promoted');
+var_dump($refId($d) === (PHP_VERSION_ID >= 80600 ? '$promoted@0' : '__construct()@0'), deepclone_from_array($d)() === 'promoted');
 
 // ── Same-line closures are told apart by op_array identity ──
 $args = (new ReflectionClass(FixAmbiguous::class))->getAttributes()[0]->getArguments();
@@ -131,10 +136,10 @@ class FixHooked {
 }
 $c = (new ReflectionProperty(FixHooked::class, 'virtual'))->getHook(PropertyHookType::Get)->getAttributes()[0]->getArguments()[0];
 $d = deepclone_to_array($c);
-var_dump($d['prepared'][1] === '$virtual::get()@0', deepclone_from_array($d)() === 'get-hook-attr');
+var_dump($refId($d) === '$virtual::get()@0', deepclone_from_array($d)() === 'get-hook-attr');
 $c = (new ReflectionProperty(FixHooked::class, 'stored'))->getHook(PropertyHookType::Set)->getParameters()[0]->getAttributes()[0]->getArguments()[0];
 $d = deepclone_to_array($c);
-var_dump($d['prepared'][1] === '$stored::set()@0', deepclone_from_array($d)() === 'set-hook-param-attr');
+var_dump($refId($d) === '$stored::set()@0', deepclone_from_array($d)() === 'set-hook-param-attr');
 
 // ── Factory constant: outer round-trips, inner runtime closure refuses ──
 class FixFactory { public const FACTORY = static function (): Closure { return static function (): string { return 'inner'; }; }; }
@@ -176,15 +181,25 @@ try {
 var_dump(deepclone_from_array($d, ['Closure', 'Fix'])() === 'class-secret');
 
 // ── Stale payload ──
+// On PHP 8.6 the id carries a "#<hash>" of the closure's code; tampering it is
+// rejected. On 8.5 the ext cannot compute the hash, so references resolve
+// positionally with no staleness check.
 $d = deepclone_to_array($rc->getAttributes()[0]->getArguments()[0]);
-$d['prepared'][2]++;
-try {
-    deepclone_from_array($d);
-} catch (\ValueError $e) {
-    var_dump(str_contains($e->getMessage(), 'stale payload, const-expr-closure moved from class-relative line'));
+if (PHP_VERSION_ID >= 80600) {
+    $d['prepared'][1] = substr($d['prepared'][1], 0, -1) . dechex(hexdec(substr($d['prepared'][1], -1)) ^ 1);
+    try {
+        deepclone_from_array($d);
+        echo "resolved!?\n";
+    } catch (\ValueError $e) {
+        var_dump(str_contains($e->getMessage(), 'changed'));
+    }
+} else {
+    var_dump(deepclone_from_array($d)() === 'class-secret');
 }
 ?>
 --EXPECT--
+bool(true)
+bool(true)
 bool(true)
 bool(true)
 bool(true)

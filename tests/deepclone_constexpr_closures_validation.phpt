@@ -17,27 +17,24 @@ class Fix {
     public function tagged(int $x = 0): void {}
 }
 
-$line = (new ReflectionFunction((new ReflectionClass(Fix::class))->getAttributes()[0]->getArguments()[0]))->getStartLine();
-
 $cases = [
     'foo',
     [Fix::class],
-    [Fix::class, '@0', $line, 'x'],
-    [42, '@0', $line],
-    [Fix::class, 0, $line],
-    [Fix::class, '@0', 'x'],
-    [Fix::class, 'nope', $line],
-    [Fix::class, '@', $line],
-    [Fix::class, '@01', $line],
-    [Fix::class, '@1x', $line],
-    ['No\\Such\\ClassAtAll', '@0', $line],
-    [Fix::class, '$nope@0', $line],
-    [Fix::class, 'nope()@0', $line],
-    [Fix::class, 'NOPE@0', $line],
-    [Fix::class, '$tagged::bad()@0', $line],
-    [Fix::class, '$tagged::get()@0', $line],
-    [Fix::class, '@9', $line],
-    [Fix::class, 'tagged()@9', $line],
+    [Fix::class, '@0', 1],
+    [42, '@0'],
+    [Fix::class, 0],
+    [Fix::class, 'nope'],
+    [Fix::class, '@'],
+    [Fix::class, '@01'],
+    [Fix::class, '@1x'],
+    ['No\\Such\\ClassAtAll', '@0'],
+    [Fix::class, '$nope@0'],
+    [Fix::class, 'nope()@0'],
+    [Fix::class, 'NOPE@0'],
+    [Fix::class, '$tagged::bad()@0'],
+    [Fix::class, '$tagged::get()@0'],
+    [Fix::class, '@9'],
+    [Fix::class, 'tagged()@9'],
 ];
 
 foreach ($cases as $prepared) {
@@ -51,11 +48,10 @@ foreach ($cases as $prepared) {
 ?>
 --EXPECT--
 deepclone_from_array(): malformed payload, const-expr-closure value must be of type array, string given
-deepclone_from_array(): malformed payload, const-expr-closure value must have 3 elements
-deepclone_from_array(): malformed payload, const-expr-closure value must have 3 elements
+deepclone_from_array(): malformed payload, const-expr-closure value must have 2 elements
+deepclone_from_array(): malformed payload, const-expr-closure value must have 2 elements
 deepclone_from_array(): malformed payload, const-expr-closure class name must be of type string, int given
 deepclone_from_array(): malformed payload, const-expr-closure id must be of type string, int given
-deepclone_from_array(): malformed payload, const-expr-closure line must be of type int, string given
 deepclone_from_array(): malformed payload, const-expr-closure id must be of the form "<site>@<rank>", "nope" given
 deepclone_from_array(): malformed payload, const-expr-closure id must be of the form "<site>@<rank>", "@" given
 deepclone_from_array(): malformed payload, const-expr-closure id must be of the form "<site>@<rank>", "@01" given
