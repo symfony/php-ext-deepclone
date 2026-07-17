@@ -1328,13 +1328,13 @@ static bool dc_cexpr_elem_attrs(dc_cexpr_walk *w, HashTable *attributes, zend_cl
 }
 
 /* Try to express a closure as a reference to the constant expressions of one
- * reflection element of `ce`: [class, "<site>@<rank>", line]. Identity is
- * exact: the closure's op_array shares its opcodes with the op_array embedded
- * in the declaring AST. The rank counts the element's closures in evaluation
- * order: attribute arguments (declaration order, nested const-expr surfaces
+ * reflection element of `ce`: [class, "<site>@<rank>"]. Identity is exact: the
+ * closure's op_array shares its opcodes with the op_array embedded in the
+ * declaring AST. The rank counts the element's closures in evaluation order:
+ * attribute arguments (declaration order, nested const-expr surfaces
  * depth-first), then parameter defaults, then the constant or property default
  * value itself. That order matches the engine's element walk, so for purely
- * literal elements the reference equals ReflectionFunction::getConstExprId().
+ * literal elements the reference equals the engine's own hash-less id.
  * Promoted properties are skipped: their constructor parameter is the
  * canonical surface. Elements are scanned in the same order the polyfill
  * indexes them, so both implementations produce identical payloads. */
@@ -1447,8 +1447,8 @@ static bool dc_cexpr_locate(const zend_function *target, zval *payload)
  * A first-class callable declared in a constant expression of class A but
  * referencing a method of class B (e.g. #[When(Validators::check(...))]) has
  * no link back to A on its closure object: its scope is B. PHP 8.6 records the
- * declaring class as engine provenance (ReflectionFunction::getConstExprClass);
- * 8.5 does not. To recover it without that API, we instrument
+ * declaring class on the closure and exposes it through Closure::__serialize();
+ * 8.5 does not. To recover it there, we instrument
  * ReflectionAttribute::getArguments() and ::newInstance() (the paths frameworks
  * use to read attribute metadata) and record, for every cross-class FCC they
  * produce, a name-keyed map from the target to its declaring class. It is built
@@ -1548,22 +1548,11 @@ static zend_class_entry *dc_provenance_lookup(zend_class_entry *target_ce, zend_
 	return zend_lookup_class_ex(decl, NULL, ZEND_FETCH_CLASS_NO_AUTOLOAD);
 }
 
-/* The class whose constant expression declares this first-class callable. On
- * PHP 8.6 the engine records it (zend_constexpr_closure_ref), so it is exact
- * and needs no capture; on 8.5 it comes from the ReflectionAttribute-captured
- * index. Either way it feeds the same site-based (5-element) reference, which
- * is interchangeable with the polyfill — unlike the engine-id form, whose fcc
- * line userland cannot reproduce. */
-static zend_class_entry *dc_declaring_class(zval *src, const zend_function *func)
+/* The class whose constant expression declares this first-class callable, taken
+ * from the ReflectionAttribute-captured index. Used only on PHP 8.5; on 8.6 the
+ * engine addresses such closures directly through Closure::__serialize(). */
+static zend_class_entry *dc_declaring_class(const zend_function *func)
 {
-#if PHP_VERSION_ID >= 80600
-	zend_class_entry *ce;
-	zend_string *id;
-	if (zend_constexpr_closure_ref(Z_OBJ_P(src), &ce, &id) == SUCCESS) {
-		zend_string_release(id);
-		return ce;
-	}
-#endif
 	return func->common.function_name
 		? dc_provenance_lookup(func->common.scope, func->common.function_name)
 		: NULL;
@@ -1659,6 +1648,94 @@ static void ZEND_FASTCALL dc_attr_new_instance_wrapper(INTERNAL_FUNCTION_PARAMET
 }
 #endif /* PHP_VERSION_ID >= 80500 */
 
+#if PHP_VERSION_ID >= 80600
+/* Read a const-expr closure's declaration-site reference straight out of the
+ * engine's native Closure::__serialize(), which yields
+ *   [ [], ["const-expr", [class, id]] ]
+ * for any closure the engine addresses. Only called for closures the engine has
+ * flagged ZEND_ACC2_CONSTEXPR_CLOSURE, so __serialize() does not throw; a
+ * malformed shape is treated as "not a reference" (false, exception cleared). On
+ * success `out` receives a fresh [class, id] array. */
+static bool dc_closure_native_ref(zval *closure, zval *out)
+{
+	zend_function *fn = zend_hash_str_find_ptr(&zend_ce_closure->function_table, ZEND_STRL("__serialize"));
+	if (!fn) {
+		return false;
+	}
+	zval ser;
+	ZVAL_UNDEF(&ser);
+	zend_call_known_instance_method_with_0_params(fn, Z_OBJ_P(closure), &ser);
+	if (EG(exception)) {
+		zend_clear_exception();
+		zval_ptr_dtor(&ser);
+		return false;
+	}
+	bool ok = false;
+	zval *tagged = Z_TYPE(ser) == IS_ARRAY ? zend_hash_index_find(Z_ARRVAL(ser), 1) : NULL;
+	zval *ref = (tagged && Z_TYPE_P(tagged) == IS_ARRAY) ? zend_hash_index_find(Z_ARRVAL_P(tagged), 1) : NULL;
+	if (ref && Z_TYPE_P(ref) == IS_ARRAY && zend_hash_num_elements(Z_ARRVAL_P(ref)) == 2) {
+		zval *zclass = zend_hash_index_find(Z_ARRVAL_P(ref), 0);
+		zval *zid = zend_hash_index_find(Z_ARRVAL_P(ref), 1);
+		if (zclass && Z_TYPE_P(zclass) == IS_STRING && zid && Z_TYPE_P(zid) == IS_STRING) {
+			zval tmp;
+			array_init_size(out, 2);
+			ZVAL_STR_COPY(&tmp, Z_STR_P(zclass));
+			zend_hash_index_add_new(Z_ARRVAL_P(out), 0, &tmp);
+			ZVAL_STR_COPY(&tmp, Z_STR_P(zid));
+			zend_hash_index_add_new(Z_ARRVAL_P(out), 1, &tmp);
+			ok = true;
+		}
+	}
+	zval_ptr_dtor(&ser);
+	return ok;
+}
+
+/* deepclone_from_array() counterpart of dc_closure_native_ref(): resolve a
+ * [class, id] reference through the engine's own Closure unserialization, which
+ * re-evaluates the reference bounded to what the class declares and verifies any
+ * "#<hash>" fingerprint. The serialized form is synthesized directly (the class
+ * and id are length-prefixed, so no escaping is needed). allowed_set gates the
+ * Closure the payload instantiates. Returns true on success (retval set); on a
+ * throw returns false with the exception left pending for the caller to weigh
+ * (a stale hash to surface vs an unknown id to heal positionally). */
+static bool dc_closure_native_resolve(zend_string *zclass, zend_string *zid, HashTable *allowed_set, zval *retval)
+{
+	ZVAL_UNDEF(retval);
+	smart_str buf = {0};
+	smart_str_appendl(&buf, ZEND_STRL("O:7:\"Closure\":2:{i:0;a:0:{}i:1;a:2:{i:0;s:10:\"const-expr\";i:1;a:2:{i:0;s:"));
+	smart_str_append_long(&buf, (zend_long) ZSTR_LEN(zclass));
+	smart_str_appendl(&buf, ZEND_STRL(":\""));
+	smart_str_append(&buf, zclass);
+	smart_str_appendl(&buf, ZEND_STRL("\";i:1;s:"));
+	smart_str_append_long(&buf, (zend_long) ZSTR_LEN(zid));
+	smart_str_appendl(&buf, ZEND_STRL(":\""));
+	smart_str_append(&buf, zid);
+	smart_str_appendl(&buf, ZEND_STRL("\";}}}"));
+	smart_str_0(&buf);
+
+	php_unserialize_data_t var_hash;
+	PHP_VAR_UNSERIALIZE_INIT(var_hash);
+	if (allowed_set) {
+		php_var_unserialize_set_allowed_classes(var_hash, allowed_set);
+	}
+	const unsigned char *p = (const unsigned char *) ZSTR_VAL(buf.s);
+	const unsigned char *end = p + ZSTR_LEN(buf.s);
+	/* The engine defers the reference's resolution (and any "not found"/"changed"
+	 * throw) to the delayed-callback pass run by DESTROY, so the exception and the
+	 * final object type are only settled afterwards. */
+	bool ok = php_var_unserialize(retval, &p, end, &var_hash);
+	PHP_VAR_UNSERIALIZE_DESTROY(var_hash);
+	smart_str_free(&buf);
+	ok = ok && !EG(exception)
+		&& Z_TYPE_P(retval) == IS_OBJECT && Z_OBJCE_P(retval) == zend_ce_closure;
+	if (!ok) {
+		zval_ptr_dtor(retval);
+		ZVAL_UNDEF(retval);
+	}
+	return ok;
+}
+#endif /* PHP_VERSION_ID >= 80600 */
+
 /* deepclone_from_array() counterpart: resolve an element-scoped
  * "<site>@<rank>" declaration-site reference back to a live Closure. */
 static void dc_cexpr_resolve(zval *value, HashTable *allowed_set, zval *retval)
@@ -1686,9 +1763,14 @@ static void dc_cexpr_resolve(zval *value, HashTable *allowed_set, zval *retval)
 	}
 
 	/* Gate before zend_lookup_class(): the payload must not be able to
-	 * autoload, let alone evaluate, classes outside the allow-list. */
+	 * autoload, let alone evaluate, classes outside the allow-list. Closure is
+	 * gated too, matching deepclone_to_array(): resolving a reference mints one. */
 	if (!dc_class_allowed(allowed_set, Z_STR_P(zclass))) {
 		zend_value_error("deepclone_from_array(): class \"%s\" is not allowed", Z_STRVAL_P(zclass));
+		return;
+	}
+	if (!dc_class_allowed(allowed_set, zend_ce_closure->name)) {
+		zend_value_error("deepclone_from_array(): class \"Closure\" is not allowed");
 		return;
 	}
 
@@ -1697,10 +1779,34 @@ static void dc_cexpr_resolve(zval *value, HashTable *allowed_set, zval *retval)
 	/* An engine-produced id may carry a "#<hash>" code fingerprint after the
 	 * rank. The ext cannot recompute it (the closure's source is discarded at
 	 * compile time), so on the value-walk below the hash is stripped and the
-	 * reference resolves positionally; on 8.6 the hash-bearing id is verified
-	 * by fromConstExpr first. */
+	 * reference resolves positionally. */
 	const char *sharp = idlen ? zend_memrchr(idstr, '#', idlen) : NULL;
 	bool has_hash = sharp != NULL;
+
+#if PHP_VERSION_ID >= 80600
+	/* Resolve through the engine's own unserialization first: it reads the raw
+	 * constant expressions and verifies the "#<hash>" fingerprint, and it alone
+	 * understands the engine's first-class-callable ids (a "<site>@<name>" the
+	 * rank parse below would reject). A hash-bearing id is fully the engine's to
+	 * judge — a rejection means the reference is stale, surfaced rather than
+	 * healed positionally. A hash-less id it does not know (a closure counted
+	 * among a constant or property's evaluated values, or one written by an
+	 * older ext) falls through to the value-walk. */
+	{
+		zval rv;
+		if (dc_closure_native_resolve(Z_STR_P(zclass), Z_STR_P(zid), allowed_set, &rv)) {
+			ZVAL_COPY_VALUE(retval, &rv);
+			return;
+		}
+		if (EG(exception)) {
+			if (has_hash) {
+				return;
+			}
+			zend_clear_exception();
+		}
+	}
+#endif
+
 	size_t coreid_len = has_hash ? (size_t) (sharp - idstr) : idlen;
 	const char *at = coreid_len ? zend_memrchr(idstr, '@', coreid_len) : NULL;
 	size_t site_len = at ? (size_t) (at - idstr) : 0;
@@ -1723,35 +1829,6 @@ static void dc_cexpr_resolve(zval *value, HashTable *allowed_set, zval *retval)
 		zend_value_error("deepclone_from_array(): malformed payload, const-expr-closure references unknown class \"%s\"", Z_STRVAL_P(zclass));
 		return;
 	}
-
-#if PHP_VERSION_ID >= 80600
-	/* The engine resolves its own ids, verifying the "#<hash>" fingerprint. Its
-	 * walk reads the raw constant expressions, while this reference counts
-	 * evaluated values, so a hash-less id the engine does not know (a closure
-	 * in a constant or property value) falls through to the evaluating walk. A
-	 * hash-bearing id is fully the engine's to judge: if it rejects one, the
-	 * reference is stale, so we surface that instead of healing positionally. */
-	{
-		zend_function *from_cexpr = zend_hash_str_find_ptr(&zend_ce_closure->function_table, ZEND_STRL("fromconstexpr"));
-		if (from_cexpr) {
-			zval rv, params[2];
-			ZVAL_UNDEF(&rv);
-			ZVAL_STR(&params[0], Z_STR_P(zclass));
-			ZVAL_STR(&params[1], Z_STR_P(zid));
-			zend_call_known_function(from_cexpr, NULL, zend_ce_closure, &rv, 2, params, NULL);
-			if (EG(exception)) {
-				if (has_hash || !instanceof_function(EG(exception)->ce, zend_ce_value_error)) {
-					return;
-				}
-				zend_clear_exception();
-			} else {
-				ZEND_ASSERT(Z_TYPE(rv) == IS_OBJECT);
-				ZVAL_COPY_VALUE(retval, &rv);
-				return;
-			}
-		}
-	}
-#endif
 
 	/* Locate the named element: its attribute lists, for methods and hooks the
 	 * op_array carrying parameter defaults, and for constants and properties
@@ -1971,13 +2048,43 @@ static void dc_copy_value(dc_ctx *ctx, zval *src, zval *dst, zval *mask_dst)
 	if (Z_OBJCE_P(src) == zend_ce_closure) {
 		const zend_function *func = zend_get_closure_method_def(Z_OBJ_P(src));
 
+#if PHP_VERSION_ID >= 80600
+		/* The engine flags every const-expr closure with ZEND_ACC2_CONSTEXPR_CLOSURE
+		 * and serializes the ones it addresses (attribute arguments and parameter
+		 * defaults) through Closure::__serialize(), which yields a [class, id]
+		 * reference fingerprinted against the closure's code. Store that directly:
+		 * it round-trips through the engine's own unserialization (see
+		 * dc_cexpr_resolve), resolves only to what the class declares, and needs no
+		 * allow_named_closures opt-in. Closures the engine flags but does not
+		 * address (a constant or property default value) leave __serialize()
+		 * throwing; dc_closure_native_ref() swallows that and they fall through to
+		 * the value-walk below, which reaches those positions too. The allow-list
+		 * is checked first, before any constant expression is evaluated. */
+		if (func && (func->common.fn_flags2 & ZEND_ACC2_CONSTEXPR_CLOSURE)) {
+			if (!dc_class_allowed(ctx->allowed_ht, zend_ce_closure->name)) {
+				zend_value_error("deepclone_to_array(): class \"Closure\" is not allowed");
+				return;
+			}
+			if (dc_closure_native_ref(src, dst)) {
+				DC_MASK_CONSTEXPR_CLOSURE(mask_dst);
+				goto handle_value;
+			}
+			if (UNEXPECTED(EG(exception))) {
+				return;
+			}
+		}
+#endif
 #if PHP_VERSION_ID >= 80500
-		/* Const-expr declaration-site reference. This covers anonymous static
-		 * closures and first-class callables over a method of their own
+		/* Const-expr declaration-site reference, walked from the constant
+		 * expressions. On 8.6 this backs the __serialize() path above for the
+		 * positions the engine does not address (constant and property default
+		 * values); on 8.5, where there is no engine provenance, it is the only
+		 * path. This covers anonymous
+		 * static closures and first-class callables over a method of their own
 		 * declaring class (e.g. #[When(self::isStrict(...))]). It is attempted
 		 * before the by-name encoding so that such closures serialize as a
-		 * declaration-site reference — resolvable only to what the class
-		 * itself declares — and therefore round-trip without requiring the
+		 * declaration-site reference — resolvable only to what the class itself
+		 * declares — and therefore round-trip without requiring the
 		 * allow_named_closures opt-in. The allow-list is checked first so that
 		 * disallowing Closure is reported before any const-expr of the scope
 		 * class is evaluated. */
@@ -1988,30 +2095,6 @@ static void dc_copy_value(dc_ctx *ctx, zval *src, zval *dst, zval *mask_dst)
 					zend_value_error("deepclone_to_array(): class \"Closure\" is not allowed");
 					return;
 				}
-#if PHP_VERSION_ID >= 80600
-				/* The engine derives the same element-scoped "<site>@<rank>"
-				 * reference without evaluating any constant expression; use it
-				 * for anonymous closures. First-class callables keep the
-				 * evaluating walk below: their payload line is the target
-				 * function's, which the engine's site-based line is not. */
-				if (!(func->common.fn_flags & ZEND_ACC_FAKE_CLOSURE)) {
-					zend_class_entry *site_ce;
-					zend_string *cexpr_id;
-					/* The engine id already carries a "#<hash>" of the closure's
-					 * code, so the reference is verified on decode without a
-					 * separate line field. */
-					if (zend_constexpr_closure_ref(Z_OBJ_P(src), &site_ce, &cexpr_id) == SUCCESS) {
-						zval tmp;
-						array_init_size(dst, 2);
-						ZVAL_STR_COPY(&tmp, site_ce->name);
-						zend_hash_index_add_new(Z_ARRVAL_P(dst), 0, &tmp);
-						ZVAL_STR(&tmp, cexpr_id);
-						zend_hash_index_add_new(Z_ARRVAL_P(dst), 1, &tmp);
-						DC_MASK_CONSTEXPR_CLOSURE(mask_dst);
-						goto handle_value;
-					}
-				}
-#endif
 				zval payload;
 				ZVAL_UNDEF(&payload);
 				if (dc_cexpr_locate(func, &payload)) {
@@ -2024,11 +2107,10 @@ static void dc_copy_value(dc_ctx *ctx, zval *src, zval *dst, zval *mask_dst)
 				}
 				/* Cross-class first-class callable: the declaring class is not
 				 * the closure's scope, so the locate above (which walks the
-				 * scope) misses. On 8.5 there is no engine provenance; fall back
-				 * to a declaring class captured from ReflectionAttribute, if
-				 * any, and locate the site there. */
+				 * scope) misses. Fall back to a declaring class captured from
+				 * ReflectionAttribute, if any, and locate the site there. */
 				if (func->common.function_name) {
-					zend_class_entry *decl = dc_declaring_class(src, func);
+					zend_class_entry *decl = dc_declaring_class(func);
 					if (decl && decl != func->common.scope && dc_cexpr_locate_ce(func, decl, &payload)) {
 						ZVAL_COPY_VALUE(dst, &payload);
 						DC_MASK_CONSTEXPR_CLOSURE(mask_dst);
@@ -2042,15 +2124,14 @@ static void dc_copy_value(dc_ctx *ctx, zval *src, zval *dst, zval *mask_dst)
 		}
 
 		/* Global-function first-class callable (no scope, internal or user):
-		 * the declaring class comes from the engine (8.6) or captured
-		 * provenance (8.5). Same
+		 * the declaring class comes from captured provenance. Same
 		 * declaration-site reference and Closure gating as above; unresolved
 		 * ones fall through to the by-name path. */
 		if (func && (func->common.fn_flags & ZEND_ACC_FAKE_CLOSURE)
 				&& !func->common.scope && func->common.function_name) {
 			zval *this_ptr = zend_get_closure_this_ptr(src);
 			if (!this_ptr || Z_TYPE_P(this_ptr) != IS_OBJECT) {
-				zend_class_entry *decl = dc_declaring_class(src, func);
+				zend_class_entry *decl = dc_declaring_class(func);
 				if (decl) {
 					if (!dc_class_allowed(ctx->allowed_ht, zend_ce_closure->name)) {
 						zend_value_error("deepclone_to_array(): class \"Closure\" is not allowed");
@@ -5439,15 +5520,13 @@ PHP_MINIT_FUNCTION(deepclone)
 #if PHP_VERSION_ID >= 80500
 	/* Cross-class first-class-callable provenance: on PHP 8.5 the engine records
 	 * no declaring-class provenance for const-expr FCCs, so we recover it by
-	 * instrumenting ReflectionAttribute. When the engine exposes it natively
-	 * (ReflectionFunction::getConstExprClass, the serializable-closures patch),
-	 * the engine-id path resolves cross-class FCCs directly and this is left
-	 * off. There is no INI knob: it is simply how deepclone behaves on a build
-	 * without native provenance. */
-	zend_class_entry *rf_ce = zend_hash_str_find_ptr(CG(class_table),
-		"reflectionfunction", sizeof("reflectionfunction") - 1);
-	bool native_provenance = rf_ce && zend_hash_str_exists(&rf_ce->function_table,
-		"getconstexprclass", sizeof("getconstexprclass") - 1);
+	 * instrumenting ReflectionAttribute. When the engine serializes const-expr
+	 * closures natively (Closure::__serialize, the serializable-closures patch),
+	 * the __serialize path resolves them directly and this is left off. There is
+	 * no INI knob: it is simply how deepclone behaves on a build without native
+	 * support. */
+	bool native_provenance = zend_hash_str_exists(&zend_ce_closure->function_table,
+		"__serialize", sizeof("__serialize") - 1);
 	DC_G(capture_attribute_closures) = !native_provenance;
 
 	if (DC_G(capture_attribute_closures)) {

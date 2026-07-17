@@ -5,7 +5,7 @@ deepclone
 --SKIPIF--
 <?php
 if (PHP_VERSION_ID < 80500) die('skip requires PHP 8.5');
-if (method_exists('ReflectionFunction', 'getConstExprClass')) die('skip native const-expr provenance present; capture is disabled');
+if (method_exists('Closure', '__serialize')) die('skip native const-expr serialization present; capture is disabled');
 ?>
 --FILE--
 <?php

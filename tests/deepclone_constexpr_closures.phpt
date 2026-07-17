@@ -182,15 +182,15 @@ var_dump(deepclone_from_array($d, ['Closure', 'Fix'])() === 'class-secret');
 
 // ── Stale payload ──
 // On PHP 8.6 the id carries a "#<hash>" of the closure's code; tampering it is
-// rejected. On 8.5 the ext cannot compute the hash, so references resolve
-// positionally with no staleness check.
+// rejected by the engine's own unserialization. On 8.5 the ext cannot compute
+// the hash, so references resolve positionally with no staleness check.
 $d = deepclone_to_array($rc->getAttributes()[0]->getArguments()[0]);
 if (PHP_VERSION_ID >= 80600) {
     $d['prepared'][1] = substr($d['prepared'][1], 0, -1) . dechex(hexdec(substr($d['prepared'][1], -1)) ^ 1);
     try {
         deepclone_from_array($d);
         echo "resolved!?\n";
-    } catch (\ValueError $e) {
+    } catch (\Exception $e) {
         var_dump(str_contains($e->getMessage(), 'changed'));
     }
 } else {
