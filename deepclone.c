@@ -1290,20 +1290,23 @@ static void dc_cexpr_walk_closure_surface(dc_cexpr_walk *w, const zend_op_array 
 	}
 }
 
-/* Builds [class, "<site>@<rank>"]; takes ownership of site. This value-walk
- * reference carries no code hash (the ext cannot recompute the engine's hash
- * of the closure's source, which is discarded at compile time), so it resolves
+/* Builds [class, site, rank, hash]; takes ownership of site. This value-walk
+ * reference carries a zero hash (the ext cannot recompute the engine's hash of
+ * the closure's source, which is discarded at compile time), so it resolves
  * positionally. On PHP 8.6 anonymous closures instead take the engine's
- * hash-bearing id; see the encoder. */
+ * hash-bearing reference; see the encoder. */
 static void dc_cexpr_payload(zval *dst, zend_class_entry *ce, zend_string *site, uint32_t rank)
 {
 	zval tmp;
-	array_init_size(dst, 2);
+	array_init_size(dst, 4);
 	ZVAL_STR_COPY(&tmp, ce->name);
 	zend_hash_index_add_new(Z_ARRVAL_P(dst), 0, &tmp);
-	ZVAL_STR(&tmp, zend_strpprintf(0, "%s@%u", ZSTR_VAL(site), rank));
+	ZVAL_STR(&tmp, site);
 	zend_hash_index_add_new(Z_ARRVAL_P(dst), 1, &tmp);
-	zend_string_release(site);
+	ZVAL_LONG(&tmp, rank);
+	zend_hash_index_add_new(Z_ARRVAL_P(dst), 2, &tmp);
+	ZVAL_LONG(&tmp, 0);
+	zend_hash_index_add_new(Z_ARRVAL_P(dst), 3, &tmp);
 }
 
 /* Walk every attribute of one reflection element (all offsets, declaration
@@ -1328,7 +1331,7 @@ static bool dc_cexpr_elem_attrs(dc_cexpr_walk *w, HashTable *attributes, zend_cl
 }
 
 /* Try to express a closure as a reference to the constant expressions of one
- * reflection element of `ce`: [class, "<site>@<rank>"]. Identity is exact: the
+ * reflection element of `ce`: [class, site, rank, 0]. Identity is exact: the
  * closure's op_array shares its opcodes with the op_array embedded in the
  * declaring AST. The rank counts the element's closures in evaluation order:
  * attribute arguments (declaration order, nested const-expr surfaces
@@ -1651,11 +1654,11 @@ static void ZEND_FASTCALL dc_attr_new_instance_wrapper(INTERNAL_FUNCTION_PARAMET
 #if PHP_VERSION_ID >= 80600
 /* Read a const-expr closure's declaration-site reference straight out of the
  * engine's native Closure::__serialize(), which yields
- *   [ [], ["const-expr", [class, id]] ]
+ *   [ [], ["const-expr", [class, site, key, hash]] ]
  * for any closure the engine addresses. Only called for closures the engine has
  * flagged ZEND_ACC2_CONSTEXPR_CLOSURE, so __serialize() does not throw; a
  * malformed shape is treated as "not a reference" (false, exception cleared). On
- * success `out` receives a fresh [class, id] array. */
+ * success `out` receives the [class, site, key, hash] reference. */
 static bool dc_closure_native_ref(zval *closure, zval *out)
 {
 	zend_function *fn = zend_hash_str_find_ptr(&zend_ce_closure->function_table, ZEND_STRL("__serialize"));
@@ -1673,16 +1676,16 @@ static bool dc_closure_native_ref(zval *closure, zval *out)
 	bool ok = false;
 	zval *tagged = Z_TYPE(ser) == IS_ARRAY ? zend_hash_index_find(Z_ARRVAL(ser), 1) : NULL;
 	zval *ref = (tagged && Z_TYPE_P(tagged) == IS_ARRAY) ? zend_hash_index_find(Z_ARRVAL_P(tagged), 1) : NULL;
-	if (ref && Z_TYPE_P(ref) == IS_ARRAY && zend_hash_num_elements(Z_ARRVAL_P(ref)) == 2) {
+	if (ref && Z_TYPE_P(ref) == IS_ARRAY && zend_hash_num_elements(Z_ARRVAL_P(ref)) == 4) {
 		zval *zclass = zend_hash_index_find(Z_ARRVAL_P(ref), 0);
-		zval *zid = zend_hash_index_find(Z_ARRVAL_P(ref), 1);
-		if (zclass && Z_TYPE_P(zclass) == IS_STRING && zid && Z_TYPE_P(zid) == IS_STRING) {
-			zval tmp;
-			array_init_size(out, 2);
-			ZVAL_STR_COPY(&tmp, Z_STR_P(zclass));
-			zend_hash_index_add_new(Z_ARRVAL_P(out), 0, &tmp);
-			ZVAL_STR_COPY(&tmp, Z_STR_P(zid));
-			zend_hash_index_add_new(Z_ARRVAL_P(out), 1, &tmp);
+		zval *zsite = zend_hash_index_find(Z_ARRVAL_P(ref), 1);
+		zval *zkey = zend_hash_index_find(Z_ARRVAL_P(ref), 2);
+		zval *zhash = zend_hash_index_find(Z_ARRVAL_P(ref), 3);
+		if (zclass && Z_TYPE_P(zclass) == IS_STRING
+		 && zsite && Z_TYPE_P(zsite) == IS_STRING
+		 && zkey && (Z_TYPE_P(zkey) == IS_LONG || Z_TYPE_P(zkey) == IS_STRING)
+		 && zhash && Z_TYPE_P(zhash) == IS_LONG) {
+			ZVAL_COPY(out, ref);
 			ok = true;
 		}
 	}
@@ -1691,26 +1694,41 @@ static bool dc_closure_native_ref(zval *closure, zval *out)
 }
 
 /* deepclone_from_array() counterpart of dc_closure_native_ref(): resolve a
- * [class, id] reference through the engine's own Closure unserialization, which
- * re-evaluates the reference bounded to what the class declares and verifies any
- * "#<hash>" fingerprint. The serialized form is synthesized directly (the class
- * and id are length-prefixed, so no escaping is needed). allowed_set gates the
- * Closure the payload instantiates. Returns true on success (retval set); on a
- * throw returns false with the exception left pending for the caller to weigh
- * (a stale hash to surface vs an unknown id to heal positionally). */
-static bool dc_closure_native_resolve(zend_string *zclass, zend_string *zid, HashTable *allowed_set, zval *retval)
+ * [class, site, key, hash] reference through the engine's own Closure
+ * unserialization, which re-evaluates the reference bounded to what the class
+ * declares and verifies a non-zero hash. The serialized form is synthesized
+ * directly (strings are length-prefixed, so no escaping is needed); the key is a
+ * rank (int) or a callable name (string). allowed_set gates the Closure the
+ * payload instantiates. Returns true on success (retval set); on a throw returns
+ * false with the exception left pending for the caller to weigh (a stale hash to
+ * surface vs an unknown reference to heal positionally). */
+static bool dc_closure_native_resolve(zend_string *zclass, zend_string *zsite, zval *zkey, zend_long hash, HashTable *allowed_set, zval *retval)
 {
 	ZVAL_UNDEF(retval);
 	smart_str buf = {0};
-	smart_str_appendl(&buf, ZEND_STRL("O:7:\"Closure\":2:{i:0;a:0:{}i:1;a:2:{i:0;s:10:\"const-expr\";i:1;a:2:{i:0;s:"));
+	smart_str_appendl(&buf, ZEND_STRL("O:7:\"Closure\":2:{i:0;a:0:{}i:1;a:2:{i:0;s:10:\"const-expr\";i:1;a:4:{i:0;s:"));
 	smart_str_append_long(&buf, (zend_long) ZSTR_LEN(zclass));
 	smart_str_appendl(&buf, ZEND_STRL(":\""));
 	smart_str_append(&buf, zclass);
 	smart_str_appendl(&buf, ZEND_STRL("\";i:1;s:"));
-	smart_str_append_long(&buf, (zend_long) ZSTR_LEN(zid));
+	smart_str_append_long(&buf, (zend_long) ZSTR_LEN(zsite));
 	smart_str_appendl(&buf, ZEND_STRL(":\""));
-	smart_str_append(&buf, zid);
-	smart_str_appendl(&buf, ZEND_STRL("\";}}}"));
+	smart_str_append(&buf, zsite);
+	smart_str_appendl(&buf, ZEND_STRL("\";i:2;"));
+	if (Z_TYPE_P(zkey) == IS_LONG) {
+		smart_str_appendl(&buf, ZEND_STRL("i:"));
+		smart_str_append_long(&buf, Z_LVAL_P(zkey));
+		smart_str_appendc(&buf, ';');
+	} else {
+		smart_str_appendl(&buf, ZEND_STRL("s:"));
+		smart_str_append_long(&buf, (zend_long) Z_STRLEN_P(zkey));
+		smart_str_appendl(&buf, ZEND_STRL(":\""));
+		smart_str_append(&buf, Z_STR_P(zkey));
+		smart_str_appendl(&buf, ZEND_STRL("\";"));
+	}
+	smart_str_appendl(&buf, ZEND_STRL("i:3;i:"));
+	smart_str_append_long(&buf, hash);
+	smart_str_appendl(&buf, ZEND_STRL(";}}}"));
 	smart_str_0(&buf);
 
 	php_unserialize_data_t var_hash;
@@ -1736,8 +1754,8 @@ static bool dc_closure_native_resolve(zend_string *zclass, zend_string *zid, Has
 }
 #endif /* PHP_VERSION_ID >= 80600 */
 
-/* deepclone_from_array() counterpart: resolve an element-scoped
- * "<site>@<rank>" declaration-site reference back to a live Closure. */
+/* deepclone_from_array() counterpart: resolve a [class, site, key, hash]
+ * declaration-site reference back to a live Closure. */
 static void dc_cexpr_resolve(zval *value, HashTable *allowed_set, zval *retval)
 {
 	if (Z_TYPE_P(value) != IS_ARRAY) {
@@ -1746,19 +1764,21 @@ static void dc_cexpr_resolve(zval *value, HashTable *allowed_set, zval *retval)
 	}
 	HashTable *ht = Z_ARRVAL_P(value);
 	zval *zclass = zend_hash_index_find(ht, 0);
-	zval *zid = zend_hash_index_find(ht, 1);
-	if (!zclass || !zid || zend_hash_num_elements(ht) != 2) {
-		zend_value_error("deepclone_from_array(): malformed payload, const-expr-closure value must have 2 elements");
+	zval *zsite = zend_hash_index_find(ht, 1);
+	zval *zkey = zend_hash_index_find(ht, 2);
+	zval *zhash = zend_hash_index_find(ht, 3);
+	if (!zclass || !zsite || !zkey || !zhash || zend_hash_num_elements(ht) != 4) {
+		zend_value_error("deepclone_from_array(): malformed payload, const-expr-closure value must have 4 elements");
 		return;
 	}
 	ZVAL_DEREF(zclass);
-	ZVAL_DEREF(zid);
-	if (Z_TYPE_P(zclass) != IS_STRING) {
-		zend_value_error("deepclone_from_array(): malformed payload, const-expr-closure class name must be of type string, %s given", zend_zval_value_name(zclass));
-		return;
-	}
-	if (Z_TYPE_P(zid) != IS_STRING) {
-		zend_value_error("deepclone_from_array(): malformed payload, const-expr-closure id must be of type string, %s given", zend_zval_value_name(zid));
+	ZVAL_DEREF(zsite);
+	ZVAL_DEREF(zkey);
+	ZVAL_DEREF(zhash);
+	if (Z_TYPE_P(zclass) != IS_STRING || Z_TYPE_P(zsite) != IS_STRING
+			|| (Z_TYPE_P(zkey) != IS_LONG && Z_TYPE_P(zkey) != IS_STRING)
+			|| Z_TYPE_P(zhash) != IS_LONG) {
+		zend_value_error("deepclone_from_array(): malformed payload, const-expr-closure reference must be [string class, string site, int|string key, int hash]");
 		return;
 	}
 
@@ -1774,27 +1794,22 @@ static void dc_cexpr_resolve(zval *value, HashTable *allowed_set, zval *retval)
 		return;
 	}
 
-	const char *idstr = Z_STRVAL_P(zid);
-	size_t idlen = Z_STRLEN_P(zid);
-	/* An engine-produced id may carry a "#<hash>" code fingerprint after the
-	 * rank. The ext cannot recompute it (the closure's source is discarded at
-	 * compile time), so on the value-walk below the hash is stripped and the
-	 * reference resolves positionally. */
-	const char *sharp = idlen ? zend_memrchr(idstr, '#', idlen) : NULL;
-	bool has_hash = sharp != NULL;
+	/* The ext cannot recompute the engine's code hash (the closure's source is
+	 * discarded at compile time), so its own value-walk references carry hash 0
+	 * and resolve positionally. A non-zero hash comes from the engine. */
+	bool has_hash = Z_LVAL_P(zhash) != 0;
 
 #if PHP_VERSION_ID >= 80600
 	/* Resolve through the engine's own unserialization first: it reads the raw
-	 * constant expressions and verifies the "#<hash>" fingerprint, and it alone
-	 * understands the engine's first-class-callable ids (a "<site>@<name>" the
-	 * rank parse below would reject). A hash-bearing id is fully the engine's to
-	 * judge — a rejection means the reference is stale, surfaced rather than
-	 * healed positionally. A hash-less id it does not know (a closure counted
-	 * among a constant or property's evaluated values, or one written by an
-	 * older ext) falls through to the value-walk. */
+	 * constant expressions, verifies the hash, and alone understands a
+	 * first-class-callable name key (the value-walk below is by rank only). A
+	 * non-zero hash is the engine's to judge — a rejection means the reference is
+	 * stale, surfaced rather than healed positionally. A hash-less reference it
+	 * does not know (a closure counted among a constant or property's evaluated
+	 * values, or one written by an older ext) falls through to the value-walk. */
 	{
 		zval rv;
-		if (dc_closure_native_resolve(Z_STR_P(zclass), Z_STR_P(zid), allowed_set, &rv)) {
+		if (dc_closure_native_resolve(Z_STR_P(zclass), Z_STR_P(zsite), zkey, Z_LVAL_P(zhash), allowed_set, &rv)) {
 			ZVAL_COPY_VALUE(retval, &rv);
 			return;
 		}
@@ -1807,22 +1822,16 @@ static void dc_cexpr_resolve(zval *value, HashTable *allowed_set, zval *retval)
 	}
 #endif
 
-	size_t coreid_len = has_hash ? (size_t) (sharp - idstr) : idlen;
-	const char *at = coreid_len ? zend_memrchr(idstr, '@', coreid_len) : NULL;
-	size_t site_len = at ? (size_t) (at - idstr) : 0;
-	size_t rank_len = at ? coreid_len - site_len - 1 : 0;
-	uint64_t rank = 0;
-	bool rank_ok = at && rank_len > 0 && (rank_len == 1 || idstr[site_len + 1] != '0');
-	for (size_t i = 0; rank_ok && i < rank_len; i++) {
-		char ch = idstr[site_len + 1 + i];
-		rank_ok = ch >= '0' && ch <= '9' && (rank = rank * 10 + (ch - '0')) <= UINT32_MAX;
-	}
-	if (!rank_ok) {
-		zend_value_error("deepclone_from_array(): malformed payload, const-expr-closure id must be of the form \"<site>@<rank>\", \"%s\" given", idstr);
+	/* The value-walk resolves an anonymous closure by position; a first-class
+	 * callable name key (string) is not positionally resolvable here (on 8.6 the
+	 * engine resolves it above). */
+	if (Z_TYPE_P(zkey) != IS_LONG || Z_LVAL_P(zkey) < 0 || Z_LVAL_P(zkey) > UINT32_MAX) {
+		zend_value_error("deepclone_from_array(): malformed payload, const-expr-closure references unknown closure at site \"%s\" of class \"%s\"", Z_STRVAL_P(zsite), Z_STRVAL_P(zclass));
 		return;
 	}
-	const char *site = idstr;
-	uint32_t want_ord = (uint32_t) rank;
+	const char *site = Z_STRVAL_P(zsite);
+	size_t site_len = Z_STRLEN_P(zsite);
+	uint32_t want_ord = (uint32_t) Z_LVAL_P(zkey);
 
 	zend_class_entry *ce = zend_lookup_class(Z_STR_P(zclass));
 	if (!ce) {
@@ -1940,11 +1949,11 @@ static void dc_cexpr_resolve(zval *value, HashTable *allowed_set, zval *retval)
 
 	dc_cexpr_walk_dtor(&w);
 	if (Z_ISUNDEF(w.found)) {
-		zend_value_error("deepclone_from_array(): malformed payload, const-expr-closure references unknown closure id \"%s\" in class \"%s\"", idstr, ZSTR_VAL(ce->name));
+		zend_value_error("deepclone_from_array(): malformed payload, const-expr-closure references unknown closure \"%.*s@%u\" in class \"%s\"", (int) site_len, site, want_ord, ZSTR_VAL(ce->name));
 		return;
 	}
 
-	/* This value-walk resolves positionally: a hash-less id carries no
+	/* This value-walk resolves positionally: a hash-less reference carries no
 	 * staleness check (the ext cannot recompute the engine's code hash), so
 	 * the rank alone selects the closure. */
 	ZVAL_COPY_VALUE(retval, &w.found);

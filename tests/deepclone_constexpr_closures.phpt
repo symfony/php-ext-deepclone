@@ -55,17 +55,17 @@ class FixTraitUser { use FixTrait; }
 
 $rc = new ReflectionClass(Fix::class);
 
-// The reference is [class, "<site>@<rank>"]; on PHP 8.6 the engine suffixes the
-// rank of an anonymous closure with a "#<hash>" of its code, which the ext
-// propagates. This helper reads the rank id with any such hash stripped.
-$refId = static fn ($d) => preg_replace('/#[0-9a-f]{8}$/', '', $d['prepared'][1]);
+// The reference is [class, site, key, hash]: an anonymous closure's key is an
+// int rank and the hash guards its code; a first-class callable's key is the
+// callable name and the hash is 0. This helper renders "<site>@<key>".
+$refId = static fn ($d) => $d['prepared'][1] . '@' . $d['prepared'][2];
 
 // ── Wire format: class attribute ──
 $c = $rc->getAttributes()[0]->getArguments()[0];
 $d = deepclone_to_array($c);
 var_dump($d['prepared'][0] === Fix::class);
 var_dump($refId($d) === '@0');
-var_dump(count($d['prepared']) === 2);
+var_dump(count($d['prepared']) === 4);
 var_dump($d['mask'] === 1);
 $r = deepclone_from_array($d);
 var_dump($r instanceof Closure, $r !== $c, $r() === 'class-secret');
@@ -181,12 +181,13 @@ try {
 var_dump(deepclone_from_array($d, ['Closure', 'Fix'])() === 'class-secret');
 
 // ── Stale payload ──
-// On PHP 8.6 the id carries a "#<hash>" of the closure's code; tampering it is
-// rejected by the engine's own unserialization. On 8.5 the ext cannot compute
-// the hash, so references resolve positionally with no staleness check.
+// On PHP 8.6 the reference carries a code hash of the anonymous closure;
+// tampering it is rejected by the engine's own unserialization. On 8.5 the ext
+// cannot compute the hash (it passes 0), so references resolve positionally
+// with no staleness check.
 $d = deepclone_to_array($rc->getAttributes()[0]->getArguments()[0]);
 if (PHP_VERSION_ID >= 80600) {
-    $d['prepared'][1] = substr($d['prepared'][1], 0, -1) . dechex(hexdec(substr($d['prepared'][1], -1)) ^ 1);
+    $d['prepared'][3] ^= 1;
     try {
         deepclone_from_array($d);
         echo "resolved!?\n";

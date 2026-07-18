@@ -17,24 +17,28 @@ class Fix {
     public function tagged(int $x = 0): void {}
 }
 
+// The reference is [class, site, key, hash]. A hash of 0 means "unverified"; the
+// cases below all pass 0, so on PHP 8.6 the engine's own resolution throws and
+// the ext heals positionally through its value-walk, surfacing these messages on
+// every version.
 $cases = [
     'foo',
     [Fix::class],
-    [Fix::class, '@0', 1],
-    [42, '@0'],
-    [Fix::class, 0],
-    [Fix::class, 'nope'],
-    [Fix::class, '@'],
-    [Fix::class, '@01'],
-    [Fix::class, '@1x'],
-    ['No\\Such\\ClassAtAll', '@0'],
-    [Fix::class, '$nope@0'],
-    [Fix::class, 'nope()@0'],
-    [Fix::class, 'NOPE@0'],
-    [Fix::class, '$tagged::bad()@0'],
-    [Fix::class, '$tagged::get()@0'],
-    [Fix::class, '@9'],
-    [Fix::class, 'tagged()@9'],
+    [Fix::class, '', 0],
+    [Fix::class, '', 0, 0, 0],
+    [42, '', 0, 0],
+    [Fix::class, 0, 0, 0],
+    [Fix::class, '', [], 0],
+    [Fix::class, '', 0, '0'],
+    ['No\\Such\\ClassAtAll', '', 0, 0],
+    [Fix::class, '$nope', 0, 0],
+    [Fix::class, 'nope()', 0, 0],
+    [Fix::class, 'NOPE', 0, 0],
+    [Fix::class, '$tagged::bad()', 0, 0],
+    [Fix::class, '$tagged::get()', 0, 0],
+    [Fix::class, '', 'x', 0],
+    [Fix::class, '', 9, 0],
+    [Fix::class, 'tagged()', 9, 0],
 ];
 
 foreach ($cases as $prepared) {
@@ -48,19 +52,19 @@ foreach ($cases as $prepared) {
 ?>
 --EXPECT--
 deepclone_from_array(): malformed payload, const-expr-closure value must be of type array, string given
-deepclone_from_array(): malformed payload, const-expr-closure value must have 2 elements
-deepclone_from_array(): malformed payload, const-expr-closure value must have 2 elements
-deepclone_from_array(): malformed payload, const-expr-closure class name must be of type string, int given
-deepclone_from_array(): malformed payload, const-expr-closure id must be of type string, int given
-deepclone_from_array(): malformed payload, const-expr-closure id must be of the form "<site>@<rank>", "nope" given
-deepclone_from_array(): malformed payload, const-expr-closure id must be of the form "<site>@<rank>", "@" given
-deepclone_from_array(): malformed payload, const-expr-closure id must be of the form "<site>@<rank>", "@01" given
-deepclone_from_array(): malformed payload, const-expr-closure id must be of the form "<site>@<rank>", "@1x" given
+deepclone_from_array(): malformed payload, const-expr-closure value must have 4 elements
+deepclone_from_array(): malformed payload, const-expr-closure value must have 4 elements
+deepclone_from_array(): malformed payload, const-expr-closure value must have 4 elements
+deepclone_from_array(): malformed payload, const-expr-closure reference must be [string class, string site, int|string key, int hash]
+deepclone_from_array(): malformed payload, const-expr-closure reference must be [string class, string site, int|string key, int hash]
+deepclone_from_array(): malformed payload, const-expr-closure reference must be [string class, string site, int|string key, int hash]
+deepclone_from_array(): malformed payload, const-expr-closure reference must be [string class, string site, int|string key, int hash]
 deepclone_from_array(): malformed payload, const-expr-closure references unknown class "No\Such\ClassAtAll"
 deepclone_from_array(): malformed payload, const-expr-closure references unknown property "$nope"
 deepclone_from_array(): malformed payload, const-expr-closure references unknown method "nope()"
 deepclone_from_array(): malformed payload, const-expr-closure references unknown constant "NOPE"
 deepclone_from_array(): malformed payload, const-expr-closure references unknown hook "$tagged::bad()"
 deepclone_from_array(): malformed payload, const-expr-closure references unknown hook "$tagged::get()"
-deepclone_from_array(): malformed payload, const-expr-closure references unknown closure id "@9" in class "Fix"
-deepclone_from_array(): malformed payload, const-expr-closure references unknown closure id "tagged()@9" in class "Fix"
+deepclone_from_array(): malformed payload, const-expr-closure references unknown closure at site "" of class "Fix"
+deepclone_from_array(): malformed payload, const-expr-closure references unknown closure "@9" in class "Fix"
+deepclone_from_array(): malformed payload, const-expr-closure references unknown closure "tagged()@9" in class "Fix"

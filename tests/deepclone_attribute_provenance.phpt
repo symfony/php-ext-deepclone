@@ -46,7 +46,7 @@ $x = (new ReflectionProperty(Order::class, 'x'))->getAttributes()[0]->getArgumen
 $d = deepclone_to_array($x);
 var_dump($d['mask'] === 1);               // declaration-site reference, not by-name
 var_dump($d['prepared'][0] === 'Order');  // the DECLARING class, not Validators (the target's scope)
-var_dump($d['prepared'][1] === '$x@0');
+var_dump($d['prepared'][1] === '$x' && $d['prepared'][2] === 0);  // [class, site, key, hash]
 $r = deepclone_from_array($d);
 var_dump($r instanceof Closure, $r() === true);
 
