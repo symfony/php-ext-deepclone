@@ -106,6 +106,13 @@ $actual = (array) deepclone_hydrate('Bar', [
 ksort($actual);
 var_dump($actual === $expected);
 
+// Same round trip with every mangled key resolving to the object's own class
+// scope, with no parent-scoped key to hint that the keys need re-keying.
+$src = new Foo();
+(function () { $this->prot = 345; $this->priv = 123; })->call($src);
+$vars = (array) $src;
+var_dump((array) deepclone_hydrate('Foo', $vars) === $vars);
+
 // Exception trace (internal class hydration)
 $e = deepclone_hydrate('Exception', ['trace' => [234]]);
 var_dump($e->getTrace() === [234]);
@@ -313,6 +320,7 @@ var_dump($o instanceof stdClass);
 echo "Done\n";
 ?>
 --EXPECT--
+bool(true)
 bool(true)
 bool(true)
 bool(true)
