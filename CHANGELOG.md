@@ -5,6 +5,19 @@ All notable changes to this extension will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.3] - 2026-08-24
+
+### Fixed
+
+- Compatibility with php-src master, where the `$this` a closure is bound to
+  became a `zend_object*` instead of a `zval*`
+  ([fbb2e1f](https://github.com/php/php-src/commit/fbb2e1f23d624503e823b43137be17846f211079),
+  [7a5e452](https://github.com/php/php-src/commit/7a5e452f14ce2e4719d6e86586652a2fad8c3697)).
+  Built against those headers, `deepclone_to_array()` encoded every bound
+  closure as unbound, and the lazy ghosts of `deepclone_from_array()`
+  segfaulted in `zend_lazy_object_init()` on first touch. PHP 8.2 to 8.5 are
+  unaffected.
+
 ## [0.8.2] - 2026-06-30
 
 ### Changed
