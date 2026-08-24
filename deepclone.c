@@ -163,6 +163,52 @@ static zend_always_inline zend_class_entry *dc_register_internal_class_with_flag
 # define DC_PROP_HAS_HOOKS(pi) (0)
 #endif
 
+/* php-src turned the $this a closure is bound to from a zval* into a
+ * zend_object*: zend_create_closure() and friends take one since fbb2e1f23d6
+ * and zend_get_closure_this_ptr() returns one since 7a5e452f14c, both during
+ * 8.6-dev and without a ZEND_MODULE_API_NO bump to key off. C passes the
+ * mismatched pointer through with just a warning, so building against the
+ * other flavor only shows up at runtime, as garbage reads. Pick the flavor
+ * from the type the engine actually declares where the compiler has
+ * _Generic, and from the version elsewhere (MSVC below C11). */
+#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
+# define DC_CLOSURE_THIS_IS_OBJ \
+	_Generic(zend_get_closure_this_ptr((zval *) NULL), zend_object *: 1, default: 0)
+#else
+# define DC_CLOSURE_THIS_IS_OBJ (PHP_VERSION_ID >= 80600)
+#endif
+
+/* The object a closure is bound to, or NULL when it is unbound. */
+static zend_always_inline zend_object *dc_closure_this(zval *closure)
+{
+	void *this_ptr = (void *) zend_get_closure_this_ptr(closure);
+
+	if (!this_ptr) {
+		return NULL;
+	}
+	if (DC_CLOSURE_THIS_IS_OBJ) {
+		return (zend_object *) this_ptr;
+	}
+
+	return Z_TYPE_P((zval *) this_ptr) == IS_OBJECT ? Z_OBJ_P((zval *) this_ptr) : NULL;
+}
+
+/* zend_create_fake_closure() taking $this in whichever flavor the engine
+ * expects; the engine adds its own reference to the object either way. */
+static zend_always_inline void dc_create_fake_closure(zval *res, zend_function *func,
+	zend_class_entry *scope, zend_class_entry *called_scope, zend_object *this_obj)
+{
+	void *this_ptr = this_obj;
+	zval this_zv;
+
+	if (this_obj && !DC_CLOSURE_THIS_IS_OBJ) {
+		ZVAL_OBJ(&this_zv, this_obj);
+		this_ptr = &this_zv;
+	}
+
+	zend_create_fake_closure(res, func, scope, called_scope, this_ptr);
+}
+
 /* Public flags for deepclone_hydrate()'s $flags parameter. Exported as
  * PHP-level constants via deepclone.stub.php; values must match. */
 #define DEEPCLONE_HYDRATE_CALL_HOOKS    (1 << 0)
@@ -2056,8 +2102,7 @@ static void dc_copy_value(dc_ctx *ctx, zval *src, zval *dst, zval *mask_dst)
 		 * disallowing Closure is reported before any const-expr of the scope
 		 * class is evaluated. */
 		if (func && func->type == ZEND_USER_FUNCTION && func->common.scope) {
-			zval *this_ptr = zend_get_closure_this_ptr(src);
-			if (!this_ptr || Z_TYPE_P(this_ptr) != IS_OBJECT) {
+			if (!dc_closure_this(src)) {
 				if (!dc_class_allowed(ctx->allowed_ht, zend_ce_closure->name)) {
 					zend_value_error("deepclone_to_array(): class \"Closure\" is not allowed");
 					return;
@@ -2098,8 +2143,7 @@ static void dc_copy_value(dc_ctx *ctx, zval *src, zval *dst, zval *mask_dst)
 		if (func && (func->common.fn_flags & ZEND_ACC_FAKE_CLOSURE)
 				&& !func->common.scope && func->common.function_name
 				&& DC_G(capture_attribute_closures)) {
-			zval *this_ptr = zend_get_closure_this_ptr(src);
-			if (!this_ptr || Z_TYPE_P(this_ptr) != IS_OBJECT) {
+			if (!dc_closure_this(src)) {
 				zend_class_entry *decl = dc_provenance_lookup(NULL, func->common.function_name);
 				if (decl) {
 					if (!dc_class_allowed(ctx->allowed_ht, zend_ce_closure->name)) {
@@ -2142,8 +2186,7 @@ static void dc_copy_value(dc_ctx *ctx, zval *src, zval *dst, zval *mask_dst)
 			array_init_size(dst, 2);
 
 			/* Element [0]: $this object, class name, or null */
-			zval *this_ptr = zend_get_closure_this_ptr(src);
-			zend_object *this_obj = (this_ptr && Z_TYPE_P(this_ptr) == IS_OBJECT) ? Z_OBJ_P(this_ptr) : NULL;
+			zend_object *this_obj = dc_closure_this(src);
 
 			zval undef;
 			ZVAL_UNDEF(&undef);
@@ -3321,8 +3364,8 @@ static void dc_resolve(zval *value, zval *mask, zval *objects, uint32_t num_obje
 			if (ce) {
 				zend_function *func = zend_hash_find_ptr_lc(&ce->function_table, priv_method);
 				if (func) {
-					zval *this_ptr = (Z_TYPE(resolved_obj) == IS_OBJECT) ? &resolved_obj : NULL;
-					zend_create_fake_closure(retval, func, ce, ce, this_ptr);
+					dc_create_fake_closure(retval, func, ce, ce,
+						(Z_TYPE(resolved_obj) == IS_OBJECT) ? Z_OBJ(resolved_obj) : NULL);
 				}
 			}
 		} else {
@@ -3331,20 +3374,20 @@ static void dc_resolve(zval *value, zval *mask, zval *objects, uint32_t num_obje
 			if (Z_TYPE(resolved_obj) == IS_NULL) {
 				zend_function *func = zend_hash_find_ptr_lc(CG(function_table), name);
 				if (func) {
-					zend_create_fake_closure(retval, func, NULL, NULL, NULL);
+					dc_create_fake_closure(retval, func, NULL, NULL, NULL);
 				}
 			} else if (Z_TYPE(resolved_obj) == IS_OBJECT) {
 				zend_class_entry *ce = Z_OBJCE(resolved_obj);
 				zend_function *func = zend_hash_find_ptr_lc(&ce->function_table, name);
 				if (func) {
-					zend_create_fake_closure(retval, func, ce, ce, &resolved_obj);
+					dc_create_fake_closure(retval, func, ce, ce, Z_OBJ(resolved_obj));
 				}
 			} else if (Z_TYPE(resolved_obj) == IS_STRING) {
 				zend_class_entry *ce = zend_lookup_class(Z_STR(resolved_obj));
 				if (ce) {
 					zend_function *func = zend_hash_find_ptr_lc(&ce->function_table, name);
 					if (func) {
-						zend_create_fake_closure(retval, func, ce, ce, NULL);
+						dc_create_fake_closure(retval, func, ce, ce, NULL);
 					}
 				}
 			}
@@ -4523,8 +4566,8 @@ PHP_FUNCTION(deepclone_from_array)
 			 * (ReflectionClass::getLazyInitializer()) sees a plain Closure.
 			 * The engine-side fcc below targets the method directly; the
 			 * Closure is what zend_object_make_lazy() retains as the zv. */
-			zend_create_fake_closure(&lazy_init_zv, dc_lazy_hydrate_fn,
-				dc_lazy_ctx_ce, dc_lazy_ctx_ce, &lazy_ctx_zv);
+			dc_create_fake_closure(&lazy_init_zv, dc_lazy_hydrate_fn,
+				dc_lazy_ctx_ce, dc_lazy_ctx_ce, Z_OBJ(lazy_ctx_zv));
 		} else if (is_ghost) {
 			efree(is_ghost);
 			is_ghost = NULL;
