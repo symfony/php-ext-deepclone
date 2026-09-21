@@ -3427,6 +3427,13 @@ static void dc_resolve(zval *value, zval *mask, zval *objects, uint32_t num_obje
 			zend_value_error("deepclone_from_array(): malformed payload, enum class \"%s\" not found", s);
 			return;
 		}
+		zend_class_constant *case_const = zend_hash_find_ptr(&ce->constants_table, case_name);
+		if (!case_const || !(ZEND_CLASS_CONST_FLAGS(case_const) & ZEND_CLASS_CONST_IS_CASE)) {
+			zend_string_release(class_name);
+			zend_string_release(case_name);
+			zend_value_error("deepclone_from_array(): malformed payload, enum case \"%s\" not found", s);
+			return;
+		}
 		zend_object *case_obj = zend_enum_get_case(ce, case_name);
 		zend_string_release(class_name);
 		zend_string_release(case_name);
