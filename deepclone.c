@@ -3464,8 +3464,9 @@ static void dc_resolve(zval *value, zval *mask, zval *objects, uint32_t num_obje
 		if (Z_TYPE_P(mval) == IS_FALSE) {
 			/* Hard ref: create PHP & reference */
 			if (Z_TYPE_P(slot) != IS_LONG) {
+				const char *slot_type = zend_zval_value_name(slot);
 				zval_ptr_dtor(&result);
-				zend_value_error("deepclone_from_array(): malformed payload, hard-ref slot must be of type int, %s given", zend_zval_value_name(slot));
+				zend_value_error("deepclone_from_array(): malformed payload, hard-ref slot must be of type int, %s given", slot_type);
 				return;
 			}
 			if (UNEXPECTED(Z_LVAL_P(slot) <= ZEND_LONG_MIN || Z_LVAL_P(slot) >= 0)) {
