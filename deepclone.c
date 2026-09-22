@@ -4934,7 +4934,7 @@ PHP_FUNCTION(deepclone_from_array)
 							goto cleanup;
 						}
 					} else {
-						ZVAL_COPY(&final_val, prop_val);
+						ZVAL_COPY_DEREF(&final_val, prop_val);
 					}
 
 					/* Write property to object */
