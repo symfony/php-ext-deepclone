@@ -4980,6 +4980,11 @@ PHP_FUNCTION(deepclone_from_array)
 						 * through zend_update_property_ex() so any overridden
 						 * write_property handler (internal classes, extensions)
 						 * is respected. Matches the deepclone_hydrate() path. */
+						if (UNEXPECTED(Z_ISREF(final_val))) {
+							zval_ptr_dtor(&final_val);
+							EG(fake_scope) = old_scope;
+							DC_INVALID("deepclone_from_array(): hard references cannot target dynamic or virtual properties");
+						}
 						zend_update_property_ex(scope_ce, obj, prop_name, &final_val);
 						zval_ptr_dtor(&final_val);
 						if (EG(exception)) {
