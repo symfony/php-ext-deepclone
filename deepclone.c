@@ -3439,7 +3439,7 @@ static void dc_resolve(zval *value, zval *mask, zval *objects, uint32_t num_obje
 	}
 
 	if (Z_TYPE_P(mask) != IS_ARRAY) {
-		ZVAL_COPY(retval, value);
+		ZVAL_COPY_DEREF(retval, value);
 		return;
 	}
 
@@ -4241,7 +4241,7 @@ PHP_FUNCTION(deepclone_from_array)
 	/* Static value: return data['value'] */
 	zval *zvalue = zend_hash_find_known_hash(data_ht, dc_key_value);
 	if (zvalue) {
-		ZVAL_COPY(return_value, zvalue);
+		ZVAL_COPY_DEREF(return_value, zvalue);
 		return;
 	}
 
@@ -5111,7 +5111,7 @@ PHP_FUNCTION(deepclone_from_array)
 		dc_resolve(zprepared, zmask, objects, num_objects, refs, allowed_set, return_value);
 		if (EG(exception)) goto cleanup;
 	} else {
-		ZVAL_COPY(return_value, zprepared);
+		ZVAL_COPY_DEREF(return_value, zprepared);
 	}
 
 cleanup:
