@@ -3278,6 +3278,10 @@ static void dc_resolve(zval *value, zval *mask, zval *objects, uint32_t num_obje
 			zend_value_error("deepclone_from_array(): malformed payload, unknown ref id " ZEND_LONG_FMT, rid);
 			return;
 		}
+		if (UNEXPECTED(ref_slot == value)) {
+			zend_value_error("deepclone_from_array(): malformed payload, ref id " ZEND_LONG_FMT " cannot reference itself", rid);
+			return;
+		}
 		if (!Z_ISREF_P(ref_slot)) {
 			ZVAL_MAKE_REF(ref_slot);
 		}
