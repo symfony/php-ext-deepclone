@@ -5,43 +5,34 @@ All notable changes to this extension will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.8.4] - 2026-09-23
 
 ### Fixed
 
-- `deepclone_to_array()` initializes native lazy objects before exporting
-  them, like `clone` does: uninitialized ghosts and proxies were exported
-  without their state, and so were the untouched ghosts created by
-  `deepclone_from_array()` since 0.8.0. A proxy is exported as an instance
-  of its own class holding the state of its real instance, which gets
-  initialized too if it was reset as lazy.
-  `ReflectionClass::SKIP_INITIALIZATION_ON_SERIALIZE` does not apply.
-- A property bound by reference to a variable outside the exported graph
-  was exported as a dangling hard-reference marker, which
-  `deepclone_from_array()` rejected with "unknown ref id", while
-  `deepclone_to_array()` wrote the unwrapped value through a pointer to a
-  stack temporary, which could corrupt the refcount of a value exported
-  after it. It is now exported as a plain value.
-- References between declared properties were dropped once the object's
-  property table had been built (e.g. by `foreach`, `var_dump()` or
-  `get_object_vars()`), when it had dynamic properties, or when it was a
-  lazy proxy.
-- References on dynamic properties are preserved too:
-  `deepclone_from_array()` binds them like `unserialize()` does instead of
-  rejecting such payloads, without reporting again the deprecation their
-  creation raised on the origin; readonly classes still reject them.
-- `deepclone_hydrate()` with `DEEPCLONE_HYDRATE_PRESERVE_REFS` aborted
-  debug builds, and stored the reference unchecked on release ones, when
-  it targeted a dynamic property, a hooked property, or a property of an
-  uninitialized lazy object. Dynamic properties and lazy objects (once
-  initialized) now get the reference, hooked properties the value; so do
-  references that `deepclone_from_array()` resolves for a property of a
-  node it creates as a lazy ghost.
-- `deepclone_to_array()` left `null` placeholders in property, state and
-  ref masks after unwrapping references seen once, and emitted a
-  `refMasks` array holding an undefined entry (counted by `count()` but
-  not iterable) for shared references to scalars. Payloads are now
-  identical to the polyfill's.
+- `deepclone_to_array()` initializes lazy objects before exporting them, like
+  `clone` does and regardless of `SKIP_INITIALIZATION_ON_SERIALIZE`: they were
+  exported without their state, including the lazy ghosts
+  `deepclone_from_array()` creates since 0.8.0. A lazy proxy is exported as an
+  instance of its own class holding the state of its real instance.
+- References bound to properties are kept, declared or dynamic, and
+  `deepclone_from_array()` binds them back instead of rejecting them on
+  dynamic properties. They were lost once the property table of an object got
+  built, eg by `foreach`, and on lazy proxies.
+- A property bound to a variable outside the exported graph produced a
+  payload that `deepclone_from_array()` rejected, while `deepclone_to_array()`
+  wrote through a dangling pointer, which could corrupt the refcount of other
+  values.
+- `deepclone_hydrate()` with `DEEPCLONE_HYDRATE_PRESERVE_REFS` aborted debug
+  builds when a reference targeted a dynamic or hooked property or an
+  uninitialized lazy object, and so did lazy ghosts of `deepclone_from_array()`
+  on dynamic properties.
+- `deepclone_from_array()` rejects more malformed payloads with a
+  `ValueError`, where it could abort debug builds or read freed memory: enum
+  values that aren't cases, reference records pointing to themselves, and
+  malformed hard-reference slots nested in arrays. References that no marker
+  declares are copied by value instead of linking the result to the input.
+- Payload masks don't carry placeholders or empty entries anymore, making
+  payloads identical to the polyfill's.
 
 ## [0.8.3] - 2026-08-24
 
