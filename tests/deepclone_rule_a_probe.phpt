@@ -3,6 +3,12 @@ Rule A: final internal classes with create_object but no serialization API round
 --EXTENSIONS--
 deepclone
 tidy
+--SKIPIF--
+<?php
+if (PHP_VERSION_ID >= 80600) {
+    die('skip tidyNode is not serializable as of PHP 8.6');
+}
+?>
 --FILE--
 <?php
 
