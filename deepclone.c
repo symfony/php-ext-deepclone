@@ -2300,6 +2300,17 @@ static void dc_process_object(dc_ctx *ctx, zval *src, zval *dst, zval *mask_dst)
 		return;
 	}
 
+#if PHP_VERSION_ID >= 80400
+	/* A payload only records an object's materialized state; it has no place
+	 * to carry a native lazy-object initializer. Initialize an existing ghost
+	 * or proxy before taking that state, as native clone does. */
+	if (UNEXPECTED(zend_object_is_lazy(obj) && !zend_lazy_object_initialized(obj))) {
+		if (UNEXPECTED(!zend_lazy_object_init(obj))) {
+			return;
+		}
+	}
+#endif
+
 	/* Allocate pool entry */
 	dc_pool_entry *entry = emalloc(sizeof(dc_pool_entry));
 	entry->id = ctx->next_obj_id++;
