@@ -207,7 +207,7 @@ child's `properties_info`).
 | `0` (default)                          | `ReflectionProperty::setRawValue` — bypass set hooks, type-check, respect readonly |
 | `DEEPCLONE_HYDRATE_CALL_HOOKS`         | `ReflectionProperty::setValue` — invoke set hooks |
 | `DEEPCLONE_HYDRATE_NO_LAZY_INIT`       | `ReflectionProperty::setRawValueWithoutLazyInitialization` — skip the lazy initializer; realize the object when the last lazy property is set |
-| `DEEPCLONE_HYDRATE_PRESERVE_REFS`      | preserve PHP `&` references from `$vars` onto the target property slots; by default, references are dropped (dereferenced) on write |
+| `DEEPCLONE_HYDRATE_PRESERVE_REFS`      | preserve PHP `&` references from `$vars` onto the target property slots, where PHP allows them (not on hooked properties, nor with `DEEPCLONE_HYDRATE_NO_LAZY_INIT` on a lazy object, which get the value); by default, references are dropped (dereferenced) on write |
 
 `DEEPCLONE_HYDRATE_CALL_HOOKS` and `DEEPCLONE_HYDRATE_NO_LAZY_INIT` are
 mutually exclusive; `PRESERVE_REFS` composes with either.
@@ -269,7 +269,8 @@ $s->__unserialize([[$obj1, 'info1', $obj2, 'info2'], []]);
 ## What it preserves
 
 - Object identity (shared references stay shared)
-- PHP `&` hard references
+- PHP `&` hard references, between array elements and properties alike
+  (declared or dynamic, within an object or across objects)
 - Cycles in the object graph
 - Private/protected properties across inheritance
 - `__serialize` / `__unserialize` / `__sleep` / `__wakeup` semantics

@@ -858,16 +858,31 @@ static bool dc_write_backed_property(zend_object *obj, zend_property_info *pi,
 	zend_string *name, zval *value, zend_long flags)
 {
 	bool call_hooks = (flags & DEEPCLONE_HYDRATE_CALL_HOOKS) != 0;
+
+	/* A hooked property cannot hold a PHP &-reference: write its value. */
+	if (UNEXPECTED(Z_ISREF_P(value)) && DC_PROP_HAS_HOOKS(pi)) {
+		value = Z_REFVAL_P(value);
+	}
+
 #if PHP_VERSION_ID >= 80400
 	bool no_lazy_init = (flags & DEEPCLONE_HYDRATE_NO_LAZY_INIT) != 0;
 
 	/* Lazy objects: a direct slot write would bypass the engine's realization
 	 * hook and leave the object in a half-initialized state. Route through
 	 * zend_update_property_ex() which triggers realization on first write.
-	 * DEEPCLONE_HYDRATE_NO_LAZY_INIT has its own opt-out fast path below. */
+	 * That writer only takes dereferenced values, so for a reference,
+	 * initialize first and bind it to the slot below, in the real instance
+	 * of a proxy. DEEPCLONE_HYDRATE_NO_LAZY_INIT has its own opt-out fast
+	 * path below. */
 	if (!no_lazy_init && UNEXPECTED(!zend_lazy_object_initialized(obj))) {
-		zend_update_property_ex(pi->ce, obj, name, value);
-		return !EG(exception);
+		if (EXPECTED(!Z_ISREF_P(value))) {
+			zend_update_property_ex(pi->ce, obj, name, value);
+			return !EG(exception);
+		}
+		obj = zend_lazy_object_init(obj);
+		if (UNEXPECTED(!obj)) {
+			return false;
+		}
 	}
 #endif
 	zval *slot = OBJ_PROP(obj, pi->offset);
@@ -939,6 +954,8 @@ static bool dc_write_backed_property(zend_object *obj, zend_property_info *pi,
 #if PHP_VERSION_ID >= 80400
 	/* Skip the Reflection round-trip when there's no lazy-init to skip. */
 	if (no_lazy_init && !zend_lazy_object_initialized(obj)) {
+		/* Like setRawValueWithoutLazyInitialization(), which takes values */
+		ZVAL_DEREF(value);
 # if PHP_VERSION_ID >= 80600
 		zend_reflection_property_set_raw_value_without_lazy_initialization(
 			pi, name, NULL, pi->ce, obj, value);
@@ -1011,6 +1028,57 @@ static bool dc_write_backed_property(zend_object *obj, zend_property_info *pi,
 	}
 #endif
 	return !EG(exception);
+}
+
+/* Whether a PHP &-reference can be bound to the dynamic property `name` of
+ * obj: only through the standard property handlers, and never where the class
+ * declares the name (e.g. a virtual property). */
+static bool dc_can_bind_dynamic_property_ref(zend_object *obj, zend_string *name)
+{
+	return obj->handlers->write_property == zend_std_write_property
+		&& obj->handlers->get_properties == zend_std_get_properties
+		&& !zend_hash_exists(&obj->ce->properties_info, name);
+}
+
+/* Bind a PHP &-reference to a dynamic property. zend_std_write_property()
+ * only accepts dereferenced values, so write the properties table directly,
+ * as unserialize() does. The graph being restored already had the property,
+ * so its creation deprecation was reported when the origin was built; only
+ * classes that forbid dynamic properties reject it. Callers check
+ * dc_can_bind_dynamic_property_ref() first. */
+static bool dc_bind_dynamic_property_ref(zend_object *obj, zend_string *name, zval *ref)
+{
+#if PHP_VERSION_ID >= 80400
+	/* Like the engine's writes, go through a lazy object to its initialized
+	 * state, i.e. to the real instance of a proxy. */
+	if (UNEXPECTED(zend_lazy_object_must_init(obj))) {
+		obj = zend_lazy_object_init(obj);
+		if (UNEXPECTED(!obj)) {
+			return false;
+		}
+	}
+#endif
+
+	HashTable *properties = zend_std_get_properties(obj);
+
+	if (UNEXPECTED(obj->ce->ce_flags & ZEND_ACC_NO_DYNAMIC_PROPERTIES)
+	 && !zend_hash_exists(properties, name)) {
+		zend_throw_error(NULL, "Cannot create dynamic property %s::$%s",
+			ZSTR_VAL(obj->ce->name), ZSTR_VAL(name));
+		return false;
+	}
+
+	if (UNEXPECTED(GC_REFCOUNT(properties) > 1)) {
+		if (EXPECTED(!(GC_FLAGS(properties) & IS_ARRAY_IMMUTABLE))) {
+			GC_DELREF(properties);
+		}
+		obj->properties = properties = zend_array_dup(properties);
+	}
+
+	Z_ADDREF_P(ref);
+	zend_hash_update(properties, name, ref);
+
+	return true;
 }
 
 /* ── Core traversal ─────────────────────────────────────────── */
@@ -2604,6 +2672,13 @@ build_scoped_props:
 		HashTable *proto = dc_get_proto(ctx, ce);
 		zend_string *arr_key;
 		zval *arr_val;
+		/* Like the slot fast path above, keep shared references, declared or
+		 * dynamic, where deepclone_from_array() can bind them back: on
+		 * objects with the standard property handlers. */
+		const zend_object_handlers *handlers = Z_OBJ_HT_P(src);
+		bool keep_refs = !handlers->get_properties_for
+			&& handlers->get_properties == zend_std_get_properties
+			&& handlers->write_property == zend_std_write_property;
 
 		ZEND_HASH_FOREACH_STR_KEY_VAL(array_value, arr_key, arr_val) {
 			const char *key;
@@ -2613,16 +2688,12 @@ build_scoped_props:
 			bool prop_name_owned = false;
 			bool scope_name_owned = false;
 
-			/* Dereference IS_INDIRECT (declared properties) and IS_REFERENCE.
-			 * Like the slot fast path above, keep shared references on
-			 * declared properties of user classes; dynamic properties cannot
-			 * carry them. */
-			bool keep_ref = false;
+			/* Dereference IS_INDIRECT (declared properties), and IS_REFERENCE
+			 * unless kept above */
 			if (Z_TYPE_P(arr_val) == IS_INDIRECT) {
 				arr_val = Z_INDIRECT_P(arr_val);
-				keep_ref = ce->type == ZEND_USER_CLASS;
 			}
-			if (Z_ISREF_P(arr_val) && (!keep_ref || Z_REFCOUNT_P(arr_val) == 1)) {
+			if (Z_ISREF_P(arr_val) && (!keep_refs || Z_REFCOUNT_P(arr_val) == 1)) {
 				arr_val = Z_REFVAL_P(arr_val);
 			}
 
@@ -4075,7 +4146,15 @@ static void dc_lazy_hydrate(dc_lazy_ctx *ctx, zend_object *obj, uint32_t id)
 			}
 		} else {
 			/* Dynamic property: same engine route as the eager path. */
-			zend_update_property_ex(slot->scope_ce, obj, slot->name, &final_val);
+			if (UNEXPECTED(Z_ISREF(final_val))) {
+				if (UNEXPECTED(!dc_can_bind_dynamic_property_ref(obj, slot->name))) {
+					zend_value_error("deepclone_from_array(): hard references cannot target virtual properties or dynamic properties behind custom handlers");
+				} else {
+					dc_bind_dynamic_property_ref(obj, slot->name, &final_val);
+				}
+			} else {
+				zend_update_property_ex(slot->scope_ce, obj, slot->name, &final_val);
+			}
 			zval_ptr_dtor(&final_val);
 			if (UNEXPECTED(EG(exception))) {
 				goto restore;
@@ -5075,13 +5154,19 @@ PHP_FUNCTION(deepclone_from_array)
 						/* Dynamic property on a non-stdClass object. Routed
 						 * through zend_update_property_ex() so any overridden
 						 * write_property handler (internal classes, extensions)
-						 * is respected. Matches the deepclone_hydrate() path. */
+						 * is respected. Matches the deepclone_hydrate() path.
+						 * That writer only takes dereferenced values, so hard
+						 * references are bound to the properties table. */
 						if (UNEXPECTED(Z_ISREF(final_val))) {
-							zval_ptr_dtor(&final_val);
-							EG(fake_scope) = old_scope;
-							DC_INVALID("deepclone_from_array(): hard references cannot target dynamic or virtual properties");
+							if (UNEXPECTED(!dc_can_bind_dynamic_property_ref(obj, prop_name))) {
+								zval_ptr_dtor(&final_val);
+								EG(fake_scope) = old_scope;
+								DC_INVALID("deepclone_from_array(): hard references cannot target virtual properties or dynamic properties behind custom handlers");
+							}
+							dc_bind_dynamic_property_ref(obj, prop_name, &final_val);
+						} else {
+							zend_update_property_ex(scope_ce, obj, prop_name, &final_val);
 						}
-						zend_update_property_ex(scope_ce, obj, prop_name, &final_val);
 						zval_ptr_dtor(&final_val);
 						if (EG(exception)) {
 							EG(fake_scope) = old_scope;
@@ -5549,8 +5634,15 @@ PHP_FUNCTION(deepclone_hydrate)
 				/* Dynamic property or unknown name. Goes through
 				 * zend_update_property_ex() so any overridden write_property
 				 * handler (internal classes, extensions overriding default
-				 * handlers) is respected. */
-				zend_update_property_ex(scope_ce, obj, real_name, v);
+				 * handlers) is respected. That writer only takes dereferenced
+				 * values: with DEEPCLONE_HYDRATE_PRESERVE_REFS, references are
+				 * bound to the properties table where the object allows it,
+				 * and written by value otherwise. */
+				if (Z_ISREF_P(v) && dc_can_bind_dynamic_property_ref(obj, real_name)) {
+					dc_bind_dynamic_property_ref(obj, real_name, v);
+				} else {
+					zend_update_property_ex(scope_ce, obj, real_name, Z_ISREF_P(v) ? Z_REFVAL_P(v) : v);
+				}
 				if (UNEXPECTED(EG(exception))) {
 					if (real_name_owned) zend_string_release(real_name);
 					if (prop_key_owned) zend_string_release(prop_key);

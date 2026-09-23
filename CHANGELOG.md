@@ -26,6 +26,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   property table had been built (e.g. by `foreach`, `var_dump()` or
   `get_object_vars()`), when it had dynamic properties, or when it was a
   lazy proxy.
+- References on dynamic properties are preserved too:
+  `deepclone_from_array()` binds them like `unserialize()` does instead of
+  rejecting such payloads, without reporting again the deprecation their
+  creation raised on the origin; readonly classes still reject them.
+- `deepclone_hydrate()` with `DEEPCLONE_HYDRATE_PRESERVE_REFS` aborted
+  debug builds, and stored the reference unchecked on release ones, when
+  it targeted a dynamic property, a hooked property, or a property of an
+  uninitialized lazy object. Dynamic properties and lazy objects (once
+  initialized) now get the reference, hooked properties the value; so do
+  references that `deepclone_from_array()` resolves for a property of a
+  node it creates as a lazy ghost.
 
 ## [0.8.3] - 2026-08-24
 
