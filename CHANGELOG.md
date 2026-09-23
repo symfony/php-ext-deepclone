@@ -16,6 +16,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   of its own class holding the state of its real instance, which gets
   initialized too if it was reset as lazy.
   `ReflectionClass::SKIP_INITIALIZATION_ON_SERIALIZE` does not apply.
+- A property bound by reference to a variable outside the exported graph
+  was exported as a dangling hard-reference marker, which
+  `deepclone_from_array()` rejected with "unknown ref id", while
+  `deepclone_to_array()` wrote the unwrapped value through a pointer to a
+  stack temporary, which could corrupt the refcount of a value exported
+  after it. It is now exported as a plain value.
+- References between declared properties were dropped once the object's
+  property table had been built (e.g. by `foreach`, `var_dump()` or
+  `get_object_vars()`), when it had dynamic properties, or when it was a
+  lazy proxy.
 
 ## [0.8.3] - 2026-08-24
 
