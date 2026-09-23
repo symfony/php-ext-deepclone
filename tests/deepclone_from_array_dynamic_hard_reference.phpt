@@ -1,5 +1,5 @@
 --TEST--
-deepclone_from_array() rejects hard references targeting dynamic properties
+deepclone_from_array() binds hard references to dynamic properties like unserialize()
 --EXTENSIONS--
 deepclone
 --FILE--
@@ -8,18 +8,37 @@ deepclone
 #[AllowDynamicProperties]
 class DynamicHardReferenceTarget {}
 
-try {
-    deepclone_from_array([
-        'classes' => DynamicHardReferenceTarget::class,
+class NoDynamicAttributeTarget {}
+
+readonly class NoDynamicPropertiesTarget {}
+
+function payload(string $class): array
+{
+    return [
+        'classes' => $class,
         'objectMeta' => 1,
         'prepared' => 0,
-        'properties' => ['stdClass' => ['dynamic' => [0 => -1]]],
-        'resolve' => ['stdClass' => ['dynamic' => [0 => false]]],
+        'properties' => ['stdClass' => ['a' => [0 => -1], 'b' => [0 => -1]]],
+        'resolve' => ['stdClass' => ['a' => [0 => false], 'b' => [0 => false]]],
         'refs' => [1 => 3],
-    ]);
-} catch (ValueError $e) {
+    ];
+}
+
+$o = deepclone_from_array(payload(DynamicHardReferenceTarget::class));
+$o->a = 42;
+var_dump($o->b);
+
+$o = deepclone_from_array(payload(NoDynamicAttributeTarget::class));
+$o->a = 42;
+var_dump($o->b);
+
+try {
+    deepclone_from_array(payload(NoDynamicPropertiesTarget::class));
+} catch (Error $e) {
     echo $e->getMessage(), "\n";
 }
 ?>
 --EXPECT--
-deepclone_from_array(): hard references cannot target dynamic or virtual properties
+int(42)
+int(42)
+Cannot create dynamic property NoDynamicPropertiesTarget::$a
