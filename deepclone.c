@@ -300,6 +300,12 @@ typedef struct {
 	zval           cur_mask;      /* original mask for unwrap restoration */
 	zval          *tree_pos;      /* pointer to the dst slot in the prepared tree */
 	zval          *mask_slot;     /* pointer to the mask zval for this ref (in parent array) */
+	/* When first seen as a direct property value, the ref's slots live in
+	 * ctx->properties/resolve, which keep growing: locate them by key. */
+	zend_string   *prop_scope;
+	zend_string   *prop_name;
+	uint32_t       prop_obj_id;
+	bool           prop_may_be_numeric;
 } dc_ref_entry;
 
 /* ── Object pool entry ──────────────────────────────────────── */
@@ -412,6 +418,10 @@ static void dc_ctx_destroy(dc_ctx *ctx) {
 			zval_ptr_dtor(&ctx->refs[i].orig_type);
 			zval_ptr_dtor(&ctx->refs[i].cur_value);
 			zval_ptr_dtor(&ctx->refs[i].cur_mask);
+			if (ctx->refs[i].prop_name) {
+				zend_string_release(ctx->refs[i].prop_scope);
+				zend_string_release(ctx->refs[i].prop_name);
+			}
 		}
 		efree(ctx->refs);
 	}
@@ -464,6 +474,8 @@ static uint32_t dc_ref_add(dc_ctx *ctx, zend_reference *ref, zval *orig, zval *c
 	ZVAL_UNDEF(&ctx->refs[idx].cur_mask);
 	ctx->refs[idx].tree_pos = NULL;
 	ctx->refs[idx].mask_slot = NULL;
+	ctx->refs[idx].prop_scope = NULL;
+	ctx->refs[idx].prop_name = NULL;
 	/* Map ref pointer → index. See the comment at the top of the file
 	 * about not pre-hashing keys handed to zend_hash_index_*. */
 	zval zidx;
@@ -2601,11 +2613,16 @@ build_scoped_props:
 			bool prop_name_owned = false;
 			bool scope_name_owned = false;
 
-			/* Dereference IS_INDIRECT (declared properties) and IS_REFERENCE */
+			/* Dereference IS_INDIRECT (declared properties) and IS_REFERENCE.
+			 * Like the slot fast path above, keep shared references on
+			 * declared properties of user classes; dynamic properties cannot
+			 * carry them. */
+			bool keep_ref = false;
 			if (Z_TYPE_P(arr_val) == IS_INDIRECT) {
 				arr_val = Z_INDIRECT_P(arr_val);
+				keep_ref = ce->type == ZEND_USER_CLASS;
 			}
-			if (Z_ISREF_P(arr_val)) {
+			if (Z_ISREF_P(arr_val) && (!keep_ref || Z_REFCOUNT_P(arr_val) == 1)) {
 				arr_val = Z_REFVAL_P(arr_val);
 			}
 
@@ -2804,6 +2821,22 @@ prepare_props:
 					return;
 				}
 				dc_mask_cleanup(&mask_slot_zv);
+
+				/* A reference first seen here recorded the temps above as the
+				 * slots to unwrap it into if it turns out unshared; they don't
+				 * outlive this iteration, so locate its slots by key instead. */
+				if (UNEXPECTED(Z_ISREF_P(raw_val))) {
+					zval *zidx = zend_hash_index_find(&ctx->ref_map, (zend_ulong)(uintptr_t)Z_REF_P(raw_val));
+					dc_ref_entry *re = &ctx->refs[Z_LVAL_P(zidx)];
+					if (re->tree_pos == &temp_dst) {
+						re->tree_pos = NULL;
+						re->mask_slot = NULL;
+						re->prop_scope = zend_string_copy(scope);
+						re->prop_name = zend_string_copy(name);
+						re->prop_obj_id = entry_id;
+						re->prop_may_be_numeric = may_have_numeric_names;
+					}
+				}
 
 				out_scope = zend_hash_find_known_hash(Z_ARRVAL(ctx->properties), scope);
 				out_name = dc_name_subarray_find(Z_ARRVAL_P(out_scope), name, may_have_numeric_names);
@@ -3097,6 +3130,41 @@ static void dc_build_output(dc_ctx *ctx, zval *prepared, zval *top_mask, zval *r
 	 * fields nulled — dc_ctx_destroy will free the rest. */
 }
 
+/* Unwrap an unshared ref that was a direct property value: put its value
+ * back in ctx->properties[scope][name][id], and its mask, if any, in
+ * ctx->resolve[scope][name][id] in place of the hard-ref marker. */
+static void dc_unwrap_prop_ref(dc_ctx *ctx, dc_ref_entry *re)
+{
+	zval *scope_zv = zend_hash_find(Z_ARRVAL(ctx->properties), re->prop_scope);
+	zval *name_zv = dc_name_subarray_find(Z_ARRVAL_P(scope_zv), re->prop_name, re->prop_may_be_numeric);
+	zval *slot = zend_hash_index_find(Z_ARRVAL_P(name_zv), re->prop_obj_id);
+	zval_ptr_dtor(slot);
+	ZVAL_COPY(slot, &re->cur_value);
+
+	scope_zv = zend_hash_find(Z_ARRVAL(ctx->resolve), re->prop_scope);
+	name_zv = dc_name_subarray_find(Z_ARRVAL_P(scope_zv), re->prop_name, re->prop_may_be_numeric);
+	if (Z_TYPE(re->cur_mask) != IS_UNDEF) {
+		slot = zend_hash_index_find(Z_ARRVAL_P(name_zv), re->prop_obj_id);
+		zval_ptr_dtor(slot);
+		ZVAL_COPY(slot, &re->cur_mask);
+		return;
+	}
+
+	zend_hash_index_del(Z_ARRVAL_P(name_zv), re->prop_obj_id);
+	if (zend_hash_num_elements(Z_ARRVAL_P(name_zv))) {
+		return;
+	}
+	zend_ulong idx;
+	if (re->prop_may_be_numeric && ZEND_HANDLE_NUMERIC(re->prop_name, idx)) {
+		zend_hash_index_del(Z_ARRVAL_P(scope_zv), idx);
+	} else {
+		zend_hash_del(Z_ARRVAL_P(scope_zv), re->prop_name);
+	}
+	if (!zend_hash_num_elements(Z_ARRVAL_P(scope_zv))) {
+		zend_hash_del(Z_ARRVAL(ctx->resolve), re->prop_scope);
+	}
+}
+
 /* ── deepclone_to_array() — produce the pure-array format ──── */
 
 PHP_FUNCTION(deepclone_to_array)
@@ -3168,7 +3236,9 @@ PHP_FUNCTION(deepclone_to_array)
 	/* Post-process: unwrap unshared refs (count=0) */
 	for (uint32_t i = 0; i < ctx.refs_count; i++) {
 		dc_ref_entry *re = &ctx.refs[i];
-		if (re->count == 0 && re->tree_pos) {
+		if (re->count == 0 && re->prop_name) {
+			dc_unwrap_prop_ref(&ctx, re);
+		} else if (re->count == 0 && re->tree_pos) {
 			zval_ptr_dtor(re->tree_pos);
 			ZVAL_COPY(re->tree_pos, &re->cur_value);
 			/* Restore the mask slot from the saved cur_mask (or reset to NULL,
