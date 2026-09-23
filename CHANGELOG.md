@@ -5,6 +5,18 @@ All notable changes to this extension will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- `deepclone_to_array()` initializes native lazy objects before exporting
+  them, like `clone` does: uninitialized ghosts and proxies were exported
+  without their state, and so were the untouched ghosts created by
+  `deepclone_from_array()` since 0.8.0. A proxy is exported as an instance
+  of its own class holding the state of its real instance, which gets
+  initialized too if it was reset as lazy.
+  `ReflectionClass::SKIP_INITIALIZATION_ON_SERIALIZE` does not apply.
+
 ## [0.8.3] - 2026-08-24
 
 ### Fixed

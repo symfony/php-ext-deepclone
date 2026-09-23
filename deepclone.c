@@ -2303,8 +2303,11 @@ static void dc_process_object(dc_ctx *ctx, zval *src, zval *dst, zval *mask_dst)
 #if PHP_VERSION_ID >= 80400
 	/* A payload only records an object's materialized state; it has no place
 	 * to carry a native lazy-object initializer. Initialize an existing ghost
-	 * or proxy before taking that state, as native clone does. */
-	if (UNEXPECTED(zend_object_is_lazy(obj) && !zend_lazy_object_initialized(obj))) {
+	 * or proxy before taking that state, as native clone does. This includes
+	 * the real instance of an initialized proxy, which may have been reset as
+	 * lazy since. A proxy stays lazy once initialized, so its state is then
+	 * read by the (array) cast below, which forwards to that instance. */
+	if (UNEXPECTED(zend_lazy_object_must_init(obj))) {
 		if (UNEXPECTED(!zend_lazy_object_init(obj))) {
 			return;
 		}

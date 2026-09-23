@@ -140,8 +140,9 @@ closure markers keep their eager, ordered replay.
 Semantics of deferred nodes (the usual native lazy-object rules):
 
 - Whole-graph operations (`serialize()`, `json_encode()`, `foreach`, `==`,
-  `clone`, `var_export()`) initialize every node they visit; `var_dump()`,
-  `===`, `spl_object_id()` and `instanceof` do not initialize.
+  `clone`, `var_export()`, `deepclone_to_array()`) initialize every node
+  they visit; `var_dump()`, `===`, `spl_object_id()` and `instanceof` do
+  not initialize.
 - Structural payload errors (unknown ids, bad scopes, unknown declared
   properties) and `$allowed_classes` violations still throw inside
   `deepclone_from_array()`. Value-level resolution errors (a class or enum
@@ -279,6 +280,11 @@ $s->__unserialize([[$obj1, 'info1', $obj2, 'info2'], []]);
 - Closures over named callables (first-class callables like `strlen(...)`),
   by name, when `$allow_named_closures` is enabled on both ends
 - Enum values
+- The state of native lazy objects (PHP 8.4+): `deepclone_to_array()`
+  initializes lazy ghosts and proxies first, like `clone` does and
+  regardless of `ReflectionClass::SKIP_INITIALIZATION_ON_SERIALIZE`; a proxy
+  comes back as a regular instance of its own class holding the state of its
+  real instance, as with `unserialize(serialize())`
 - Copy-on-write for strings and scalar arrays
 
 ## Error handling
