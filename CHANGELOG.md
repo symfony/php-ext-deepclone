@@ -37,6 +37,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   initialized) now get the reference, hooked properties the value; so do
   references that `deepclone_from_array()` resolves for a property of a
   node it creates as a lazy ghost.
+- `deepclone_to_array()` left `null` placeholders in property, state and
+  ref masks after unwrapping references seen once, and emitted a
+  `refMasks` array holding an undefined entry (counted by `count()` but
+  not iterable) for shared references to scalars. Payloads are now
+  identical to the polyfill's.
 
 ## [0.8.3] - 2026-08-24
 

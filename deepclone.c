@@ -3099,10 +3099,11 @@ static void dc_build_output(dc_ctx *ctx, zval *prepared, zval *top_mask, zval *r
 			ZVAL_INTERNED_STR(&marker, zend_string_init_interned("e", 1, 0));
 			zend_hash_index_add_new(Z_ARRVAL(ref_masks_out), ref_id, &marker);
 		} else {
-			/* Scalar or array ref — use saved cur_value and cur_mask */
+			/* Scalar or array ref: use saved cur_value and cur_mask, which
+			 * is UNDEF or NULL when the value needs no mask */
 			Z_TRY_ADDREF_P(cur);
 			zend_hash_index_add_new(Z_ARRVAL(refs_out), ref_id, cur);
-			if (Z_TYPE(re->cur_mask) != IS_NULL) {
+			if (Z_TYPE(re->cur_mask) > IS_NULL) {
 				zval mask_copy;
 				ZVAL_COPY(&mask_copy, &re->cur_mask);
 				zend_hash_index_add_new(Z_ARRVAL(ref_masks_out), ref_id, &mask_copy);
@@ -3326,8 +3327,24 @@ PHP_FUNCTION(deepclone_to_array)
 	}
 
 	/* Strip the NULL placeholders that dc_copy_array seeded and any slots that
-	 * the unshared-ref unwrap pass cleared. */
+	 * the unshared-ref unwrap pass cleared, wherever masks live: the top-level
+	 * one, property masks, __unserialize() state masks and shared ref masks. */
 	dc_mask_cleanup(&top_mask);
+	dc_mask_cleanup(&ctx.resolve);
+	for (uint32_t id = 0; id < ctx.next_obj_id; id++) {
+		dc_pool_entry *e = ctx.entries[id];
+		if (e && e->prop_mask) {
+			zval mask;
+			ZVAL_ARR(&mask, e->prop_mask);
+			dc_mask_cleanup(&mask);
+			e->prop_mask = Z_TYPE(mask) == IS_ARRAY ? Z_ARRVAL(mask) : NULL;
+		}
+	}
+	for (uint32_t i = 0; i < ctx.refs_count; i++) {
+		if (ctx.refs[i].count > 0) {
+			dc_mask_cleanup(&ctx.refs[i].cur_mask);
+		}
+	}
 
 	/* Recompute is_static after unwrapping unshared refs:
 	 * if no objects, no shared refs, no remaining mask, the value is static. */
