@@ -1,0 +1,8 @@
+# This is a sanitizer-coverage ignore list, not a sanitizer ignore list.
+# Native unserialization remains ASAN/UBSAN-instrumented; its PCs and compare
+# operands simply do not become libFuzzer corpus features.
+src:*ext/standard/var_unserializer.c
+fun:php_var_unserialize*
+fun:process_nested_array_data
+fun:finish_nested_data
+fun:object_common
