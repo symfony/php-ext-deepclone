@@ -101,8 +101,8 @@ Closure: DeepClone\NotInstantiableException: Type "Closure" is not instantiable.
 Generator: DeepClone\NotInstantiableException: Type "Generator" is not instantiable.
 class@anonymous%0%s: DeepClone\NotInstantiableException: Type "class@anonymous" is not instantiable.
 == deepclone_hydrate()
-FileInfoWakeup: DeepClone\NotInstantiableException: Class "FileInfoWakeup" is not instantiable.
-FileInfoBoth: DeepClone\NotInstantiableException: Class "FileInfoBoth" is not instantiable.
-class@anonymous%0%s: DeepClone\NotInstantiableException: Class "class@anonymous" is not instantiable.
+FileInfoWakeup: DeepClone\NotInstantiableException: Type "FileInfoWakeup" is not instantiable.
+FileInfoBoth: DeepClone\NotInstantiableException: Type "FileInfoBoth" is not instantiable.
+class@anonymous%0%s: DeepClone\NotInstantiableException: Type "class@anonymous" is not instantiable.
 class@anonymous%0%s: accepted
 Exception@anonymous%0%s: accepted

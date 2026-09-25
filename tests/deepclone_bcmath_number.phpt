@@ -63,5 +63,5 @@ string(1) "5"
 string(6) "99.999"
 int(3)
 string(7) "100.499"
-Class "BcMath\Number" is not instantiable.
+Type "BcMath\Number" is not instantiable.
 rejected with ValueError
