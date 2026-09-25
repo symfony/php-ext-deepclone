@@ -69,6 +69,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `deepclone_hydrate()` rejects the anonymous classes that declare neither
   `__wakeup()` nor `__unserialize()`, and the user subclasses of internal
   classes that refuse serialization, as the README already stated.
+- `SplMinHeap`, `SplMaxHeap`, `SplPriorityQueue` and `MultipleIterator` are
+  handled like `unserialize()` does, instead of being rejected as not
+  instantiable by `deepclone_to_array()` and `deepclone_hydrate()`: they are
+  created without their internal state, the heaps empty with their default
+  flags before PHP 8.5, and `MultipleIterator` without its iterators. Their
+  user subclasses already were.
 
 ## [0.8.5] - 2026-09-23
 
