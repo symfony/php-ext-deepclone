@@ -5,6 +5,17 @@ All notable changes to this extension will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- `SplMinHeap`, `SplMaxHeap`, `SplPriorityQueue` and `MultipleIterator` are
+  handled like `unserialize()` does, instead of being rejected as not
+  instantiable by `deepclone_to_array()` and `deepclone_hydrate()`: they are
+  created without their internal state, the heaps empty with their default
+  flags before PHP 8.5, and `MultipleIterator` without its iterators. Their
+  user subclasses already were.
+
 ## [0.8.5] - 2026-09-23
 
 ### Added
