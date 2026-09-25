@@ -58,6 +58,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `unserialize()`.
 - An uninitialized typed property no longer changes the order of the scopes
   in the payload once the property table of an object got built.
+- Classes that refuse serialization are rejected whatever methods they
+  declare, as `serialize()` does: subclasses of `SplFileInfo` and of the other
+  internal classes that refuse it got through when they declared `__wakeup()`
+  or `__unserialize()`. Anonymous classes, throwables included, still
+  round-trip when they declare one of these.
+- `deepclone_from_array()` rejects the classes that refuse serialization, as
+  `unserialize()` does, instead of creating objects of them: a `Closure` or a
+  `Generator` created that way crashed on first use.
+- `deepclone_hydrate()` rejects the anonymous classes that declare neither
+  `__wakeup()` nor `__unserialize()`, and the user subclasses of internal
+  classes that refuse serialization, as the README already stated.
 
 ## [0.8.5] - 2026-09-23
 
