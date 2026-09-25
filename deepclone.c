@@ -3642,7 +3642,15 @@ static void dc_resolve(zval *value, zval *mask, zval *objects, uint32_t num_obje
 		zval *slot = mkey
 			? zend_hash_find(Z_ARRVAL(result), mkey)
 			: zend_hash_index_find(Z_ARRVAL(result), midx);
-		if (!slot) continue;
+		if (UNEXPECTED(!slot)) {
+			/* A mask entry that matches no value resolves null, which all
+			 * masks reject but unknown ones, like with the polyfill. */
+			zval null_val;
+			ZVAL_NULL(&null_val);
+			slot = mkey
+				? zend_hash_add_new(Z_ARRVAL(result), mkey, &null_val)
+				: zend_hash_index_add_new(Z_ARRVAL(result), midx, &null_val);
+		}
 
 		if (Z_TYPE_P(mval) == IS_FALSE) {
 			/* Hard ref: create PHP & reference */
@@ -4307,6 +4315,52 @@ ZEND_METHOD(DeepClone_HydrationContext, hydrate)
 	} while (0)
 #define DC_REQUIRE(cond, ...) do { if (UNEXPECTED(!(cond))) DC_INVALID(__VA_ARGS__); } while (0)
 
+/* Throw for the entry of ht holding val, whose key isn't a valid object id,
+ * reporting the key as the polyfill does: numeric loops read the hash of
+ * string keys, and negative keys as unsigned. */
+static ZEND_COLD zend_never_inline void dc_throw_invalid_id(HashTable *ht, zval *val, zend_string *scope, zend_string *name)
+{
+	zend_string *key = NULL;
+	zend_ulong idx = 0;
+	zval *v;
+
+	ZEND_HASH_FOREACH_KEY_VAL(ht, idx, key, v) {
+		if (v == val) {
+			break;
+		}
+	} ZEND_HASH_FOREACH_END();
+
+	key = key ? zend_string_copy(key) : zend_long_to_str((zend_long) idx);
+	if (scope) {
+		zend_value_error("deepclone_from_array(): Argument #1 ($data) \"properties\" entry for \"%s::%s\" references unknown object id %s",
+			ZSTR_VAL(scope), ZSTR_VAL(name), ZSTR_VAL(key));
+	} else {
+		zend_value_error("deepclone_from_array(): Argument #1 ($data) \"objectMeta\" entry index %s out of range", ZSTR_VAL(key));
+	}
+	zend_string_release(key);
+}
+
+/* Resolve the refMasks of a payload that has no refs: each matches no
+ * reference and resolves null, like in array masks. */
+static ZEND_COLD zend_never_inline bool dc_resolve_masks_without_refs(HashTable *ref_masks, zval *objects, uint32_t num_objects, HashTable *refs, HashTable *allowed_set)
+{
+	zend_ulong rid;
+	zval *rmask;
+
+	ZEND_HASH_FOREACH_NUM_KEY_VAL(ref_masks, rid, rmask) {
+		zval null_val, resolved;
+		ZVAL_NULL(&null_val);
+		ZVAL_NULL(&resolved);
+		dc_resolve(&null_val, rmask, objects, num_objects, refs, allowed_set, &resolved);
+		if (EG(exception)) {
+			return false;
+		}
+		zend_hash_index_update(refs, rid, &resolved);
+	} ZEND_HASH_FOREACH_END();
+
+	return true;
+}
+
 /* Recursively scan a mask zval tree for LONG(0)/LONG(1) entries (named and
  * const-expr closure markers). Returns true as soon as one is found. */
 static bool dc_mask_has_closure(zval *mask)
@@ -4588,7 +4642,8 @@ PHP_FUNCTION(deepclone_from_array)
 		zval *meta;
 		ZEND_HASH_FOREACH_NUM_KEY_VAL(Z_ARRVAL_P(zobject_meta), id, meta) {
 			if (id >= num_objects) {
-				DC_INVALID("deepclone_from_array(): Argument #1 ($data) \"objectMeta\" entry index " ZEND_ULONG_FMT " out of range", id);
+				dc_throw_invalid_id(Z_ARRVAL_P(zobject_meta), meta, NULL, NULL);
+				goto cleanup;
 			}
 			zend_long cidx_val;
 			if (Z_TYPE_P(meta) == IS_ARRAY) {
@@ -4965,7 +5020,13 @@ PHP_FUNCTION(deepclone_from_array)
 			zval *rmask;
 			ZEND_HASH_FOREACH_NUM_KEY_VAL(Z_ARRVAL_P(zref_masks), rid, rmask) {
 				zval *slot = zend_hash_index_find(refs, rid);
-				if (!slot) continue;
+				if (UNEXPECTED(!slot)) {
+					/* A mask that matches no reference resolves null, like
+					 * in array masks. */
+					zval null_val;
+					ZVAL_NULL(&null_val);
+					slot = zend_hash_index_add_new(refs, rid, &null_val);
+				}
 				zval resolved;
 				ZVAL_UNDEF(&resolved);
 				dc_resolve(slot, rmask, objects, num_objects, refs, allowed_set, &resolved);
@@ -4981,6 +5042,9 @@ PHP_FUNCTION(deepclone_from_array)
 				}
 			} ZEND_HASH_FOREACH_END();
 		}
+	} else if (UNEXPECTED(zref_masks != NULL)
+	 && !dc_resolve_masks_without_refs(Z_ARRVAL_P(zref_masks), objects, num_objects, refs, allowed_set)) {
+		goto cleanup;
 	}
 
 	/* ── Hydrate properties ────────────────────── */
@@ -5095,8 +5159,8 @@ PHP_FUNCTION(deepclone_from_array)
 				ZEND_HASH_FOREACH_NUM_KEY_VAL(Z_ARRVAL_P(id_values), obj_id, prop_val) {
 					if (UNEXPECTED(obj_id >= num_objects)) {
 						EG(fake_scope) = old_scope;
-						DC_INVALID("deepclone_from_array(): Argument #1 ($data) \"properties\" entry for \"%s::%s\" references unknown object id " ZEND_ULONG_FMT,
-							ZSTR_VAL(scope_name), ZSTR_VAL(prop_name), obj_id);
+						dc_throw_invalid_id(Z_ARRVAL_P(id_values), prop_val, scope_name, prop_name);
+						goto cleanup;
 					}
 					if (is_ghost && is_ghost[obj_id]) {
 						/* Created as a lazy ghost: its slots are replayed by
