@@ -19,6 +19,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Once the property table of an object got built, eg by `foreach`, a public or
   protected property named like a private property of a parent class was
   exported in the scope of that parent, and its value lost.
+- `deepclone_to_array()` keeps the last of two keys resolving to the same
+  property, like `unserialize()` does: a dynamic property named like a private
+  property of a parent class, which `unserialize()` writes to that private
+  property, or the bare and mangled names of a property returned by
+  `__serialize()` without `__unserialize()`. The first one was kept, and debug
+  builds of PHP aborted on the duplicate key.
 
 ## [0.8.5] - 2026-09-23
 

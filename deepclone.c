@@ -2785,7 +2785,12 @@ build_scoped_props:
 
 			/* Add to scoped properties. The addref pairs with the hash's
 			 * own ref — scope_name is either interned (release is a no-op)
-			 * or owned here (release at next_prop via scope_name_owned). */
+			 * or owned here (release at next_prop via scope_name_owned).
+			 * Two keys can resolve to the same property: a dynamic property
+			 * named like a private property of a parent class, which
+			 * unserialize() writes to that private property, or a bare and a
+			 * mangled key returned by __serialize(). The last one wins, as
+			 * with unserialize(). */
 			{
 				zval *scope_ht = zend_hash_find(Z_ARRVAL(props_zval), scope_name);
 				if (!scope_ht) {
@@ -2795,7 +2800,7 @@ build_scoped_props:
 					scope_ht = zend_hash_add_new(Z_ARRVAL(props_zval), scope_name, &new_ht);
 				}
 				Z_TRY_ADDREF_P(arr_val);
-				zend_hash_add_new(Z_ARRVAL_P(scope_ht), prop_name, arr_val);
+				zend_hash_update(Z_ARRVAL_P(scope_ht), prop_name, arr_val);
 			}
 
 next_prop:
