@@ -60,6 +60,8 @@
 #include "Zend/zend_interfaces.h"
 #include "ext/spl/spl_iterators.h"
 #include "ext/spl/spl_exceptions.h"
+#include "ext/spl/spl_heap.h"
+#include "ext/spl/spl_observer.h"
 
 /* ext/reflection's class entries are PHPAPI but Debian's php-dev does not
  * ship ext/reflection/php_reflection.h. Forward-declare what we use; the
@@ -362,6 +364,21 @@ struct _dc_ctx {
 #define DC_CI_NOT_INSTANTIABLE (1 << 5)
 #define DC_CI_COMPUTED         (1 << 7)
 
+/* Internal classes that have no serialization API but that unserialize()
+ * creates all the same, without their internal state, like their user
+ * subclasses: MultipleIterator without its iterators, and heaps empty with
+ * their default flags before PHP 8.5, which serializes their contents. */
+static bool dc_unserializes_stateless(zend_class_entry *ce)
+{
+#if PHP_VERSION_ID < 80500
+	if (instanceof_function(ce, spl_ce_SplHeap) || instanceof_function(ce, spl_ce_SplPriorityQueue)) {
+		return true;
+	}
+#endif
+
+	return instanceof_function(ce, spl_ce_MultipleIterator);
+}
+
 
 /* ── Helpers ────────────────────────────────────────────────── */
 
@@ -536,7 +553,8 @@ static uint8_t dc_get_class_info(dc_ctx *ctx, zend_class_entry *ce)
 
 	/* Internal classes with create_object and no serialization API:
 	 * final → probe instantiation (stateless classes like BSON\MinKey pass);
-	 * non-final → reject. Classes with __serialize/__unserialize are trusted. */
+	 * non-final → reject, unless unserialize() creates them all the same.
+	 * Classes with __serialize/__unserialize are trusted. */
 	if (ce->type == ZEND_INTERNAL_CLASS
 	 && ce->create_object != NULL
 	 && (ce->ce_flags & ZEND_ACC_FINAL)
@@ -553,7 +571,8 @@ static uint8_t dc_get_class_info(dc_ctx *ctx, zend_class_entry *ce)
 	 && ce->create_object != NULL
 	 && ce->serialize == NULL
 	 && !(flags & (DC_CI_HAS_SERIALIZE | DC_CI_HAS_UNSERIALIZE | DC_CI_HAS_SLEEP | DC_CI_HAS_WAKEUP))
-	 && ce != php_ce_incomplete_class) {
+	 && ce != php_ce_incomplete_class
+	 && !dc_unserializes_stateless(ce)) {
 		flags |= DC_CI_NOT_INSTANTIABLE;
 	}
 
@@ -5447,7 +5466,7 @@ PHP_FUNCTION(deepclone_hydrate)
 						} else {
 							zval_ptr_dtor(&probe);
 						}
-					} else {
+					} else if (!dc_unserializes_stateless(ce)) {
 						ok = false;
 					}
 				}
