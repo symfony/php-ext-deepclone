@@ -165,7 +165,8 @@ classes that refuse serialization, subclasses of internal ones included,
 whatever methods they declare, like `serialize()` does. Anonymous classes
 refuse it too, but round-trip when they declare `__wakeup()` or
 `__unserialize()`, like throwables do.
-`deepclone_from_array()` and `deepclone_hydrate()` throw
+`deepclone_from_array()` and `deepclone_hydrate()` throw it for abstract
+classes, interfaces, traits and enums, and throw
 `DeepClone\ClassNotFoundException` for classes that don't exist. Both extend
 `InvalidArgumentException`. Malformed input and classes missing from
 `$allowed_classes` throw `ValueError`.

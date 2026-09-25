@@ -501,8 +501,9 @@ static zend_always_inline bool dc_refuses_serialization(zend_class_entry *ce)
 		|| (!ce->__unserialize && !zend_hash_find_known_hash(&ce->function_table, ZSTR_KNOWN(ZEND_STR_WAKEUP)));
 }
 
-/* Look up the class of payload objects, rejecting the ones that refuse
- * serialization like unserialize() does. */
+/* Look up the class of payload objects, rejecting the ones unserialize() can't
+ * create: abstract classes, interfaces, traits and enums, and the classes that
+ * refuse serialization. */
 static zend_class_entry *dc_lookup_payload_class(zend_string *class_name)
 {
 	zend_class_entry *ce = zend_lookup_class(class_name);
@@ -510,7 +511,7 @@ static zend_class_entry *dc_lookup_payload_class(zend_string *class_name)
 	if (UNEXPECTED(!ce)) {
 		zend_throw_exception_ex(dc_ce_class_not_found_exception, 0,
 			"Class \"%s\" not found.", ZSTR_VAL(class_name));
-	} else if (UNEXPECTED(dc_refuses_serialization(ce))) {
+	} else if (UNEXPECTED((ce->ce_flags & ZEND_ACC_UNINSTANTIABLE) || dc_refuses_serialization(ce))) {
 		zend_throw_exception_ex(dc_ce_not_instantiable_exception, 0,
 			"Type \"%s\" is not instantiable.", ZSTR_VAL(ce->name));
 		ce = NULL;
@@ -5424,7 +5425,7 @@ PHP_FUNCTION(deepclone_hydrate)
 		}
 		if (UNEXPECTED(ce->ce_flags & ZEND_ACC_UNINSTANTIABLE)) {
 			zend_throw_exception_ex(dc_ce_not_instantiable_exception, 0,
-				"Class \"%s\" is not instantiable.", ZSTR_VAL(ce->name));
+				"Type \"%s\" is not instantiable.", ZSTR_VAL(ce->name));
 			RETURN_THROWS();
 		}
 		/* Reject classes that cannot function without their constructor,
@@ -5443,7 +5444,7 @@ PHP_FUNCTION(deepclone_hydrate)
 			if (EXPECTED(cached_ce == ce)) {
 				if (UNEXPECTED(!(packed & 1))) {
 					zend_throw_exception_ex(dc_ce_not_instantiable_exception, 0,
-						"Class \"%s\" is not instantiable.", ZSTR_VAL(ce->name));
+						"Type \"%s\" is not instantiable.", ZSTR_VAL(ce->name));
 					RETURN_THROWS();
 				}
 			} else {
@@ -5528,13 +5529,13 @@ PHP_FUNCTION(deepclone_hydrate)
 				zend_hash_update_ptr(hydrate_cache, ce->name, (void *) packed);
 				if (!ok) {
 					zend_throw_exception_ex(dc_ce_not_instantiable_exception, 0,
-						"Class \"%s\" is not instantiable.", ZSTR_VAL(ce->name));
+						"Type \"%s\" is not instantiable.", ZSTR_VAL(ce->name));
 					RETURN_THROWS();
 				}
 			}
 		} else if (UNEXPECTED(dc_refuses_serialization(ce))) {
 			zend_throw_exception_ex(dc_ce_not_instantiable_exception, 0,
-				"Class \"%s\" is not instantiable.", ZSTR_VAL(ce->name));
+				"Type \"%s\" is not instantiable.", ZSTR_VAL(ce->name));
 			RETURN_THROWS();
 		}
 		if (UNEXPECTED(object_init_ex(&obj_zval, ce) != SUCCESS)) {

@@ -19,6 +19,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Generator` created that way crashed on first use.
 - `deepclone_hydrate()` rejects the user classes that refuse serialization,
   like it does for internal ones.
+- `deepclone_from_array()` throws `DeepClone\NotInstantiableException` for
+  abstract classes, interfaces, traits and enums, like `deepclone_hydrate()`
+  and the polyfill do, instead of an `Error`.
+- `deepclone_hydrate()` words its `DeepClone\NotInstantiableException`
+  messages `Type "X" is not instantiable.` like the other functions and the
+  polyfill do, instead of `Class "X" is not instantiable.`.
 
 ## [0.8.5] - 2026-09-23
 
