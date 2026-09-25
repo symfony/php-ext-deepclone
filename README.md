@@ -159,8 +159,12 @@ $ao->__unserialize([ArrayObject::ARRAY_AS_PROPS, ['x' => 1], []]);
 ## Errors
 
 `deepclone_to_array()` and `deepclone_hydrate()` throw
-`DeepClone\NotInstantiableException` for resources, anonymous classes,
-`Reflection*` and internal classes that can't be serialized.
+`DeepClone\NotInstantiableException` for resources, `Reflection*` and
+internal classes that can't be serialized. All three functions throw it for
+classes that refuse serialization, subclasses of internal ones included,
+whatever methods they declare, like `serialize()` does. Anonymous classes
+refuse it too, but round-trip when they declare `__wakeup()` or
+`__unserialize()`, like throwables do.
 `deepclone_from_array()` and `deepclone_hydrate()` throw
 `DeepClone\ClassNotFoundException` for classes that don't exist. Both extend
 `InvalidArgumentException`. Malformed input and classes missing from
