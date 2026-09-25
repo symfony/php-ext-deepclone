@@ -5,6 +5,21 @@ All notable changes to this extension will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- `deepclone_to_array()` resolves the names returned by `__sleep()` like
+  `serialize()`: a bare name selected the private property of a parent class
+  by that name, instead of the same-named property of the object's class or,
+  when there's none, nothing but a "does not exist" notice. `__sleep()` was
+  also ignored on classes that declare `__unserialize()`, and returning both
+  `'x'` and `"\0ParentClass\0x"` exported only one of two same-named private
+  properties.
+- Once the property table of an object got built, eg by `foreach`, a public or
+  protected property named like a private property of a parent class was
+  exported in the scope of that parent, and its value lost.
+
 ## [0.8.5] - 2026-09-23
 
 ### Added
