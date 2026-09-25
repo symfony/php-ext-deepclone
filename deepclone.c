@@ -484,6 +484,41 @@ static uint32_t dc_ref_add(dc_ctx *ctx, zend_reference *ref, zval *orig, zval *c
 	return idx;
 }
 
+/* Whether the class refuses serialization, as serialize() and unserialize()
+ * do whatever methods it declares: PHP flags some internal classes, which
+ * their subclasses inherit, and anonymous classes, whose names don't resolve
+ * in another process. In-process, anonymous classes that restore their state
+ * with __wakeup() or __unserialize(), throwables included, round-trip all the
+ * same, unless their parent refuses serialization too. */
+static zend_always_inline bool dc_refuses_serialization(zend_class_entry *ce)
+{
+	if (EXPECTED(!(ce->ce_flags & ZEND_ACC_NOT_SERIALIZABLE))) {
+		return false;
+	}
+
+	return !(ce->ce_flags & ZEND_ACC_ANON_CLASS)
+		|| (ce->parent && (ce->parent->ce_flags & ZEND_ACC_NOT_SERIALIZABLE))
+		|| (!ce->__unserialize && !zend_hash_find_known_hash(&ce->function_table, ZSTR_KNOWN(ZEND_STR_WAKEUP)));
+}
+
+/* Look up the class of payload objects, rejecting the ones that refuse
+ * serialization like unserialize() does. */
+static zend_class_entry *dc_lookup_payload_class(zend_string *class_name)
+{
+	zend_class_entry *ce = zend_lookup_class(class_name);
+
+	if (UNEXPECTED(!ce)) {
+		zend_throw_exception_ex(dc_ce_class_not_found_exception, 0,
+			"Class \"%s\" not found.", ZSTR_VAL(class_name));
+	} else if (UNEXPECTED(dc_refuses_serialization(ce))) {
+		zend_throw_exception_ex(dc_ce_not_instantiable_exception, 0,
+			"Type \"%s\" is not instantiable.", ZSTR_VAL(ce->name));
+		ce = NULL;
+	}
+
+	return ce;
+}
+
 static uint8_t dc_get_class_info(dc_ctx *ctx, zend_class_entry *ce)
 {
 	zval *cached = zend_hash_find(&ctx->class_info, ce->name);
@@ -512,12 +547,10 @@ static uint8_t dc_get_class_info(dc_ctx *ctx, zend_class_entry *ce)
 		flags |= DC_CI_HAS_WAKEUP;
 	}
 
-	/* Mark anonymous classes (names tied to file/line, can't round-trip) and
-	 * Reflection / IteratorIterator / RecursiveIteratorIterator subclasses as
-	 * non-instantiable. Escape hatches: Serializable, __wakeup, __unserialize. */
+	/* Mark Reflection / IteratorIterator / RecursiveIteratorIterator subclasses
+	 * as non-instantiable. Escape hatches: Serializable, __wakeup, __unserialize. */
 	if (!(flags & (DC_CI_HAS_UNSERIALIZE | DC_CI_HAS_WAKEUP)) && ce->serialize == NULL
-	 && ((ce->ce_flags & ZEND_ACC_ANON_CLASS)
-	  || instanceof_function(ce, reflector_ptr)
+	 && (instanceof_function(ce, reflector_ptr)
 	  || instanceof_function(ce, reflection_type_ptr)
 	  || instanceof_function(ce, spl_ce_IteratorIterator)
 	  || instanceof_function(ce, spl_ce_RecursiveIteratorIterator)
@@ -525,12 +558,7 @@ static uint8_t dc_get_class_info(dc_ctx *ctx, zend_class_entry *ce)
 		flags |= DC_CI_NOT_INSTANTIABLE;
 	}
 
-	/* Honour ZEND_ACC_NOT_SERIALIZABLE — classes that explicitly refuse
-	 * serialization. Escape hatch: if the class declares its own
-	 * (un)serialization API, trust the declaration. */
-	if ((ce->ce_flags & ZEND_ACC_NOT_SERIALIZABLE)
-	 && !(flags & (DC_CI_HAS_UNSERIALIZE | DC_CI_HAS_WAKEUP))
-	 && ce->serialize == NULL) {
+	if (dc_refuses_serialization(ce)) {
 		flags |= DC_CI_NOT_INSTANTIABLE;
 	}
 
@@ -4719,11 +4747,9 @@ PHP_FUNCTION(deepclone_from_array)
 				}
 				zend_class_entry *ce = class_ces[cid];
 				if (!ce) {
-					ce = zend_lookup_class(class_name);
+					ce = dc_lookup_payload_class(class_name);
 					if (!ce) {
 						efree(has_closure_slot);
-						zend_throw_exception_ex(dc_ce_class_not_found_exception, 0,
-							"Class \"%s\" not found.", ZSTR_VAL(class_name));
 						goto cleanup;
 					}
 					class_ces[cid] = ce;
@@ -4821,10 +4847,8 @@ PHP_FUNCTION(deepclone_from_array)
 			/* class_ces is lazily populated — fill on miss. */
 			zend_class_entry *ce = class_ces[cid];
 			if (!ce) {
-				ce = zend_lookup_class(class_name);
+				ce = dc_lookup_payload_class(class_name);
 				if (!ce) {
-					zend_throw_exception_ex(dc_ce_class_not_found_exception, 0,
-						"Class \"%s\" not found.", ZSTR_VAL(class_name));
 					goto cleanup;
 				}
 				class_ces[cid] = ce;
@@ -5405,7 +5429,9 @@ PHP_FUNCTION(deepclone_hydrate)
 		}
 		/* Reject classes that cannot function without their constructor,
 		 * using the same rules as dc_get_class_info / deepclone_from_array.
-		 * User classes always pass; internal classes are checked and cached. */
+		 * Internal classes are checked and cached; user classes pass unless
+		 * they refuse serialization, checked each time as the cache is
+		 * persistent and their names aren't. */
 		if (UNEXPECTED(ce->type == ZEND_INTERNAL_CLASS)) {
 			/* Per-thread cache (via module globals). Packs ce pointer + ok-bit
 			 * into the stored value: low bit is ok, high bits are the ce. A ce
@@ -5426,15 +5452,14 @@ PHP_FUNCTION(deepclone_hydrate)
 				bool has_wakeup = zend_hash_find_known_hash(&ce->function_table, ZSTR_KNOWN(ZEND_STR_WAKEUP)) != NULL;
 				bool has_ser_api = has_unser || has_wakeup || ce->serialize != NULL;
 				if (!has_ser_api
-				 && ((ce->ce_flags & ZEND_ACC_ANON_CLASS)
-				  || instanceof_function(ce, reflector_ptr)
+				 && (instanceof_function(ce, reflector_ptr)
 				  || instanceof_function(ce, reflection_type_ptr)
 				  || instanceof_function(ce, spl_ce_IteratorIterator)
 				  || instanceof_function(ce, spl_ce_RecursiveIteratorIterator)
 				  || (dc_ce_reflection_generator && instanceof_function(ce, dc_ce_reflection_generator)))) {
 					ok = false;
 				}
-				if (ok && (ce->ce_flags & ZEND_ACC_NOT_SERIALIZABLE) && !has_ser_api) {
+				if (ok && dc_refuses_serialization(ce)) {
 					ok = false;
 				}
 				if (ok && ce->create_object != NULL && ce != php_ce_incomplete_class && !has_ser_api
@@ -5507,6 +5532,10 @@ PHP_FUNCTION(deepclone_hydrate)
 					RETURN_THROWS();
 				}
 			}
+		} else if (UNEXPECTED(dc_refuses_serialization(ce))) {
+			zend_throw_exception_ex(dc_ce_not_instantiable_exception, 0,
+				"Class \"%s\" is not instantiable.", ZSTR_VAL(ce->name));
+			RETURN_THROWS();
 		}
 		if (UNEXPECTED(object_init_ex(&obj_zval, ce) != SUCCESS)) {
 			RETURN_THROWS();
