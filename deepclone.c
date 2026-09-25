@@ -3740,6 +3740,22 @@ PHP_FUNCTION(deepclone_to_array)
 
 /* ── deepclone_from_array() — reconstruct the value graph ──── */
 
+static void dc_resolve(zval *value, zval *mask, zval *objects, uint32_t num_objects, HashTable *refs, HashTable *allowed_set, zval *retval);
+
+/* Check a mask that matches no value, or a refMasks entry that matches no
+ * reference, as if it matched null, like the polyfill does: markers reject
+ * it, unknown masks let it pass. Nothing is added to the payload. */
+static ZEND_COLD zend_never_inline bool dc_resolve_unmatched_mask(zval *mask, zval *objects, uint32_t num_objects, HashTable *refs, HashTable *allowed_set)
+{
+	zval null_val, resolved;
+	ZVAL_NULL(&null_val);
+	ZVAL_UNDEF(&resolved);
+	dc_resolve(&null_val, mask, objects, num_objects, refs, allowed_set, &resolved);
+	zval_ptr_dtor(&resolved);
+
+	return !EG(exception);
+}
+
 /*
  * Resolve a value using its mask marker. Writes the resolved value to *retval.
  * Throws \ValueError on malformed input — callers must check EG(exception)
@@ -4004,7 +4020,18 @@ static void dc_resolve(zval *value, zval *mask, zval *objects, uint32_t num_obje
 		zval *slot = mkey
 			? zend_hash_find(Z_ARRVAL(result), mkey)
 			: zend_hash_index_find(Z_ARRVAL(result), midx);
-		if (!slot) continue;
+		if (UNEXPECTED(!slot)) {
+			if (Z_TYPE_P(mval) == IS_FALSE) {
+				zval_ptr_dtor(&result);
+				zend_value_error("deepclone_from_array(): malformed payload, hard-ref slot must be of type int, null given");
+				return;
+			}
+			if (!dc_resolve_unmatched_mask(mval, objects, num_objects, refs, allowed_set)) {
+				zval_ptr_dtor(&result);
+				return;
+			}
+			continue;
+		}
 
 		if (Z_TYPE_P(mval) == IS_FALSE) {
 			/* Hard ref: create PHP & reference */
@@ -4669,6 +4696,31 @@ ZEND_METHOD(DeepClone_HydrationContext, hydrate)
 	} while (0)
 #define DC_REQUIRE(cond, ...) do { if (UNEXPECTED(!(cond))) DC_INVALID(__VA_ARGS__); } while (0)
 
+/* Throw for the entry of ht holding val, whose key isn't a valid object id,
+ * reporting the key as the polyfill does: numeric loops read the hash of
+ * string keys, and negative keys as unsigned. */
+static ZEND_COLD zend_never_inline void dc_throw_invalid_id(HashTable *ht, zval *val, zend_string *scope, zend_string *name)
+{
+	zend_string *key = NULL;
+	zend_ulong idx = 0;
+	zval *v;
+
+	ZEND_HASH_FOREACH_KEY_VAL(ht, idx, key, v) {
+		if (v == val) {
+			break;
+		}
+	} ZEND_HASH_FOREACH_END();
+
+	key = key ? zend_string_copy(key) : zend_long_to_str((zend_long) idx);
+	if (scope) {
+		zend_value_error("deepclone_from_array(): Argument #1 ($data) \"properties\" entry for \"%s::%s\" references unknown object id %s",
+			ZSTR_VAL(scope), ZSTR_VAL(name), ZSTR_VAL(key));
+	} else {
+		zend_value_error("deepclone_from_array(): Argument #1 ($data) \"objectMeta\" entry index %s out of range", ZSTR_VAL(key));
+	}
+	zend_string_release(key);
+}
+
 /* Recursively scan a mask zval tree for LONG(0)/LONG(1) entries (named and
  * const-expr closure markers). Returns true as soon as one is found. */
 static bool dc_mask_has_closure(zval *mask)
@@ -4950,7 +5002,8 @@ PHP_FUNCTION(deepclone_from_array)
 		zval *meta;
 		ZEND_HASH_FOREACH_NUM_KEY_VAL(Z_ARRVAL_P(zobject_meta), id, meta) {
 			if (id >= num_objects) {
-				DC_INVALID("deepclone_from_array(): Argument #1 ($data) \"objectMeta\" entry index " ZEND_ULONG_FMT " out of range", id);
+				dc_throw_invalid_id(Z_ARRVAL_P(zobject_meta), meta, NULL, NULL);
+				goto cleanup;
 			}
 			zend_long cidx_val;
 			if (Z_TYPE_P(meta) == IS_ARRAY) {
@@ -5317,28 +5370,34 @@ PHP_FUNCTION(deepclone_from_array)
 			ZVAL_COPY(&copy, rval);
 			zend_hash_index_add_new(refs, rid, &copy);
 		} ZEND_HASH_FOREACH_END();
+	}
 
-		/* Second pass: resolve those with masks, updating in-place */
-		if (zref_masks) {
-			zval *rmask;
-			ZEND_HASH_FOREACH_NUM_KEY_VAL(Z_ARRVAL_P(zref_masks), rid, rmask) {
-				zval *slot = zend_hash_index_find(refs, rid);
-				if (!slot) continue;
-				zval resolved;
-				ZVAL_UNDEF(&resolved);
-				dc_resolve(slot, rmask, objects, num_objects, refs, allowed_set, &resolved);
-				if (EG(exception)) goto cleanup;
-				/* Write through reference if slot was made into one (by dc_resolve) */
-				if (Z_ISREF_P(slot)) {
-					zval *inner = Z_REFVAL_P(slot);
-					zval_ptr_dtor(inner);
-					ZVAL_COPY_VALUE(inner, &resolved);
-				} else {
-					zval_ptr_dtor(slot);
-					ZVAL_COPY_VALUE(slot, &resolved);
+	/* Second pass: resolve those with masks, updating in-place */
+	if (zref_masks) {
+		zend_ulong rid;
+		zval *rmask;
+		ZEND_HASH_FOREACH_NUM_KEY_VAL(Z_ARRVAL_P(zref_masks), rid, rmask) {
+			zval *slot = zend_hash_index_find(refs, rid);
+			if (UNEXPECTED(!slot)) {
+				if (!dc_resolve_unmatched_mask(rmask, objects, num_objects, refs, allowed_set)) {
+					goto cleanup;
 				}
-			} ZEND_HASH_FOREACH_END();
-		}
+				continue;
+			}
+			zval resolved;
+			ZVAL_UNDEF(&resolved);
+			dc_resolve(slot, rmask, objects, num_objects, refs, allowed_set, &resolved);
+			if (EG(exception)) goto cleanup;
+			/* Write through reference if slot was made into one (by dc_resolve) */
+			if (Z_ISREF_P(slot)) {
+				zval *inner = Z_REFVAL_P(slot);
+				zval_ptr_dtor(inner);
+				ZVAL_COPY_VALUE(inner, &resolved);
+			} else {
+				zval_ptr_dtor(slot);
+				ZVAL_COPY_VALUE(slot, &resolved);
+			}
+		} ZEND_HASH_FOREACH_END();
 	}
 
 	/* ── Hydrate properties ────────────────────── */
@@ -5453,8 +5512,8 @@ PHP_FUNCTION(deepclone_from_array)
 				ZEND_HASH_FOREACH_NUM_KEY_VAL(Z_ARRVAL_P(id_values), obj_id, prop_val) {
 					if (UNEXPECTED(obj_id >= num_objects)) {
 						EG(fake_scope) = old_scope;
-						DC_INVALID("deepclone_from_array(): Argument #1 ($data) \"properties\" entry for \"%s::%s\" references unknown object id " ZEND_ULONG_FMT,
-							ZSTR_VAL(scope_name), ZSTR_VAL(prop_name), obj_id);
+						dc_throw_invalid_id(Z_ARRVAL_P(id_values), prop_val, scope_name, prop_name);
+						goto cleanup;
 					}
 					if (is_ghost && is_ghost[obj_id]) {
 						/* Created as a lazy ghost: its slots are replayed by
