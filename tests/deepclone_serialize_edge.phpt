@@ -74,6 +74,7 @@ var_dump(isset($d['properties']['SleepPrivate']['bar']));
 // ── __sleep inherited-private exclusion ──
 class ParentSleep {
     private string $secret = '';
+    public function setSecret(string $v): void { $this->secret = $v; }
 }
 class ChildSleep extends ParentSleep {
     public string $pub = '';
@@ -83,6 +84,8 @@ class ChildSleep extends ParentSleep {
 
 $o = new ChildSleep();
 $o->pub = 'visible';
+// A non-default value, as default ones are skipped anyway
+$o->setSecret('changed');
 $d = deepclone_to_array($o);
 var_dump(isset($d['properties']['stdClass']['pub']));
 // 'secret' is a private property of ParentSleep, unmangled "secret"
@@ -104,6 +107,8 @@ bool(true)
 bool(true)
 bool(true)
 bool(true)
+
+Notice: deepclone_to_array(): serialize(): "secret" returned as member variable from __sleep() but does not exist in %s on line %d
 bool(true)
 bool(true)
 Done

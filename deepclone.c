@@ -573,11 +573,14 @@ static HashTable *dc_get_scope_map(dc_ctx *ctx, zend_class_entry *ce) {
 	array_init(&zmap);
 	HashTable *map = Z_ARRVAL(zmap);
 
+	/* A name maps to the property of that name visible from ce, else to the
+	 * private property of the closest parent class that declares one */
 	zend_class_entry *parent = ce;
 	while (parent) {
 		for (uint32_t i = 0; i < parent->default_properties_count; i++) {
 			zend_property_info *pi = parent->properties_info_table[i];
 			if (!pi || (pi->flags & ZEND_ACC_STATIC)) continue;
+			if ((pi->flags & ZEND_ACC_PRIVATE) && pi->ce != parent) continue;
 
 			/* Use unmangled name as key (pi->name is mangled for non-public) */
 			zend_string *key;
@@ -2349,6 +2352,40 @@ handle_value:
 
 /* ── Object processing ──────────────────────────────────────── */
 
+/* Tell whether the names __sleep() returned select the property stored under
+ * key in the property table of an object of class ce, and remove the names
+ * that select it from sleep_set. As for serialize(), a name selects the
+ * property whose key it is, and a bare name also selects the protected
+ * property or the private property of ce by that name, but never a private
+ * property inherited from a parent class. */
+static bool dc_sleep_selects(HashTable *sleep_set, zend_class_entry *ce, zend_string *key)
+{
+	const char *name = ZSTR_VAL(key);
+	size_t name_len = ZSTR_LEN(key);
+	bool bare = true;
+
+	if (name_len && name[0] == '\0') {
+		const char *sep = memchr(name + 1, '\0', name_len - 1);
+		if (!sep) {
+			return zend_hash_del(sleep_set, key) == SUCCESS;
+		}
+		size_t class_len = sep - name - 1;
+		bare = (class_len == 1 && name[1] == '*')
+			|| (class_len == ZSTR_LEN(ce->name) && !memcmp(name + 1, ZSTR_VAL(ce->name), class_len));
+		name_len -= class_len + 2;
+		name = sep + 1;
+	}
+
+	if (zend_hash_del(sleep_set, key) == SUCCESS) {
+		if (bare) {
+			zend_hash_str_del(sleep_set, name, name_len);
+		}
+		return true;
+	}
+
+	return bare && zend_hash_str_del(sleep_set, name, name_len) == SUCCESS;
+}
+
 /* Process an object value: pool it, walk its properties, write the resulting
  * pool ID to *dst and the marker to *mask_dst.
  *
@@ -2536,6 +2573,23 @@ static void dc_process_object(dc_ctx *ctx, zval *src, zval *dst, zval *mask_dst)
 	 && !zend_object_is_lazy(obj)) {
 		/* Declared properties only — none can be numeric. */
 		may_have_numeric_names = false;
+
+		/* For __unserialize objects, use the raw (array) cast, keyed by mangled
+		 * names, from the property slots selected by __sleep */
+		if (has_unserialize) {
+			for (uint32_t j = 0; j < ce->default_properties_count; j++) {
+				zend_property_info *pj = ce->properties_info_table[j];
+				if (!pj || (pj->flags & ZEND_ACC_STATIC)) continue;
+				zval *pv = OBJ_PROP(obj, pj->offset);
+				if (Z_TYPE_P(pv) == IS_UNDEF) continue;
+				if (sleep_set && !dc_sleep_selects(sleep_set, ce, pj->name)) continue;
+				if (Z_ISREF_P(pv) && Z_REFCOUNT_P(pv) == 1) pv = Z_REFVAL_P(pv);
+				Z_TRY_ADDREF_P(pv);
+				zend_hash_add(Z_ARRVAL(props_zval), pj->name, pv);
+			}
+			goto done_props;
+		}
+
 		/* Direct property slot access — compare with prototype slots */
 		zend_property_info *prop_info;
 		zval *prop;
@@ -2551,6 +2605,9 @@ static void dc_process_object(dc_ctx *ctx, zval *src, zval *dst, zval *mask_dst)
 			}
 			prop = OBJ_PROP(obj, prop_info->offset);
 			if (Z_TYPE_P(prop) == IS_UNDEF) {
+				continue;
+			}
+			if (sleep_set && !dc_sleep_selects(sleep_set, ce, prop_info->name)) {
 				continue;
 			}
 			/* Unwrap references with refcount == 1 */
@@ -2574,19 +2631,6 @@ static void dc_process_object(dc_ctx *ctx, zval *src, zval *dst, zval *mask_dst)
 				/* Try to get an existing interned string (free for common names) */
 				prop_name = zend_string_init_existing_interned(unmangled_name, unmangled_len, 0);
 				scope_name = prop_info->ce->name;
-			}
-
-			/* __sleep filtering: check both mangled (prop_info->name) and unmangled name */
-			if (sleep_set) {
-				if (!zend_hash_exists(sleep_set, prop_info->name)
-				 && !zend_hash_exists(sleep_set, prop_name)) {
-					if (!(prop_info->flags & ZEND_ACC_PUBLIC)) {
-						zend_string_release(prop_name);
-					}
-					continue;
-				}
-				zend_hash_del(sleep_set, prop_info->name);
-				zend_hash_del(sleep_set, prop_name);
 			}
 
 			/* Skip default values — compare with default_properties_table */
@@ -2621,29 +2665,6 @@ static void dc_process_object(dc_ctx *ctx, zval *src, zval *dst, zval *mask_dst)
 			}
 		}
 
-		/* For __unserialize objects, discard scoped props and use raw (array) cast */
-		if (has_unserialize) {
-			zval_ptr_dtor(&props_zval);
-			/* Rebuild the raw (array) cast from property slots */
-			array_init(&props_zval);
-			for (uint32_t j = 0; j < ce->default_properties_count; j++) {
-				zend_property_info *pj = ce->properties_info_table[j];
-				if (!pj || (pj->flags & ZEND_ACC_STATIC)) continue;
-				zval *pv = OBJ_PROP(obj, pj->offset);
-				if (Z_TYPE_P(pv) == IS_UNDEF) continue;
-				if (Z_ISREF_P(pv) && Z_REFCOUNT_P(pv) == 1) pv = Z_REFVAL_P(pv);
-				/* Use unmangled name as key (matching (array) cast for public) */
-				if (pj->flags & ZEND_ACC_PUBLIC) {
-					Z_TRY_ADDREF_P(pv);
-					zend_hash_add(Z_ARRVAL(props_zval), pj->name, pv);
-				} else {
-					/* Private/protected: use mangled key like (array) cast */
-					Z_TRY_ADDREF_P(pv);
-					zend_hash_add(Z_ARRVAL(props_zval), pj->name, pv);
-				}
-			}
-		}
-
 		goto done_props;
 	}
 
@@ -2656,10 +2677,22 @@ static void dc_process_object(dc_ctx *ctx, zval *src, zval *dst, zval *mask_dst)
 		}
 	}
 
-	/* __unserialize without __serialize: use raw (array) cast as state props */
+	/* __unserialize without __serialize: use raw (array) cast as state props,
+	 * the ones selected by __sleep */
 	if (has_unserialize && array_value) {
 		zval_ptr_dtor(&props_zval);
 		ZVAL_ARR(&props_zval, zend_array_dup(array_value));
+		if (sleep_set) {
+			zend_ulong num_key;
+			zend_string *key;
+			ZEND_HASH_FOREACH_KEY(Z_ARRVAL(props_zval), num_key, key) {
+				if (!key) {
+					zend_hash_index_del(Z_ARRVAL(props_zval), num_key);
+				} else if (!dc_sleep_selects(sleep_set, ce, key)) {
+					zend_hash_del(Z_ARRVAL(props_zval), key);
+				}
+			} ZEND_HASH_FOREACH_END();
+		}
 		if (need_release_array_value) {
 			zend_release_properties(array_value);
 		}
@@ -2732,32 +2765,8 @@ build_scoped_props:
 				prop_name_owned = true;
 			}
 
-			/* __sleep filtering: match by mangled key first, then by unmangled name
-			 * (but only if not an inherited private property — same as PHP Exporter) */
-			if (sleep_set) {
-				bool found = zend_hash_exists(sleep_set, arr_key);
-				if (!found) {
-					/* For private props of parent classes, unmangled name must not match */
-					bool is_inherited_private = (key[0] == '\0' && key[1] != '*');
-					if (is_inherited_private) {
-						const char *sep = memchr(key + 2, '\0', key_len - 2);
-						if (sep) {
-							size_t class_len = sep - key - 1;
-							zend_string *prop_class = zend_string_init_existing_interned(key + 1, class_len, 0);
-							is_inherited_private = !zend_string_equals(prop_class, ce->name);
-							zend_string_release(prop_class);
-						}
-					}
-					if (!is_inherited_private) {
-						found = zend_hash_exists(sleep_set, prop_name);
-					}
-				}
-				if (found) {
-					zend_hash_del(sleep_set, arr_key);
-					zend_hash_del(sleep_set, prop_name);
-				} else {
-					goto next_prop;
-				}
+			if (sleep_set && !dc_sleep_selects(sleep_set, ce, arr_key)) {
+				goto next_prop;
 			}
 
 			/* Skip default values, except for the call-context-sensitive Throwable
@@ -2804,11 +2813,14 @@ next_prop:
 	}
 
 done_props:
-	/* __sleep: warn about non-existent members */
+	/* __sleep: warn about the names that selected no property, unless they
+	 * name a declared property, eg an uninitialized one. A bare name doesn't
+	 * name the private properties of parent classes. */
 	if (sleep_set) {
 		zend_string *missing;
 		ZEND_HASH_FOREACH_STR_KEY(sleep_set, missing) {
-			if (missing && !zend_hash_find_known_hash(&ce->properties_info, missing)) {
+			zend_property_info *pi = zend_hash_find_ptr(&ce->properties_info, missing);
+			if (!pi || ((pi->flags & ZEND_ACC_PRIVATE) && pi->ce != ce)) {
 				php_error_docref(NULL, E_NOTICE,
 					"serialize(): \"%s\" returned as member variable from __sleep() but does not exist",
 					ZSTR_VAL(missing));
