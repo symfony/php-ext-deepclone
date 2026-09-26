@@ -57,6 +57,7 @@
 #endif
 #include "Zend/zend_enum.h"
 #include "Zend/zend_attributes.h"
+#include "Zend/zend_bitset.h"
 #include "Zend/zend_interfaces.h"
 #include "ext/spl/spl_iterators.h"
 #include "ext/spl/spl_exceptions.h"
@@ -305,8 +306,35 @@ typedef struct {
 	zend_string   *prop_scope;
 	zend_string   *prop_name;
 	uint32_t       prop_obj_id;
+	uint32_t       prop_log_idx;  /* its entry in the resolve log */
 	bool           prop_may_be_numeric;
 } dc_ref_entry;
+
+/* ── Resolve log entry ──────────────────────────────────────────
+ * The markers of an object's properties are known once the walk of their
+ * values returns, after the objects these values reach. They are logged and
+ * put in ctx->resolve per object in id order once the walk is over, so that
+ * their order matches the one of ctx->properties, like with the polyfill. */
+
+typedef struct {
+	zend_string   *scope;
+	zend_string   *name;          /* NULL for a numeric name */
+	zend_ulong     idx;           /* the numeric name */
+	uint32_t       next;          /* next entry of the same object, or UINT32_MAX */
+	zval           mask;          /* UNDEF once unwrapped to nothing */
+} dc_resolve_entry;
+
+#define DC_RLOG_INLINE 16
+
+/* A property value to walk once the slots of all the properties of its
+ * object are created */
+typedef struct {
+	zend_string   *scope;
+	zend_string   *name;
+	zval          *val;
+} dc_pending_entry;
+
+#define DC_PENDING_INLINE 16
 
 /* ── Object pool entry ──────────────────────────────────────── */
 
@@ -318,6 +346,8 @@ typedef struct {
 	int            wakeup;        /* >0 = __wakeup order, <0 = __unserialize order, 0 = none */
 	HashTable     *props;         /* [scope][name] => value (already prepared) */
 	HashTable     *prop_mask;     /* [scope][name] => mask marker (or NULL) */
+	uint32_t       rlog_head;     /* first and last resolve log entries, or UINT32_MAX */
+	uint32_t       rlog_tail;
 } dc_pool_entry;
 
 /* ── Traversal context ──────────────────────────────────────── */
@@ -340,6 +370,15 @@ struct _dc_ctx {
 	zval           classes;        /* deduped class names */
 	zval           properties;     /* [scope][name][id] => value */
 	zval           resolve;        /* [scope][name][id] => marker */
+	dc_resolve_entry *rlog;        /* property markers, until put in resolve */
+	uint32_t       rlog_count;
+	uint32_t       rlog_cap;
+	dc_resolve_entry rlog_inline[DC_RLOG_INLINE];
+	/* The property values to walk, as a stack shared by the nested objects */
+	dc_pending_entry *pending;
+	uint32_t       pending_count;
+	uint32_t       pending_cap;
+	dc_pending_entry pending_inline[DC_PENDING_INLINE];
 	HashTable      class_map;      /* class_name => cidx (uint32_t in zval long) */
 
 	/* Scope map cache: class_name => HashTable(prop_name => scope_class_name) */
@@ -375,6 +414,12 @@ static void dc_ctx_init(dc_ctx *ctx) {
 	ZVAL_UNDEF(&ctx->classes);
 	ZVAL_UNDEF(&ctx->properties);
 	ZVAL_UNDEF(&ctx->resolve);
+	ctx->rlog = ctx->rlog_inline;
+	ctx->rlog_count = 0;
+	ctx->rlog_cap = DC_RLOG_INLINE;
+	ctx->pending = ctx->pending_inline;
+	ctx->pending_count = 0;
+	ctx->pending_cap = DC_PENDING_INLINE;
 	zend_hash_init(&ctx->class_map, 4, NULL, NULL, 0);
 	zend_hash_init(&ctx->ref_map, 8, NULL, NULL, 0);
 	ctx->next_obj_id = 0;
@@ -392,6 +437,20 @@ static void dc_ctx_destroy(dc_ctx *ctx) {
 	zval_ptr_dtor(&ctx->classes);
 	zval_ptr_dtor(&ctx->properties);
 	zval_ptr_dtor(&ctx->resolve);
+	/* Markers not moved to ctx->resolve after an exception */
+	for (uint32_t i = 0; i < ctx->rlog_count; i++) {
+		zend_string_release(ctx->rlog[i].scope);
+		if (ctx->rlog[i].name) {
+			zend_string_release(ctx->rlog[i].name);
+		}
+		zval_ptr_dtor(&ctx->rlog[i].mask);
+	}
+	if (ctx->rlog != ctx->rlog_inline) {
+		efree(ctx->rlog);
+	}
+	if (ctx->pending != ctx->pending_inline) {
+		efree(ctx->pending);
+	}
 	zend_hash_destroy(&ctx->class_map);
 	if (ctx->entries) {
 		/* Free any remaining pool entries (entries whose props/prop_mask were
@@ -476,6 +535,7 @@ static uint32_t dc_ref_add(dc_ctx *ctx, zend_reference *ref, zval *orig, zval *c
 	ctx->refs[idx].mask_slot = NULL;
 	ctx->refs[idx].prop_scope = NULL;
 	ctx->refs[idx].prop_name = NULL;
+	ctx->refs[idx].prop_log_idx = UINT32_MAX;
 	/* Map ref pointer → index. See the comment at the top of the file
 	 * about not pre-hashing keys handed to zend_hash_index_*. */
 	zval zidx;
@@ -692,14 +752,14 @@ static HashTable *dc_build_allowed_set(HashTable *list, const char *func_name)
 		if (Z_TYPE_P(entry) != IS_STRING) {
 			zend_hash_destroy(set);
 			efree(set);
-			zend_value_error("%s(): Argument $allowedClasses must be an array of class names, %s given",
+			zend_value_error("%s(): Argument $allowed_classes must be an array of class names, %s given",
 				func_name, zend_zval_value_name(entry));
 			return NULL;
 		}
 		if (!zend_is_valid_class_name(Z_STR_P(entry))) {
 			zend_hash_destroy(set);
 			efree(set);
-			zend_value_error("%s(): Argument $allowedClasses must be an array of class names, \"%s\" given",
+			zend_value_error("%s(): Argument $allowed_classes must be an array of class names, \"%s\" given",
 				func_name, ZSTR_VAL(Z_STR_P(entry)));
 			return NULL;
 		}
@@ -780,6 +840,90 @@ static zend_always_inline zval *dc_name_subarray_find(HashTable *scope_ht, zend_
 		return zend_hash_index_find(scope_ht, idx);
 	}
 	return zend_hash_find_known_hash(scope_ht, name);
+}
+
+/* Log the marker of a property of the object of the given pool entry, taking
+ * ownership of mask. Returns the index of the log entry. */
+static uint32_t dc_rlog_add(dc_ctx *ctx, dc_pool_entry *entry, zend_string *scope, zend_string *name, bool may_be_numeric, zval *mask)
+{
+	if (UNEXPECTED(ctx->rlog_count >= ctx->rlog_cap)) {
+		ctx->rlog_cap = ((ctx->rlog_cap * 3) >> 1) + 1;
+		if (ctx->rlog == ctx->rlog_inline) {
+			ctx->rlog = safe_emalloc(ctx->rlog_cap, sizeof(dc_resolve_entry), 0);
+			memcpy(ctx->rlog, ctx->rlog_inline, sizeof(ctx->rlog_inline));
+		} else {
+			ctx->rlog = safe_erealloc(ctx->rlog, ctx->rlog_cap, sizeof(dc_resolve_entry), 0);
+		}
+	}
+	uint32_t idx = ctx->rlog_count++;
+	dc_resolve_entry *re = &ctx->rlog[idx];
+	re->scope = zend_string_copy(scope);
+	if (may_be_numeric && ZEND_HANDLE_NUMERIC(name, re->idx)) {
+		re->name = NULL;
+	} else {
+		re->name = zend_string_copy(name);
+	}
+	re->next = UINT32_MAX;
+	ZVAL_COPY_VALUE(&re->mask, mask);
+
+	if (entry->rlog_tail == UINT32_MAX) {
+		entry->rlog_head = idx;
+	} else {
+		ctx->rlog[entry->rlog_tail].next = idx;
+	}
+	entry->rlog_tail = idx;
+
+	return idx;
+}
+
+/* Move the logged markers to ctx->resolve[scope][name][id], object by object
+ * in id order, and each object's ones in the order of its properties. Those
+ * unwrapped to nothing leave a NULL placeholder, which dc_mask_cleanup()
+ * strips afterwards: like with the polyfill, they still decide where their
+ * scope and name go. */
+static void dc_rlog_flush(dc_ctx *ctx)
+{
+	if (!ctx->rlog_count) {
+		return;
+	}
+	if (Z_TYPE(ctx->resolve) == IS_UNDEF) {
+		array_init(&ctx->resolve);
+	}
+	for (uint32_t id = 0; id < ctx->next_obj_id; id++) {
+		dc_pool_entry *e = ctx->entries[id];
+		if (!e) {
+			continue;
+		}
+		for (uint32_t i = e->rlog_head; i != UINT32_MAX; i = ctx->rlog[i].next) {
+			dc_resolve_entry *re = &ctx->rlog[i];
+			if (Z_TYPE(re->mask) == IS_UNDEF) {
+				ZVAL_NULL(&re->mask);
+			}
+			zval *out_scope = zend_hash_find_known_hash(Z_ARRVAL(ctx->resolve), re->scope);
+			if (!out_scope) {
+				zval new_ht;
+				array_init_size(&new_ht, 1);
+				out_scope = zend_hash_add_new(Z_ARRVAL(ctx->resolve), re->scope, &new_ht);
+			}
+			zval *out_name = re->name
+				? zend_hash_find_known_hash(Z_ARRVAL_P(out_scope), re->name)
+				: zend_hash_index_find(Z_ARRVAL_P(out_scope), re->idx);
+			if (!out_name) {
+				zval new_ht;
+				array_init_size(&new_ht, 1);
+				out_name = re->name
+					? zend_hash_add_new(Z_ARRVAL_P(out_scope), re->name, &new_ht)
+					: zend_hash_index_add_new(Z_ARRVAL_P(out_scope), re->idx, &new_ht);
+			}
+			zend_hash_index_add_new(Z_ARRVAL_P(out_name), id, &re->mask);
+			zend_string_release(re->scope);
+			if (re->name) {
+				zend_string_release(re->name);
+			}
+		}
+	}
+	/* The markers belong to ctx->resolve now */
+	ctx->rlog_count = 0;
 }
 
 #if PHP_VERSION_ID >= 80400 && PHP_VERSION_ID < 80600
@@ -2076,6 +2220,16 @@ static void dc_cexpr_resolve(zval *value, HashTable *allowed_set, zval *retval)
 	ZVAL_COPY_VALUE(retval, &w.found);
 }
 
+/* Resources can't be restored. Closed ones have no type, which
+ * get_resource_type() reports as "Unknown". */
+static ZEND_COLD void dc_throw_resource(zval *res)
+{
+	const char *type = zend_rsrc_list_get_rsrc_type(Z_RES_P(res));
+
+	zend_throw_exception_ex(dc_ce_not_instantiable_exception, 0,
+		"Type \"%s resource\" is not instantiable.", type ? type : "Unknown");
+}
+
 static void dc_copy_value(dc_ctx *ctx, zval *src, zval *dst, zval *mask_dst)
 {
 	/* Bail out early if we're about to overflow the C stack. Throws \Error
@@ -2141,8 +2295,7 @@ static void dc_copy_value(dc_ctx *ctx, zval *src, zval *dst, zval *mask_dst)
 
 	/* ── Resource (cold — rejected to match PHP DeepCloner) ── */
 	if (UNEXPECTED(Z_TYPE_P(src) == IS_RESOURCE)) {
-		zend_throw_exception_ex(dc_ce_not_instantiable_exception, 0,
-			"Type \"%s resource\" is not instantiable.", zend_rsrc_list_get_rsrc_type(Z_RES_P(src)));
+		dc_throw_resource(src);
 		return;
 	}
 
@@ -2258,7 +2411,7 @@ static void dc_copy_value(dc_ctx *ctx, zval *src, zval *dst, zval *mask_dst)
 		 * ends must enable. */
 		if (func && (func->common.fn_flags & ZEND_ACC_FAKE_CLOSURE)) {
 			if (!ctx->allow_named_closures) {
-				zend_value_error("deepclone_to_array(): serializing a closure over the named callable \"%s\" requires enabling the \"allow_named_closures\" option; do it only if you trust the input", ZSTR_VAL(func->common.function_name));
+				zend_value_error("deepclone_to_array(): serializing a closure over the named callable \"%s\" requires enabling the \"allow_named_closures\" option; do it only if you trust the input; alternatively, install the \"deepclone\" extension, which can reference callables declared in constant expressions", ZSTR_VAL(func->common.function_name));
 				return;
 			}
 			if (!dc_class_allowed(ctx->allowed_ht, zend_ce_closure->name)) {
@@ -2352,38 +2505,243 @@ handle_value:
 
 /* ── Object processing ──────────────────────────────────────── */
 
-/* Tell whether the names __sleep() returned select the property stored under
- * key in the property table of an object of class ce, and remove the names
- * that select it from sleep_set. As for serialize(), a name selects the
- * property whose key it is, and a bare name also selects the protected
- * property or the private property of ce by that name, but never a private
- * property inherited from a parent class. */
-static bool dc_sleep_selects(HashTable *sleep_set, zend_class_entry *ce, zend_string *key)
+/* Add prop, the value of a declared property, to props[scope][name], unless
+ * it holds its default value, as found in default_props */
+static zend_always_inline void dc_add_slot_property(HashTable *props, zend_class_entry *ce, zend_property_info *prop_info, zval *prop, zval *default_props)
 {
-	const char *name = ZSTR_VAL(key);
-	size_t name_len = ZSTR_LEN(key);
-	bool bare = true;
+	/* Unwrap references with refcount == 1 */
+	if (Z_ISREF_P(prop) && Z_REFCOUNT_P(prop) == 1) {
+		prop = Z_REFVAL_P(prop);
+	}
 
-	if (name_len && name[0] == '\0') {
-		const char *sep = memchr(name + 1, '\0', name_len - 1);
+	/* Unmangle prop_info->name for non-public properties */
+	const char *unmangled_name;
+	size_t unmangled_len;
+	zend_string *prop_name;
+	zend_string *scope_name;
+
+	if (prop_info->flags & ZEND_ACC_PUBLIC) {
+		prop_name = prop_info->name;
+		scope_name = !(prop_info->flags & (ZEND_ACC_PROTECTED_SET | ZEND_ACC_PRIVATE_SET))
+			? ZEND_STANDARD_CLASS_DEF_PTR->name : prop_info->ce->name;
+	} else {
+		const char *class_name_unused;
+		zend_unmangle_property_name_ex(prop_info->name, &class_name_unused, &unmangled_name, &unmangled_len);
+		/* Try to get an existing interned string (free for common names) */
+		prop_name = zend_string_init_existing_interned(unmangled_name, unmangled_len, 0);
+		scope_name = prop_info->ce->name;
+	}
+
+	/* Skip default values — compare with default_properties_table */
+	if (default_props) {
+		uint32_t prop_num = OBJ_PROP_TO_NUM(prop_info->offset);
+		zval *default_val = &default_props[prop_num];
+		if (Z_TYPE_P(default_val) != IS_UNDEF && zend_is_identical(prop, default_val)) {
+			/* Always keep trace properties */
+			bool is_trace = zend_string_equals(prop_name, dc_str_trace)
+				&& (instanceof_function(ce, zend_ce_exception) || instanceof_function(ce, zend_ce_error));
+			if (!is_trace) {
+				if (!(prop_info->flags & ZEND_ACC_PUBLIC)) {
+					zend_string_release(prop_name);
+				}
+				return;
+			}
+		}
+	}
+
+	/* Add to props[scope][name] = value (COW).
+	 * scope_name is always interned (class entry name). */
+	zval *scope_ht = zend_hash_find_known_hash(props, scope_name);
+	if (!scope_ht) {
+		zval new_ht;
+		array_init(&new_ht);
+		scope_ht = zend_hash_add_new(props, scope_name, &new_ht);
+	}
+	Z_TRY_ADDREF_P(prop);
+	zend_hash_add(Z_ARRVAL_P(scope_ht), prop_name, prop);
+	if (!(prop_info->flags & ZEND_ACC_PUBLIC)) {
+		zend_string_release(prop_name);
+	}
+}
+
+/* Whether the property table of an object, when built, holds its declared
+ * properties only, so that they can be read from their slots instead */
+static zend_always_inline bool dc_has_declared_properties_only(zval *src)
+{
+	zend_object *obj = Z_OBJ_P(src);
+
+	return obj->ce->type == ZEND_USER_CLASS
+		&& obj->properties == NULL
+		&& Z_OBJ_HT_P(src)->get_properties_for == NULL
+		&& Z_OBJ_HT_P(src)->get_properties == zend_std_get_properties
+		&& !zend_object_is_lazy(obj);
+}
+
+/* Add val, the property stored under key, to selected, as serialize() does
+ * with the names returned by __sleep() */
+static void dc_sleep_add(HashTable *selected, zend_string *key, zval *val, zend_string *name)
+{
+	if (Z_ISREF_P(val) && Z_REFCOUNT_P(val) == 1) {
+		val = Z_REFVAL_P(val);
+	}
+	if (!zend_hash_add(selected, key, val)) {
+		zend_error(PHP_VERSION_ID >= 80300 ? E_WARNING : E_NOTICE,
+			"serialize(): \"%s\" is returned from __sleep() multiple times", ZSTR_VAL(name));
+		return;
+	}
+	Z_TRY_ADDREF_P(val);
+}
+
+/* Look key up in the property table props, like serialize() does with the
+ * names returned by __sleep(). Returns false when there is no such property,
+ * or when it is unset and untyped. */
+static bool dc_sleep_add_from_table(HashTable *selected, HashTable *props, zend_string *key, zend_string *name, zend_object *obj)
+{
+	zval *val = zend_hash_find(props, key);
+	if (!val) {
+		return false;
+	}
+	if (Z_TYPE_P(val) == IS_INDIRECT) {
+		val = Z_INDIRECT_P(val);
+		if (Z_TYPE_P(val) == IS_UNDEF) {
+			/* Uninitialized typed properties are skipped silently */
+			return zend_get_typed_property_info_for_slot(obj, val) != NULL;
+		}
+	}
+	dc_sleep_add(selected, key, val, name);
+	return true;
+}
+
+/* For objects that have only declared properties, find the property that
+ * serialize() selects for a name returned by __sleep() without building the
+ * property table: the property whose key the name is, else the private
+ * property of the object's class or the protected property by that name. */
+static zend_property_info *dc_sleep_find_slot(zend_class_entry *ce, zend_string *name)
+{
+	const char *n = ZSTR_VAL(name);
+	size_t len = ZSTR_LEN(name);
+	zend_property_info *pi = NULL;
+
+	if (len && n[0] == '\0') {
+		/* The key of a protected property or of a private one */
+		const char *sep = len > 1 ? memchr(n + 1, '\0', len - 1) : NULL;
 		if (!sep) {
-			return zend_hash_del(sleep_set, key) == SUCCESS;
+			return NULL;
 		}
-		size_t class_len = sep - name - 1;
-		bare = (class_len == 1 && name[1] == '*')
-			|| (class_len == ZSTR_LEN(ce->name) && !memcmp(name + 1, ZSTR_VAL(ce->name), class_len));
-		name_len -= class_len + 2;
-		name = sep + 1;
+		size_t class_len = sep - n - 1;
+		if (class_len == 1 && n[1] == '*') {
+			pi = zend_hash_str_find_ptr(&ce->properties_info, sep + 1, len - 3);
+			if (pi && !(pi->flags & ZEND_ACC_PROTECTED)) {
+				pi = NULL;
+			}
+		} else {
+			for (zend_class_entry *scope = ce; scope; scope = scope->parent) {
+				if (ZSTR_LEN(scope->name) == class_len && !memcmp(ZSTR_VAL(scope->name), n + 1, class_len)) {
+					pi = zend_hash_str_find_ptr(&scope->properties_info, sep + 1, len - class_len - 2);
+					if (pi && (!(pi->flags & ZEND_ACC_PRIVATE) || pi->ce != scope)) {
+						pi = NULL;
+					}
+					break;
+				}
+			}
+		}
+	} else {
+		/* A bare name doesn't select the private properties of parent classes */
+		pi = zend_hash_find_ptr(&ce->properties_info, name);
+		if (pi && (pi->flags & ZEND_ACC_PRIVATE) && pi->ce != ce) {
+			pi = NULL;
+		}
 	}
 
-	if (zend_hash_del(sleep_set, key) == SUCCESS) {
-		if (bare) {
-			zend_hash_str_del(sleep_set, name, name_len);
-		}
-		return true;
+	return dc_is_backed_declared_property(pi) ? pi : NULL;
+}
+
+/* Select the properties named by __sleep() like serialize() does, in the
+ * same order and with the same warnings. Adds them to selected keyed like in
+ * the property table or, for objects that have only declared properties, to
+ * scoped by scope and name, leaving default values out like the slot walk of
+ * dc_process_object(). Returns false when an exception is thrown. */
+static bool dc_sleep_properties(zval *src, HashTable *names, HashTable *selected, HashTable *scoped)
+{
+	zend_object *obj = Z_OBJ_P(src);
+	zend_class_entry *ce = obj->ce;
+	bool from_slots = scoped || dc_has_declared_properties_only(src);
+	HashTable *props = from_slots ? NULL : zend_get_properties_for(src, ZEND_PROP_PURPOSE_SERIALIZE);
+	zend_bitset seen = NULL;
+	uint32_t seen_len = 0;
+	ALLOCA_FLAG(use_heap);
+	zval *name_val;
+	bool ok = true;
+
+	if (scoped) {
+		/* The slots selected so far, to spot the names selecting one again */
+		seen_len = zend_bitset_len(ce->default_properties_count);
+		seen = ZEND_BITSET_ALLOCA(seen_len, use_heap);
+		zend_bitset_clear(seen, seen_len);
 	}
 
-	return bare && zend_hash_str_del(sleep_set, name, name_len) == SUCCESS;
+	ZEND_HASH_FOREACH_VAL_IND(names, name_val) {
+		zend_string *name, *tmp_name, *key;
+		bool found = false;
+
+		ZVAL_DEREF(name_val);
+		if (Z_TYPE_P(name_val) != IS_STRING) {
+			zend_error(E_WARNING, "serialize(): %s::__sleep() should return an array only containing the names of instance-variables to serialize", ZSTR_VAL(ce->name));
+		}
+		name = zval_get_tmp_string(name_val, &tmp_name);
+		if (EG(exception)) {
+			/* found stays false */
+		} else if (from_slots) {
+			zend_property_info *pi = dc_sleep_find_slot(ce, name);
+			zval *val = pi ? OBJ_PROP(obj, pi->offset) : NULL;
+			if (!val) {
+				/* No such property */
+			} else if (Z_TYPE_P(val) == IS_UNDEF) {
+				/* Uninitialized typed properties are skipped silently */
+				found = ZEND_TYPE_IS_SET(pi->type);
+			} else if (!scoped) {
+				found = true;
+				dc_sleep_add(selected, pi->name, val, name);
+			} else if (zend_bitset_in(seen, OBJ_PROP_TO_NUM(pi->offset))) {
+				found = true;
+				zend_error(PHP_VERSION_ID >= 80300 ? E_WARNING : E_NOTICE,
+					"serialize(): \"%s\" is returned from __sleep() multiple times", ZSTR_VAL(name));
+			} else {
+				found = true;
+				zend_bitset_incl(seen, OBJ_PROP_TO_NUM(pi->offset));
+				dc_add_slot_property(scoped, ce, pi, val, ce->default_properties_table);
+			}
+		} else if (props) {
+			found = dc_sleep_add_from_table(selected, props, name, name, obj);
+			if (!found && !EG(exception)) {
+				key = zend_mangle_property_name(ZSTR_VAL(ce->name), ZSTR_LEN(ce->name), ZSTR_VAL(name), ZSTR_LEN(name), 0);
+				found = dc_sleep_add_from_table(selected, props, key, name, obj);
+				zend_string_release(key);
+			}
+			if (!found && !EG(exception)) {
+				key = zend_mangle_property_name("*", 1, ZSTR_VAL(name), ZSTR_LEN(name), 0);
+				found = dc_sleep_add_from_table(selected, props, key, name, obj);
+				zend_string_release(key);
+			}
+		}
+		if (!found && !EG(exception)) {
+			zend_error(E_WARNING, "serialize(): \"%s\" returned as member variable from __sleep() but does not exist", ZSTR_VAL(name));
+		}
+		zend_tmp_string_release(tmp_name);
+		if (UNEXPECTED(EG(exception))) {
+			ok = false;
+			break;
+		}
+	} ZEND_HASH_FOREACH_END();
+
+	if (props) {
+		zend_release_properties(props);
+	}
+	if (scoped) {
+		free_alloca(seen, use_heap);
+	}
+
+	return ok;
 }
 
 /* Process an object value: pool it, walk its properties, write the resulting
@@ -2402,7 +2760,8 @@ static void dc_process_object(dc_ctx *ctx, zval *src, zval *dst, zval *mask_dst)
 	HashTable *array_value = NULL;
 	zval props_zval, retval;
 	bool has_unserialize, need_release_array_value = false;
-	HashTable *sleep_set = NULL;
+	/* Whether array_value comes from __serialize() */
+	bool from_serialize = false;
 	/* Whether this object's property names can include numeric ones. Only
 	 * dynamic properties can be named like an integer, so the declared-only
 	 * fast path below clears this and the transpose skips the per-name
@@ -2440,6 +2799,8 @@ static void dc_process_object(dc_ctx *ctx, zval *src, zval *dst, zval *mask_dst)
 	entry->wakeup = 0;
 	entry->props = NULL;
 	entry->prop_mask = NULL;
+	entry->rlog_head = UINT32_MAX;
+	entry->rlog_tail = UINT32_MAX;
 
 	/* Register in id-indexed entries array — 1.5× growth, safe_erealloc
 	 * for overflow detection (see the comment in dc_ref_add). */
@@ -2504,6 +2865,7 @@ static void dc_process_object(dc_ctx *ctx, zval *src, zval *dst, zval *mask_dst)
 		}
 		array_value = Z_ARRVAL(retval);
 		need_release_array_value = true; /* retval owns the array */
+		from_serialize = true;
 		goto build_scoped_props;
 	}
 
@@ -2525,7 +2887,7 @@ static void dc_process_object(dc_ctx *ctx, zval *src, zval *dst, zval *mask_dst)
 		goto replace_with_id;
 	}
 
-	/* ── __sleep filtering (cold) ──────────────────────── */
+	/* ── __sleep (cold) ─────────────────────────────────── */
 	if (UNEXPECTED(ci & DC_CI_HAS_SLEEP)) {
 		zend_function *sleep_fn = zend_hash_find_ptr(&ce->function_table, ZSTR_KNOWN(ZEND_STR_SLEEP));
 		zend_call_method_with_0_params(obj, ce, &sleep_fn, "__sleep", &retval);
@@ -2534,9 +2896,8 @@ static void dc_process_object(dc_ctx *ctx, zval *src, zval *dst, zval *mask_dst)
 			return;
 		}
 		if (UNEXPECTED(Z_TYPE(retval) != IS_ARRAY)) {
-			php_error_docref(NULL, E_NOTICE,
-				"serialize(): __sleep should return an array only containing the names of instance-variables to serialize");
 			zval_ptr_dtor(&retval);
+			zend_error(E_WARNING, "serialize(): %s::__sleep() should return an array only containing the names of instance-variables to serialize", ZSTR_VAL(ce->name));
 			/* Roll back the pool entry and write null into the parent slot */
 			zval_ptr_dtor(&props_zval);
 			ctx->entries[entry->id] = NULL;
@@ -2546,18 +2907,35 @@ static void dc_process_object(dc_ctx *ctx, zval *src, zval *dst, zval *mask_dst)
 			ZVAL_NULL(dst);
 			return;
 		}
-		/* Build sleep_set: name => 1 */
-		ALLOC_HASHTABLE(sleep_set);
-		zend_hash_init(sleep_set, zend_hash_num_elements(Z_ARRVAL(retval)), NULL, NULL, 0);
-		zval *sleep_name;
-		ZEND_HASH_FOREACH_VAL(Z_ARRVAL(retval), sleep_name) {
-			if (Z_TYPE_P(sleep_name) == IS_STRING) {
-				zval one;
-				ZVAL_LONG(&one, 1);
-				zend_hash_add(sleep_set, Z_STR_P(sleep_name), &one);
+		if (!has_unserialize && dc_has_declared_properties_only(src)) {
+			/* Like the slot walk below, in the order of the names */
+			may_have_numeric_names = false;
+			bool ok = dc_sleep_properties(src, Z_ARRVAL(retval), NULL, Z_ARRVAL(props_zval));
+			zval_ptr_dtor(&retval);
+			if (UNEXPECTED(!ok)) {
+				zval_ptr_dtor(&props_zval);
+				return;
 			}
-		} ZEND_HASH_FOREACH_END();
+			goto prepare_props;
+		}
+		array_value = zend_new_array(zend_hash_num_elements(Z_ARRVAL(retval)));
+		bool ok = dc_sleep_properties(src, Z_ARRVAL(retval), array_value, NULL);
 		zval_ptr_dtor(&retval);
+		if (UNEXPECTED(!ok)) {
+			zend_array_release(array_value);
+			zval_ptr_dtor(&props_zval);
+			return;
+		}
+		need_release_array_value = true;
+		if (has_unserialize) {
+			/* The state, keyed like in the property table and ordered like
+			 * the names returned by __sleep() */
+			zval_ptr_dtor(&props_zval);
+			ZVAL_ARR(&props_zval, zend_proptable_to_symtable(array_value, false));
+			zend_array_release(array_value);
+			goto prepare_props;
+		}
+		goto build_scoped_props;
 	}
 
 	/* ── Get properties ─────────────────────────── */
@@ -2566,28 +2944,23 @@ static void dc_process_object(dc_ctx *ctx, zval *src, zval *dst, zval *mask_dst)
 	 * This avoids rebuilding the properties HashTable via zend_get_properties_for.
 	 * Conditions: no custom handlers, no dynamic properties yet, not lazy.
 	 */
-	if (ce->type == ZEND_USER_CLASS
-	 && obj->properties == NULL
-	 && Z_OBJ_HT_P(src)->get_properties_for == NULL
-	 && Z_OBJ_HT_P(src)->get_properties == zend_std_get_properties
-	 && !zend_object_is_lazy(obj)) {
+	if (dc_has_declared_properties_only(src)) {
 		/* Declared properties only — none can be numeric. */
 		may_have_numeric_names = false;
 
 		/* For __unserialize objects, use the raw (array) cast, keyed by mangled
-		 * names, from the property slots selected by __sleep */
+		 * names */
 		if (has_unserialize) {
 			for (uint32_t j = 0; j < ce->default_properties_count; j++) {
 				zend_property_info *pj = ce->properties_info_table[j];
 				if (!pj || (pj->flags & ZEND_ACC_STATIC)) continue;
 				zval *pv = OBJ_PROP(obj, pj->offset);
 				if (Z_TYPE_P(pv) == IS_UNDEF) continue;
-				if (sleep_set && !dc_sleep_selects(sleep_set, ce, pj->name)) continue;
 				if (Z_ISREF_P(pv) && Z_REFCOUNT_P(pv) == 1) pv = Z_REFVAL_P(pv);
 				Z_TRY_ADDREF_P(pv);
 				zend_hash_add(Z_ARRVAL(props_zval), pj->name, pv);
 			}
-			goto done_props;
+			goto prepare_props;
 		}
 
 		/* Direct property slot access — compare with prototype slots */
@@ -2607,65 +2980,10 @@ static void dc_process_object(dc_ctx *ctx, zval *src, zval *dst, zval *mask_dst)
 			if (Z_TYPE_P(prop) == IS_UNDEF) {
 				continue;
 			}
-			if (sleep_set && !dc_sleep_selects(sleep_set, ce, prop_info->name)) {
-				continue;
-			}
-			/* Unwrap references with refcount == 1 */
-			if (Z_ISREF_P(prop) && Z_REFCOUNT_P(prop) == 1) {
-				prop = Z_REFVAL_P(prop);
-			}
-
-			/* Unmangle prop_info->name for non-public properties */
-			const char *unmangled_name;
-			size_t unmangled_len;
-			zend_string *prop_name;
-			zend_string *scope_name;
-
-			if (prop_info->flags & ZEND_ACC_PUBLIC) {
-				prop_name = prop_info->name;
-				scope_name = !(prop_info->flags & (ZEND_ACC_PROTECTED_SET | ZEND_ACC_PRIVATE_SET))
-					? ZEND_STANDARD_CLASS_DEF_PTR->name : prop_info->ce->name;
-			} else {
-				const char *class_name_unused;
-				zend_unmangle_property_name_ex(prop_info->name, &class_name_unused, &unmangled_name, &unmangled_len);
-				/* Try to get an existing interned string (free for common names) */
-				prop_name = zend_string_init_existing_interned(unmangled_name, unmangled_len, 0);
-				scope_name = prop_info->ce->name;
-			}
-
-			/* Skip default values — compare with default_properties_table */
-			if (default_props) {
-				uint32_t prop_num = OBJ_PROP_TO_NUM(prop_info->offset);
-				zval *default_val = &default_props[prop_num];
-				if (Z_TYPE_P(default_val) != IS_UNDEF && zend_is_identical(prop, default_val)) {
-					/* Always keep trace properties */
-					bool is_trace = zend_string_equals(prop_name, dc_str_trace)
-						&& (instanceof_function(ce, zend_ce_exception) || instanceof_function(ce, zend_ce_error));
-					if (!is_trace) {
-						if (!(prop_info->flags & ZEND_ACC_PUBLIC)) {
-							zend_string_release(prop_name);
-						}
-						continue;
-					}
-				}
-			}
-
-			/* Add to props_zval[scope][name] = value (COW).
-			 * scope_name is always interned (class entry name). */
-			zval *scope_ht = zend_hash_find_known_hash(Z_ARRVAL(props_zval), scope_name);
-			if (!scope_ht) {
-				zval new_ht;
-				array_init(&new_ht);
-				scope_ht = zend_hash_add_new(Z_ARRVAL(props_zval), scope_name, &new_ht);
-			}
-			Z_TRY_ADDREF_P(prop);
-			zend_hash_add(Z_ARRVAL_P(scope_ht), prop_name, prop);
-			if (!(prop_info->flags & ZEND_ACC_PUBLIC)) {
-				zend_string_release(prop_name);
-			}
+			dc_add_slot_property(Z_ARRVAL(props_zval), ce, prop_info, prop, default_props);
 		}
 
-		goto done_props;
+		goto prepare_props;
 	}
 
 	/* Fallback: (array) cast for objects with custom handlers */
@@ -2677,32 +2995,23 @@ static void dc_process_object(dc_ctx *ctx, zval *src, zval *dst, zval *mask_dst)
 		}
 	}
 
-	/* __unserialize without __serialize: use raw (array) cast as state props,
-	 * the ones selected by __sleep */
+	/* __unserialize without __serialize: use raw (array) cast as state props */
 	if (has_unserialize && array_value) {
 		zval_ptr_dtor(&props_zval);
-		ZVAL_ARR(&props_zval, zend_array_dup(array_value));
-		if (sleep_set) {
-			zend_ulong num_key;
-			zend_string *key;
-			ZEND_HASH_FOREACH_KEY(Z_ARRVAL(props_zval), num_key, key) {
-				if (!key) {
-					zend_hash_index_del(Z_ARRVAL(props_zval), num_key);
-				} else if (!dc_sleep_selects(sleep_set, ce, key)) {
-					zend_hash_del(Z_ARRVAL(props_zval), key);
-				}
-			} ZEND_HASH_FOREACH_END();
-		}
+		ZVAL_ARR(&props_zval, zend_proptable_to_symtable(array_value, true));
 		if (need_release_array_value) {
 			zend_release_properties(array_value);
 		}
-		goto done_props;
+		goto prepare_props;
 	}
 
 build_scoped_props:
 	if (array_value) {
 		HashTable *scope_map = dc_get_scope_map(ctx, ce);
-		HashTable *proto = dc_get_proto(ctx, ce);
+		/* Default values are left out, except the ones returned by
+		 * __serialize(): unserialize() writes its keys in turn, so that the
+		 * last one naming a property wins, even with its default value */
+		HashTable *proto = from_serialize ? NULL : dc_get_proto(ctx, ce);
 		zend_string *arr_key;
 		zval *arr_val;
 		/* Like the slot fast path above, keep shared references, declared or
@@ -2713,7 +3022,8 @@ build_scoped_props:
 			&& handlers->get_properties == zend_std_get_properties
 			&& handlers->write_property == zend_std_write_property;
 
-		ZEND_HASH_FOREACH_STR_KEY_VAL(array_value, arr_key, arr_val) {
+		zend_ulong arr_idx;
+		ZEND_HASH_FOREACH_KEY_VAL(array_value, arr_idx, arr_key, arr_val) {
 			const char *key;
 			size_t key_len;
 			zend_string *prop_name = NULL;
@@ -2730,8 +3040,12 @@ build_scoped_props:
 				arr_val = Z_REFVAL_P(arr_val);
 			}
 
-			if (!arr_key) {
-				continue;
+			if (UNEXPECTED(!arr_key)) {
+				/* An integer key returned by __serialize() names a dynamic property */
+				prop_name = zend_long_to_str((zend_long) arr_idx);
+				prop_name_owned = true;
+				scope_name = ZEND_STANDARD_CLASS_DEF_PTR->name;
+				goto add_prop;
 			}
 			key = ZSTR_VAL(arr_key);
 			key_len = ZSTR_LEN(arr_key);
@@ -2742,16 +3056,12 @@ build_scoped_props:
 				zval *scope_zv = zend_hash_find(scope_map, arr_key);
 				scope_name = scope_zv ? Z_STR_P(scope_zv) : ZEND_STANDARD_CLASS_DEF_PTR->name;
 			} else if (key[1] == '*') {
-				/* Protected: \0*\0name */
+				/* Protected: \0*\0name. An undeclared one, eg returned by
+				 * __serialize(), can only be restored as a dynamic property. */
 				prop_name = zend_string_init_existing_interned(key + 3, key_len - 3, 0);
 				prop_name_owned = true;
 				zval *scope_zv = zend_hash_find(scope_map, prop_name);
-				if (scope_zv) {
-					scope_name = Z_STR_P(scope_zv);
-				} else {
-					zend_property_info *pi = zend_hash_find_ptr(&ce->properties_info, prop_name);
-					scope_name = pi ? pi->ce->name : ce->name;
-				}
+				scope_name = scope_zv ? Z_STR_P(scope_zv) : ZEND_STANDARD_CLASS_DEF_PTR->name;
 			} else {
 				/* Private: \0ClassName\0name */
 				const char *sep = memchr(key + 2, '\0', key_len - 2);
@@ -2765,15 +3075,12 @@ build_scoped_props:
 				prop_name_owned = true;
 			}
 
-			if (sleep_set && !dc_sleep_selects(sleep_set, ce, arr_key)) {
-				goto next_prop;
-			}
-
 			/* Skip default values, except for the call-context-sensitive Throwable
 			 * properties (file, line, trace). For those, the lazily-built prototype
 			 * inherits the same file/line as the actual exception, so the proto
 			 * comparison would spuriously drop them — always emit them instead. */
-			if (!zend_string_equals(arr_key, dc_str_file_mangled)
+			if (proto
+			 && !zend_string_equals(arr_key, dc_str_file_mangled)
 			 && !zend_string_equals(arr_key, dc_str_line_mangled)
 			 && !zend_string_equals(arr_key, dc_str_error_trace_mangled)
 			 && !zend_string_equals(arr_key, dc_str_exception_trace_mangled)) {
@@ -2782,6 +3089,8 @@ build_scoped_props:
 					goto next_prop;
 				}
 			}
+
+add_prop:
 
 			/* Add to scoped properties. The addref pairs with the hash's
 			 * own ref — scope_name is either interned (release is a no-op)
@@ -2817,24 +3126,6 @@ next_prop:
 		}
 	}
 
-done_props:
-	/* __sleep: warn about the names that selected no property, unless they
-	 * name a declared property, eg an uninitialized one. A bare name doesn't
-	 * name the private properties of parent classes. */
-	if (sleep_set) {
-		zend_string *missing;
-		ZEND_HASH_FOREACH_STR_KEY(sleep_set, missing) {
-			zend_property_info *pi = zend_hash_find_ptr(&ce->properties_info, missing);
-			if (!pi || ((pi->flags & ZEND_ACC_PRIVATE) && pi->ce != ce)) {
-				php_error_docref(NULL, E_NOTICE,
-					"serialize(): \"%s\" returned as member variable from __sleep() but does not exist",
-					ZSTR_VAL(missing));
-			}
-		} ZEND_HASH_FOREACH_END();
-		zend_hash_destroy(sleep_set);
-		FREE_HASHTABLE(sleep_set);
-	}
-
 prepare_props:
 	/* Compute and cache the deduped class index */
 	entry->cidx = dc_class_index(ctx, entry->class_name);
@@ -2853,19 +3144,24 @@ prepare_props:
 		entry->prop_mask = (Z_TYPE(prop_mask) == IS_ARRAY) ? Z_ARRVAL(prop_mask) : NULL;
 	} else {
 		/* For normal objects: transpose directly into ctx->properties[scope][name][id]
-		 * and ctx->resolve[scope][name][id] during the walk.
+		 * during the walk, and log the markers for ctx->resolve[scope][name][id].
+		 *
+		 * The slots of all the properties are created before walking their
+		 * values, so that the ones of the objects these values reach come
+		 * after, in the order of their ids, like with the polyfill.
 		 *
 		 * The recursive dc_copy_value() call may grow the same hash tables
 		 * we are inserting into, so we never cache bucket pointers across
 		 * the call: write into a stack-local temp, then re-find and insert
 		 * after the call returns. */
 		uint32_t entry_id = entry->id;
+		uint32_t pending_base = ctx->pending_count;
 
 		zend_string *scope;
 		zval *scope_vals;
+		zend_string *name;
+		zval *raw_val;
 		ZEND_HASH_FOREACH_STR_KEY_VAL(Z_ARRVAL(props_zval), scope, scope_vals) {
-			zend_string *name;
-			zval *raw_val;
 			ZEND_HASH_FOREACH_STR_KEY_VAL(Z_ARRVAL_P(scope_vals), name, raw_val) {
 				if (Z_TYPE(ctx->properties) == IS_UNDEF) {
 					array_init_size(&ctx->properties, 1);
@@ -2880,72 +3176,87 @@ prepare_props:
 				}
 				zval *out_name = dc_name_subarray(Z_ARRVAL_P(out_scope), name, may_have_numeric_names);
 
-				/* Fast path: scalar values can't mutate ctx, so no placeholder,
-				 * no recursion, no re-lookup. This covers IS_UNDEF/IS_NULL/
-				 * IS_FALSE/IS_TRUE/IS_LONG/IS_DOUBLE/IS_STRING (not IS_REFERENCE). */
-				if (EXPECTED(Z_TYPE_P(raw_val) <= IS_STRING)) {
-					zval copy;
+				/* Values that need no walk are final: scalars (IS_UNDEF/IS_NULL/
+				 * IS_FALSE/IS_TRUE/IS_LONG/IS_DOUBLE/IS_STRING, not IS_REFERENCE),
+				 * static arrays and enums, which dc_copy_value() would copy as
+				 * is. Others get a placeholder (IS_NULL, not IS_UNDEF — packed
+				 * arrays treat UNDEF as a tombstone in zend_hash_index_find). */
+				zval copy;
+				if (EXPECTED(Z_TYPE_P(raw_val) <= IS_STRING)
+				 || (Z_TYPE_P(raw_val) == IS_ARRAY && (zend_hash_num_elements(Z_ARRVAL_P(raw_val)) == 0 || dc_array_is_static(Z_ARRVAL_P(raw_val))))
+				 || (Z_TYPE_P(raw_val) == IS_OBJECT && (Z_OBJCE_P(raw_val)->ce_flags & ZEND_ACC_ENUM))) {
 					ZVAL_COPY(&copy, raw_val);
-					zend_hash_index_add_new(Z_ARRVAL_P(out_name), entry_id, &copy);
-					continue;
-				}
-
-				/* Reserve a placeholder (IS_NULL, not IS_UNDEF — packed arrays
-				 * treat UNDEF as a tombstone in zend_hash_index_find). */
-				zval null_ph;
-				ZVAL_NULL(&null_ph);
-				zend_hash_index_add_new(Z_ARRVAL_P(out_name), entry_id, &null_ph);
-
-				/* Recurse into a stack-local temp, then re-find and insert. */
-				zval temp_dst;
-				ZVAL_UNDEF(&temp_dst);
-				zval mask_slot_zv;
-				ZVAL_UNDEF(&mask_slot_zv);
-				dc_copy_value(ctx, raw_val, &temp_dst, &mask_slot_zv);
-				if (UNEXPECTED(EG(exception))) {
-					zval_ptr_dtor(&temp_dst);
-					zval_ptr_dtor(&mask_slot_zv);
-					zval_ptr_dtor(&props_zval);
-					return;
-				}
-				dc_mask_cleanup(&mask_slot_zv);
-
-				/* A reference first seen here recorded the temps above as the
-				 * slots to unwrap it into if it turns out unshared; they don't
-				 * outlive this iteration, so locate its slots by key instead. */
-				if (UNEXPECTED(Z_ISREF_P(raw_val))) {
-					zval *zidx = zend_hash_index_find(&ctx->ref_map, (zend_ulong)(uintptr_t)Z_REF_P(raw_val));
-					dc_ref_entry *re = &ctx->refs[Z_LVAL_P(zidx)];
-					if (re->tree_pos == &temp_dst) {
-						re->tree_pos = NULL;
-						re->mask_slot = NULL;
-						re->prop_scope = zend_string_copy(scope);
-						re->prop_name = zend_string_copy(name);
-						re->prop_obj_id = entry_id;
-						re->prop_may_be_numeric = may_have_numeric_names;
+				} else {
+					ZVAL_NULL(&copy);
+					if (UNEXPECTED(ctx->pending_count == ctx->pending_cap)) {
+						ctx->pending_cap *= 2;
+						if (ctx->pending == ctx->pending_inline) {
+							ctx->pending = safe_emalloc(ctx->pending_cap, sizeof(dc_pending_entry), 0);
+							memcpy(ctx->pending, ctx->pending_inline, sizeof(ctx->pending_inline));
+						} else {
+							ctx->pending = safe_erealloc(ctx->pending, ctx->pending_cap, sizeof(dc_pending_entry), 0);
+						}
 					}
+					dc_pending_entry *pe = &ctx->pending[ctx->pending_count++];
+					pe->scope = scope;
+					pe->name = name;
+					pe->val = raw_val;
 				}
-
-				out_scope = zend_hash_find_known_hash(Z_ARRVAL(ctx->properties), scope);
-				out_name = dc_name_subarray_find(Z_ARRVAL_P(out_scope), name, may_have_numeric_names);
-				zval *dst_slot = zend_hash_index_find(Z_ARRVAL_P(out_name), entry_id);
-				ZVAL_COPY_VALUE(dst_slot, &temp_dst);
-
-				if (Z_TYPE(mask_slot_zv) != IS_UNDEF && Z_TYPE(mask_slot_zv) != IS_NULL) {
-					if (Z_TYPE(ctx->resolve) == IS_UNDEF) {
-						array_init_size(&ctx->resolve, 1);
-					}
-					zval *out_rscope = zend_hash_find_known_hash(Z_ARRVAL(ctx->resolve), scope);
-					if (!out_rscope) {
-						zval new_ht;
-						array_init_size(&new_ht, 1);
-						out_rscope = zend_hash_add_new(Z_ARRVAL(ctx->resolve), scope, &new_ht);
-					}
-					zval *out_rname = dc_name_subarray(Z_ARRVAL_P(out_rscope), name, may_have_numeric_names);
-					zend_hash_index_add_new(Z_ARRVAL_P(out_rname), entry_id, &mask_slot_zv);
-				}
+				zend_hash_index_add_new(Z_ARRVAL_P(out_name), entry_id, &copy);
 			} ZEND_HASH_FOREACH_END();
 		} ZEND_HASH_FOREACH_END();
+
+		/* The walk pushes the values of nested objects past pending_end, and
+		 * pops them before returning, but can move ctx->pending */
+		uint32_t pending_end = ctx->pending_count;
+		for (uint32_t p = pending_base; p < pending_end; p++) {
+			scope = ctx->pending[p].scope;
+			name = ctx->pending[p].name;
+			raw_val = ctx->pending[p].val;
+
+			/* Recurse into a stack-local temp, then re-find and insert. */
+			zval temp_dst;
+			ZVAL_UNDEF(&temp_dst);
+			zval mask_slot_zv;
+			ZVAL_UNDEF(&mask_slot_zv);
+			dc_copy_value(ctx, raw_val, &temp_dst, &mask_slot_zv);
+			if (UNEXPECTED(EG(exception))) {
+				zval_ptr_dtor(&temp_dst);
+				zval_ptr_dtor(&mask_slot_zv);
+				ctx->pending_count = pending_base;
+				zval_ptr_dtor(&props_zval);
+				return;
+			}
+			dc_mask_cleanup(&mask_slot_zv);
+
+			zval *out_scope = zend_hash_find_known_hash(Z_ARRVAL(ctx->properties), scope);
+			zval *out_name = dc_name_subarray_find(Z_ARRVAL_P(out_scope), name, may_have_numeric_names);
+			zval *dst_slot = zend_hash_index_find(Z_ARRVAL_P(out_name), entry_id);
+			ZVAL_COPY_VALUE(dst_slot, &temp_dst);
+
+			uint32_t log_idx = UINT32_MAX;
+			if (Z_TYPE(mask_slot_zv) != IS_UNDEF && Z_TYPE(mask_slot_zv) != IS_NULL) {
+				log_idx = dc_rlog_add(ctx, entry, scope, name, may_have_numeric_names, &mask_slot_zv);
+			}
+
+			/* A reference first seen here recorded the temps above as the
+			 * slots to unwrap it into if it turns out unshared; they don't
+			 * outlive this iteration, so locate its slots by key instead. */
+			if (UNEXPECTED(Z_ISREF_P(raw_val))) {
+				zval *zidx = zend_hash_index_find(&ctx->ref_map, (zend_ulong)(uintptr_t)Z_REF_P(raw_val));
+				dc_ref_entry *re = &ctx->refs[Z_LVAL_P(zidx)];
+				if (re->tree_pos == &temp_dst) {
+					re->tree_pos = NULL;
+					re->mask_slot = NULL;
+					re->prop_scope = zend_string_copy(scope);
+					re->prop_name = zend_string_copy(name);
+					re->prop_obj_id = entry_id;
+					re->prop_log_idx = log_idx;
+					re->prop_may_be_numeric = may_have_numeric_names;
+				}
+			}
+		}
+		ctx->pending_count = pending_base;
 
 		zval_ptr_dtor(&props_zval);
 		entry->props = NULL;
@@ -3220,8 +3531,8 @@ static void dc_build_output(dc_ctx *ctx, zval *prepared, zval *top_mask, zval *r
 }
 
 /* Unwrap an unshared ref that was a direct property value: put its value
- * back in ctx->properties[scope][name][id], and its mask, if any, in
- * ctx->resolve[scope][name][id] in place of the hard-ref marker. */
+ * back in ctx->properties[scope][name][id], and its mask, if any, in its
+ * resolve log entry in place of the hard-ref marker. */
 static void dc_unwrap_prop_ref(dc_ctx *ctx, dc_ref_entry *re)
 {
 	zval *scope_zv = zend_hash_find(Z_ARRVAL(ctx->properties), re->prop_scope);
@@ -3230,27 +3541,10 @@ static void dc_unwrap_prop_ref(dc_ctx *ctx, dc_ref_entry *re)
 	zval_ptr_dtor(slot);
 	ZVAL_COPY(slot, &re->cur_value);
 
-	scope_zv = zend_hash_find(Z_ARRVAL(ctx->resolve), re->prop_scope);
-	name_zv = dc_name_subarray_find(Z_ARRVAL_P(scope_zv), re->prop_name, re->prop_may_be_numeric);
-	if (Z_TYPE(re->cur_mask) != IS_UNDEF) {
-		slot = zend_hash_index_find(Z_ARRVAL_P(name_zv), re->prop_obj_id);
+	if (re->prop_log_idx != UINT32_MAX) {
+		slot = &ctx->rlog[re->prop_log_idx].mask;
 		zval_ptr_dtor(slot);
 		ZVAL_COPY(slot, &re->cur_mask);
-		return;
-	}
-
-	zend_hash_index_del(Z_ARRVAL_P(name_zv), re->prop_obj_id);
-	if (zend_hash_num_elements(Z_ARRVAL_P(name_zv))) {
-		return;
-	}
-	zend_ulong idx;
-	if (re->prop_may_be_numeric && ZEND_HANDLE_NUMERIC(re->prop_name, idx)) {
-		zend_hash_index_del(Z_ARRVAL_P(scope_zv), idx);
-	} else {
-		zend_hash_del(Z_ARRVAL_P(scope_zv), re->prop_name);
-	}
-	if (!zend_hash_num_elements(Z_ARRVAL_P(scope_zv))) {
-		zend_hash_del(Z_ARRVAL(ctx->resolve), re->prop_scope);
 	}
 }
 
@@ -3274,8 +3568,7 @@ PHP_FUNCTION(deepclone_to_array)
 	 * returned wrapped in ['value' => $resource], which is no longer a pure
 	 * array and silently breaks downstream serializers. */
 	if (UNEXPECTED(Z_TYPE_P(value) == IS_RESOURCE)) {
-		zend_throw_exception_ex(dc_ce_not_instantiable_exception, 0,
-			"%s resource", zend_rsrc_list_get_rsrc_type(Z_RES_P(value)));
+		dc_throw_resource(value);
 		RETURN_THROWS();
 	}
 
@@ -3342,6 +3635,8 @@ PHP_FUNCTION(deepclone_to_array)
 			}
 		}
 	}
+
+	dc_rlog_flush(&ctx);
 
 	/* Strip the NULL placeholders that dc_copy_array seeded and any slots that
 	 * the unshared-ref unwrap pass cleared, wherever masks live: the top-level

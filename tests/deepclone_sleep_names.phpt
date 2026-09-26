@@ -246,26 +246,26 @@ var_dump(deepclone_from_array(@deepclone_to_array($o))->keys);
 ?>
 --EXPECT--
 parent private, bare: {"stdClass":{"pub":["changed"]}}
-  deepclone_to_array(): serialize(): "secret" returned as member variable from __sleep() but does not exist
+  serialize(): "secret" returned as member variable from __sleep() but does not exist
 parent private, mangled: {"Base":{"secret":["changed"]},"stdClass":{"pub":["changed"]}}
 protected, bare: {"Base":{"prot":["changed"]}}
 protected, mangled: {"Base":{"prot":["changed"]}}
 same private, bare: {"SamePrivate":{"secret":["child"]}}
 same private from a child class, bare: null
-  deepclone_to_array(): serialize(): "secret" returned as member variable from __sleep() but does not exist
+  serialize(): "secret" returned as member variable from __sleep() but does not exist
 same private, parent mangled: {"Base":{"secret":["parent"]}}
-same private, bare and parent mangled: {"Base":{"secret":["parent"]},"SamePrivateBoth":{"secret":["child"]}}
+same private, bare and parent mangled: {"SamePrivateBoth":{"secret":["child"]},"Base":{"secret":["parent"]}}
 child public, bare: {"stdClass":{"secret":["child"]}}
 child protected, bare: {"ChildProtected":{"secret":["child"]}}
 dynamic: {"stdClass":{"dyn":["dynamic"]}}
-  deepclone_to_array(): serialize(): "secret" returned as member variable from __sleep() but does not exist
-  deepclone_to_array(): serialize(): "missing" returned as member variable from __sleep() but does not exist
+  serialize(): "secret" returned as member variable from __sleep() but does not exist
+  serialize(): "missing" returned as member variable from __sleep() but does not exist
 dynamic named like a parent private: {"Base":{"secret":["dynamic"]},"stdClass":{"dyn":["dynamic"]}}
-  deepclone_to_array(): serialize(): "missing" returned as member variable from __sleep() but does not exist
+  serialize(): "missing" returned as member variable from __sleep() but does not exist
 own private, bare and mangled: {"OwnPrivate":{"a":["changed"],"b":["changed"]}}
 private of the class declaring __sleep(): {"SleepingParent":{"secret":["changed"]}}
 private of the parent declaring __sleep(): null
-  deepclone_to_array(): serialize(): "secret" returned as member variable from __sleep() but does not exist
-__unserialize(): {"1":[0,{"\u0000*\u0000prot":"changed","pub":"changed","\u0000Unserializing\u0000own":"changed"}]}
-  deepclone_to_array(): serialize(): "secret" returned as member variable from __sleep() but does not exist
+  serialize(): "secret" returned as member variable from __sleep() but does not exist
+__unserialize(): {"1":[0,{"pub":"changed","\u0000*\u0000prot":"changed","\u0000Unserializing\u0000own":"changed"}]}
+  serialize(): "secret" returned as member variable from __sleep() but does not exist
 string(30) "~*~prot,~Unserializing~own,pub"
