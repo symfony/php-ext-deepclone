@@ -5,6 +5,17 @@ All notable changes to this extension will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- `deepclone_from_array()` reports invalid ids of `objectMeta` and
+  `properties` by their key, like the polyfill does: string keys were reported
+  by their hash, and negative ones as unsigned.
+- `deepclone_from_array()` rejects mask entries that match no value, and
+  `refMasks` in payloads that have no `refs`, like the polyfill does, instead
+  of ignoring them.
+
 ## [0.8.5] - 2026-09-23
 
 ### Added
