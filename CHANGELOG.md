@@ -5,6 +5,27 @@ All notable changes to this extension will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- Classes that refuse serialization are rejected whatever methods they
+  declare, as `serialize()` does: subclasses of `SplFileInfo` and of the other
+  internal classes that refuse it got through when they declared `__wakeup()`
+  or `__unserialize()`. Anonymous classes still round-trip when they declare
+  one of these, like throwables do.
+- `deepclone_from_array()` rejects the classes that refuse serialization, as
+  `unserialize()` does, instead of creating objects of them: a `Closure` or a
+  `Generator` created that way crashed on first use.
+- `deepclone_hydrate()` rejects the user classes that refuse serialization,
+  like it does for internal ones.
+- `deepclone_from_array()` throws `DeepClone\NotInstantiableException` for
+  abstract classes, interfaces, traits and enums, like `deepclone_hydrate()`
+  and the polyfill do, instead of an `Error`.
+- `deepclone_hydrate()` words its `DeepClone\NotInstantiableException`
+  messages `Type "X" is not instantiable.` like the other functions and the
+  polyfill do, instead of `Class "X" is not instantiable.`.
+
 ## [0.8.5] - 2026-09-23
 
 ### Added
