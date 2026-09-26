@@ -166,6 +166,14 @@ $ao->__unserialize([ArrayObject::ARRAY_AS_PROPS, ['x' => 1], []]);
 `InvalidArgumentException`. Malformed input and classes missing from
 `$allowed_classes` throw `ValueError`.
 
+`deepclone_to_array()` and `deepclone_hydrate()` also reject internal classes
+that keep their state out of their properties and declare no serialization
+API, eg `Redis` or `Imagick`: `unserialize()` and the polyfill create them
+without that state, but some crash when used that way. Only
+`MultipleIterator`, heaps before PHP 8.5 and the classes of the dom, xsl,
+mysqli and soap extensions, eg `DOMNodeList`, are created like `unserialize()`
+does.
+
 ## Installation
 
 The extension requires PHP 8.2+, NTS or ZTS, 32 or 64-bit. Install it with
