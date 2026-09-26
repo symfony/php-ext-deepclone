@@ -66,6 +66,7 @@ class SleepPrivate {
 
 $o = new SleepPrivate();
 $o->setAll('night', 'afternoon', 'morning');
+// Like serialize(), warns that "\0*\0foo" selects foo again
 $d = deepclone_to_array($o);
 var_dump(isset($d['properties']['stdClass']['good']));
 var_dump(isset($d['properties']['SleepPrivate']['foo']));
@@ -104,11 +105,13 @@ bool(true)
 bool(true)
 bool(true)
 bool(true)
+
+%s: serialize(): "" is returned from __sleep() multiple times in %s on line %d
 bool(true)
 bool(true)
 bool(true)
 
-Notice: deepclone_to_array(): serialize(): "secret" returned as member variable from __sleep() but does not exist in %s on line %d
+Warning: serialize(): "secret" returned as member variable from __sleep() but does not exist in %s on line %d
 bool(true)
 bool(true)
 Done

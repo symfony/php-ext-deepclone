@@ -96,5 +96,5 @@ bool(true)
 bool(true)
 {"DupSerialize":{"b":["bare"]}}
 bool(true)
-[]
+{"DupSerialize":{"b":["default"]}}
 bool(true)
