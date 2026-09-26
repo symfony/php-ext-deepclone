@@ -66,6 +66,7 @@ class SleepPrivate {
 
 $o = new SleepPrivate();
 $o->setAll('night', 'afternoon', 'morning');
+// Like serialize(), warns that "\0*\0foo" selects foo again
 $d = deepclone_to_array($o);
 var_dump(isset($d['properties']['stdClass']['good']));
 var_dump(isset($d['properties']['SleepPrivate']['foo']));
@@ -74,6 +75,7 @@ var_dump(isset($d['properties']['SleepPrivate']['bar']));
 // ── __sleep inherited-private exclusion ──
 class ParentSleep {
     private string $secret = '';
+    public function setSecret(string $v): void { $this->secret = $v; }
 }
 class ChildSleep extends ParentSleep {
     public string $pub = '';
@@ -83,6 +85,8 @@ class ChildSleep extends ParentSleep {
 
 $o = new ChildSleep();
 $o->pub = 'visible';
+// A non-default value, as default ones are skipped anyway
+$o->setSecret('changed');
 $d = deepclone_to_array($o);
 var_dump(isset($d['properties']['stdClass']['pub']));
 // 'secret' is a private property of ParentSleep, unmangled "secret"
@@ -101,9 +105,13 @@ bool(true)
 bool(true)
 bool(true)
 bool(true)
+
+%s: serialize(): "" is returned from __sleep() multiple times in %s on line %d
 bool(true)
 bool(true)
 bool(true)
+
+Warning: serialize(): "secret" returned as member variable from __sleep() but does not exist in %s on line %d
 bool(true)
 bool(true)
 Done

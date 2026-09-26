@@ -5,6 +5,51 @@ All notable changes to this extension will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- `deepclone_to_array()` lists the properties of objects and their markers
+  object by object in the order of their ids, and the properties selected by
+  `__sleep()` in the order it returns them, like the polyfill: both produce
+  the same payloads now. `__unserialize()` gets the keys in the order of
+  `__sleep()`, like with `unserialize()`, and objects with `__sleep()` are
+  exported faster, eg 29% fewer instructions for Doctrine's class metadata.
+- Default values returned by `__serialize()` without `__unserialize()` are
+  kept: `unserialize()` writes its keys in turn, and a property named by two
+  keys kept the value of the first one when the second held the default.
+
+### Fixed
+
+- `deepclone_to_array()` resolves the names returned by `__sleep()` like
+  `serialize()`: a bare name selected the private property of a parent class
+  by that name, instead of the same-named property of the object's class or,
+  when there's none, nothing but a "does not exist" notice. `__sleep()` was
+  also ignored on classes that declare `__unserialize()`, and returning both
+  `'x'` and `"\0ParentClass\0x"` exported only one of two same-named private
+  properties.
+- Once the property table of an object got built, eg by `foreach`, a public or
+  protected property named like a private property of a parent class was
+  exported in the scope of that parent, and its value lost.
+- `deepclone_to_array()` keeps the last of two keys resolving to the same
+  property, like `unserialize()` does: a dynamic property named like a private
+  property of a parent class, which `unserialize()` writes to that private
+  property, or the bare and mangled names of a property returned by
+  `__serialize()` without `__unserialize()`. The first one was kept, and debug
+  builds of PHP aborted on the duplicate key.
+- `__sleep()` triggers the warnings of `serialize()`, at the same level: for
+  names returned multiple times, for unset untyped properties and for names
+  that aren't strings. The warnings lost their `deepclone_to_array():` prefix,
+  and the one about `__sleep()` not returning an array names the class.
+- Integer keys returned by `__serialize()` without `__unserialize()` were
+  dropped, and undeclared protected ones produced a payload that
+  `deepclone_from_array()` rejected: both are exported as dynamic properties.
+- Closed resources are reported as `Unknown resource` instead of
+  `(null) resource`, and top-level resources with the message of nested ones.
+- The errors about invalid allowed classes name the `$allowed_classes`
+  argument, and the one about named closures of `deepclone_to_array()`
+  matches the one of `deepclone_from_array()`.
+
 ## [0.8.5] - 2026-09-23
 
 ### Added
