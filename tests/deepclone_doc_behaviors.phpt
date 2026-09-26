@@ -109,7 +109,7 @@ foreach ($nonInstantiable as $label => $value) {
 //    clone — e.g. an SplFileInfo with no path, a ZipArchive with no archive,
 //    a PDO with no connection. We catch them up-front instead of returning
 //    a corrupt clone. Only test classes from required extensions to keep
-//    the suite portable; the same logic catches PDO, ZipArchive, mysqli_*,
+//    the suite portable; the same logic catches PDO, ZipArchive, Redis,
 //    SplFileObject, etc. when those extensions are loaded.
 $hiddenState = [
     'SplFileInfo' => new SplFileInfo('/etc/hostname'),

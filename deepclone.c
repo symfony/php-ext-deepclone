@@ -366,8 +366,12 @@ struct _dc_ctx {
 
 /* Internal classes that have no serialization API but that unserialize()
  * creates all the same, without their internal state, like their user
- * subclasses: MultipleIterator without its iterators, and heaps empty with
- * their default flags before PHP 8.5, which serializes their contents. */
+ * subclasses: MultipleIterator without its iterators, heaps empty with their
+ * default flags before PHP 8.5, which serializes their contents, and the
+ * classes of the dom, xsl, mysqli and soap extensions, eg an empty
+ * DOMNodeList or a mysqli without its connection. Classes of other
+ * extensions are left out: some crash when used, or even destroyed, without
+ * their constructor. */
 static bool dc_unserializes_stateless(zend_class_entry *ce)
 {
 #if PHP_VERSION_ID < 80500
@@ -376,7 +380,13 @@ static bool dc_unserializes_stateless(zend_class_entry *ce)
 	}
 #endif
 
-	return instanceof_function(ce, spl_ce_MultipleIterator);
+	if (instanceof_function(ce, spl_ce_MultipleIterator)) {
+		return true;
+	}
+
+	const char *module = ce->info.internal.module ? ce->info.internal.module->name : NULL;
+
+	return module && (!strcmp(module, "dom") || !strcmp(module, "xsl") || !strcmp(module, "mysqli") || !strcmp(module, "soap"));
 }
 
 
