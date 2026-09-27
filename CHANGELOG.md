@@ -94,6 +94,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `deepclone_from_array()` rejects markers of masks that match no value, and
   of `refMasks` that match no reference, like the polyfill does, instead of
   ignoring them.
+- `deepclone_from_array()` rejects the internal classes that keep their state
+  out of their properties, like `deepclone_to_array()` and
+  `deepclone_hydrate()` do, instead of creating them without that state when a
+  payload names them: some, like `Relay\Table`, crash PHP that way. This
+  includes `IteratorIterator` and the other internal iterators wrapping
+  another one.
+- The three functions reject the user classes that extend such internal
+  classes without declaring a serialization API, eg a subclass of
+  `RedisCluster`, which crashed PHP the same way.
 
 ## [0.8.5] - 2026-09-23
 

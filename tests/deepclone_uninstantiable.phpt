@@ -31,8 +31,8 @@ foreach (['AbstractThing', 'Thing', 'ThingTrait', 'ThingEnum'] as $class) {
 $payload = ['classes' => 'AbstractThing', 'objectMeta' => 1, 'prepared' => 0, 'properties' => ['stdClass' => ['f' => [[null, 'strlen']]]], 'resolve' => ['stdClass' => ['f' => [0]]]];
 check('from_array lazy AbstractThing', fn () => deepclone_from_array($payload, null, true));
 
-// unserialize() creates the classes whose state serialize() loses, and so
-// does deepclone_from_array(), while deepclone_to_array() rejects them
+// unserialize() creates the classes whose state serialize() loses, and their
+// user subclasses, while the three functions reject them
 foreach (['IteratorIterator', 'LimitIterator', 'UserIterator'] as $class) {
     check("unserialize $class", fn () => unserialize('O:'.strlen($class).':"'.$class.'":0:{}'));
     check("from_array $class", fn () => deepclone_from_array(['classes' => $class, 'objectMeta' => 1, 'prepared' => 0]));
@@ -52,11 +52,11 @@ from_array ThingEnum: DeepClone\NotInstantiableException: Type "ThingEnum" is no
 hydrate ThingEnum: DeepClone\NotInstantiableException: Type "ThingEnum" is not instantiable.
 from_array lazy AbstractThing: DeepClone\NotInstantiableException: Type "AbstractThing" is not instantiable.
 unserialize IteratorIterator: IteratorIterator
-from_array IteratorIterator: IteratorIterator
+from_array IteratorIterator: DeepClone\NotInstantiableException: Type "IteratorIterator" is not instantiable.
 unserialize LimitIterator: LimitIterator
-from_array LimitIterator: LimitIterator
+from_array LimitIterator: DeepClone\NotInstantiableException: Type "LimitIterator" is not instantiable.
 unserialize UserIterator: UserIterator
-from_array UserIterator: UserIterator
+from_array UserIterator: DeepClone\NotInstantiableException: Type "UserIterator" is not instantiable.
 to_array IteratorIterator: DeepClone\NotInstantiableException: Type "IteratorIterator" is not instantiable.
 hydrate IteratorIterator: DeepClone\NotInstantiableException: Type "IteratorIterator" is not instantiable.
-hydrate UserIterator: UserIterator
+hydrate UserIterator: DeepClone\NotInstantiableException: Type "UserIterator" is not instantiable.

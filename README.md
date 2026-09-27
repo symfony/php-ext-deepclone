@@ -171,11 +171,13 @@ classes, interfaces, traits and enums, and throw
 `InvalidArgumentException`. Malformed input and classes missing from
 `$allowed_classes` throw `ValueError`.
 
-`deepclone_to_array()` and `deepclone_hydrate()` also reject internal classes
-that keep their state out of their properties and declare no serialization
-API, eg `Redis` or `Imagick`: `unserialize()` and the polyfill create them
-without that state, but some crash when used that way. Only
-`MultipleIterator`, heaps before PHP 8.5 and the classes of the dom, xsl,
+All three functions also reject internal classes that keep their state out of
+their properties and declare no serialization API, eg `Redis` or `Imagick`,
+and the user classes that extend them without declaring one: `unserialize()`
+creates them without that state, but some crash when used, or even destroyed,
+that way. The polyfill can't tell these classes apart and
+rejects the ones of the extensions it knows, eg zip, redis, relay or imagick.
+Only `MultipleIterator`, heaps before PHP 8.5 and the classes of the dom, xsl,
 mysqli and soap extensions, eg `DOMNodeList`, are created like `unserialize()`
 does.
 
