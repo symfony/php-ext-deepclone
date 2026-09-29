@@ -3789,6 +3789,25 @@ static ZEND_COLD zend_never_inline bool dc_resolve_unmatched_mask(zval *mask, zv
 	return !EG(exception);
 }
 
+/* Check the resolve markers of a property that match no value of it, like
+ * dc_resolve_unmatched_mask() does. */
+static ZEND_COLD zend_never_inline bool dc_resolve_unmatched_markers(HashTable *resolve_ids, HashTable *id_values, zval *objects, uint32_t num_objects, HashTable *refs, HashTable *allowed_set)
+{
+	zend_ulong id;
+	zend_string *key;
+	zval *marker;
+
+	ZEND_HASH_FOREACH_KEY_VAL(resolve_ids, id, key, marker) {
+		/* Values are keyed by object id, never by a string */
+		if ((key || !zend_hash_index_exists(id_values, id))
+		 && !dc_resolve_unmatched_mask(marker, objects, num_objects, refs, allowed_set)) {
+			return false;
+		}
+	} ZEND_HASH_FOREACH_END();
+
+	return true;
+}
+
 /*
  * Resolve a value using its mask marker. Writes the resolved value to *retval.
  * Throws \ValueError on malformed input — callers must check EG(exception)
@@ -5542,6 +5561,7 @@ PHP_FUNCTION(deepclone_from_array)
 
 				zend_ulong obj_id;
 				zval *prop_val;
+				uint32_t matched_markers = 0;
 				ZEND_HASH_FOREACH_NUM_KEY_VAL(Z_ARRVAL_P(id_values), obj_id, prop_val) {
 					if (UNEXPECTED(obj_id >= num_objects)) {
 						EG(fake_scope) = old_scope;
@@ -5549,6 +5569,7 @@ PHP_FUNCTION(deepclone_from_array)
 						goto cleanup;
 					}
 					if (is_ghost && is_ghost[obj_id]) {
+						matched_markers += resolve_ids && zend_hash_index_exists(resolve_ids, obj_id);
 						/* Created as a lazy ghost: its slots are replayed by
 						 * the initializer. Skip by creation-time flag, never
 						 * by current lazy state; user code triggered from an
@@ -5569,6 +5590,7 @@ PHP_FUNCTION(deepclone_from_array)
 					zval final_val;
 					zval *marker = resolve_ids ? zend_hash_index_find(resolve_ids, obj_id) : NULL;
 					if (marker) {
+						matched_markers++;
 						ZVAL_UNDEF(&final_val);
 						dc_resolve(prop_val, marker, objects, num_objects, refs, allowed_set, &final_val);
 						if (EG(exception)) {
@@ -5641,6 +5663,14 @@ PHP_FUNCTION(deepclone_from_array)
 						}
 					}
 				} ZEND_HASH_FOREACH_END();
+
+				/* Markers that match no value are checked as if they marked
+				 * null, like in masks */
+				if (UNEXPECTED(resolve_ids && matched_markers < zend_hash_num_elements(resolve_ids))
+				 && !dc_resolve_unmatched_markers(resolve_ids, Z_ARRVAL_P(id_values), objects, num_objects, refs, allowed_set)) {
+					EG(fake_scope) = old_scope;
+					goto cleanup;
+				}
 
 				if (numeric_prop_tmp) {
 					zend_string_release(numeric_prop_tmp);
