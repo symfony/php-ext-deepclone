@@ -75,6 +75,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   created without their internal state, the heaps empty with their default
   flags before PHP 8.5, and `MultipleIterator` without its iterators. Their
   user subclasses already were.
+- The classes of the dom, xsl, mysqli and soap extensions that have no
+  serialization API, like `DOMNodeList`, `XSLTProcessor`, `mysqli` or, on PHP
+  8.6, `SoapClient`, are
+  handled like `unserialize()` does too, instead of being rejected as not
+  instantiable: they are created without their internal state. Classes of
+  other extensions in that case, like `Redis` or `Imagick`, are still
+  rejected, as some of them crash when used without their constructor.
 - `deepclone_from_array()` throws `DeepClone\NotInstantiableException` for
   abstract classes, interfaces, traits and enums, like `deepclone_hydrate()`
   and the polyfill do, instead of an `Error`.
