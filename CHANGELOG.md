@@ -103,6 +103,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The three functions reject the user classes that extend such internal
   classes without declaring a serialization API, eg a subclass of
   `RedisCluster`, which crashed PHP the same way.
+- `deepclone_to_array()` keeps the marker of closures held by `&`
+  references: named ones, and the ones declared in constant expressions, came
+  back as the arrays that encode them.
 
 ## [0.8.5] - 2026-09-23
 
