@@ -3474,22 +3474,17 @@ static void dc_build_output(dc_ctx *ctx, zval *prepared, zval *top_mask, zval *r
 		zval *orig = &re->orig_type;
 		zval *cur = &re->cur_value;
 
-		if (Z_TYPE_P(orig) == IS_OBJECT && !(Z_OBJCE_P(orig)->ce_flags & ZEND_ACC_ENUM)) {
+		zval *pooled;
+		if (Z_TYPE_P(orig) == IS_OBJECT && !(Z_OBJCE_P(orig)->ce_flags & ZEND_ACC_ENUM)
+		 && (pooled = zend_hash_index_find(&ctx->object_pool, Z_OBJ_HANDLE_P(orig)))) {
 			/* Object ref */
-			uint32_t handle = Z_OBJ_HANDLE_P(orig);
-			zval *pooled = zend_hash_index_find(&ctx->object_pool, handle);
-			if (pooled) {
-				dc_pool_entry *pe = (dc_pool_entry *)Z_PTR_P(pooled);
-				zval zid;
-				ZVAL_LONG(&zid, pe->id);
-				zend_hash_index_add_new(Z_ARRVAL(refs_out), ref_id, &zid);
-				zval marker;
-				ZVAL_TRUE(&marker);
-				zend_hash_index_add_new(Z_ARRVAL(ref_masks_out), ref_id, &marker);
-			} else {
-				Z_TRY_ADDREF_P(cur);
-				zend_hash_index_add_new(Z_ARRVAL(refs_out), ref_id, cur);
-			}
+			dc_pool_entry *pe = (dc_pool_entry *)Z_PTR_P(pooled);
+			zval zid;
+			ZVAL_LONG(&zid, pe->id);
+			zend_hash_index_add_new(Z_ARRVAL(refs_out), ref_id, &zid);
+			zval marker;
+			ZVAL_TRUE(&marker);
+			zend_hash_index_add_new(Z_ARRVAL(ref_masks_out), ref_id, &marker);
 		} else if (Z_TYPE_P(orig) == IS_OBJECT && (Z_OBJCE_P(orig)->ce_flags & ZEND_ACC_ENUM)) {
 			/* UnitEnum ref — synthesize "Class::Case" once per occurrence.
 			 * If the same combined string happens to be interned already
@@ -3513,8 +3508,10 @@ static void dc_build_output(dc_ctx *ctx, zval *prepared, zval *top_mask, zval *r
 			ZVAL_INTERNED_STR(&marker, zend_string_init_interned("e", 1, 0));
 			zend_hash_index_add_new(Z_ARRVAL(ref_masks_out), ref_id, &marker);
 		} else {
-			/* Scalar or array ref: use saved cur_value and cur_mask, which
-			 * is UNDEF or NULL when the value needs no mask */
+			/* Scalar, array or closure ref: use saved cur_value and
+			 * cur_mask, which is UNDEF or NULL when the value needs no mask.
+			 * Closures aren't pooled: their mask tells how they're encoded,
+			 * by name or by declaration site. */
 			Z_TRY_ADDREF_P(cur);
 			zend_hash_index_add_new(Z_ARRVAL(refs_out), ref_id, cur);
 			if (Z_TYPE(re->cur_mask) > IS_NULL) {
