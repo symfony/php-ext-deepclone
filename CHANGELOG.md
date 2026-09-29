@@ -31,6 +31,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the polyfill do: `null` on a non-nullable one and a scalar on one typed with
   a backed enum throw a `TypeError` instead of leaving it uninitialized or
   casting the scalar, which `deepclone_hydrate()` still does.
+- Named closures are created like `Closure::fromCallable()` does: over an
+  inherited method, they got the scope of the class of their object, where
+  the private properties of the parent class aren't reachable, and over a
+  static method, `deepclone_to_array()` exported the class that declares it
+  instead of the one it's called on, which `static::` resolves to.
+- `deepclone_from_array()` rejects named closures over a non-static method
+  without an object, or over a method of a class that their object or class
+  doesn't extend, instead of creating them, and throws when it doesn't find
+  the function of a top-level one, instead of returning `null`. It creates the
+  ones over a method that `__call()` or `__callStatic()` handles, instead of
+  returning `null`.
+- On PHP 8.4+, `deepclone_from_array()` checks the shape of the named closures
+  that lazy objects hold right away, instead of when these are first used.
 
 ## [0.8.6] - 2026-09-29
 
