@@ -81,6 +81,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `deepclone_hydrate()` words its `DeepClone\NotInstantiableException`
   messages `Type "X" is not instantiable.` like the other functions and the
   polyfill do, instead of `Class "X" is not instantiable.`.
+- `deepclone_from_array()` reports invalid ids of `objectMeta` and
+  `properties` by their key, like the polyfill does: string keys were reported
+  by their hash, and negative ones as unsigned.
+- `deepclone_from_array()` rejects markers of masks that match no value, and
+  of `refMasks` that match no reference, like the polyfill does, instead of
+  ignoring them.
 
 ## [0.8.5] - 2026-09-23
 
