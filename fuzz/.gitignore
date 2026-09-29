@@ -1,0 +1,11 @@
+deepclone_from_array_fuzzer*
+!deepclone_from_array_fuzzer.cc
+.libs/
+artifacts/*
+!artifacts/.gitkeep
+work/
+corpus/*
+!corpus/from_array/
+corpus/from_array/*
+!corpus/from_array/.gitkeep
+*.profraw
