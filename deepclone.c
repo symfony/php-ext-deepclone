@@ -196,6 +196,19 @@ static zend_always_inline zend_object *dc_closure_this(zval *closure)
 	return Z_TYPE_P((zval *) this_ptr) == IS_OBJECT ? Z_OBJ_P((zval *) this_ptr) : NULL;
 }
 
+/* The class a closure is called on, eg CM2 for CM2::m(...) where m() is
+ * declared by its parent CM */
+static zend_class_entry *dc_closure_called_scope(zval *closure)
+{
+	zend_class_entry *called_scope = NULL;
+	zend_function *func;
+	zend_object *this_obj;
+
+	Z_OBJ_HT_P(closure)->get_closure(Z_OBJ_P(closure), &called_scope, &func, &this_obj, true);
+
+	return called_scope;
+}
+
 /* zend_create_fake_closure() taking $this in whichever flavor the engine
  * expects; the engine adds its own reference to the object either way. */
 static zend_always_inline void dc_create_fake_closure(zval *res, zend_function *func,
@@ -2568,9 +2581,13 @@ static void dc_copy_value(dc_ctx *ctx, zval *src, zval *dst, zval *mask_dst)
 				zval_ptr_dtor(&this_zval);
 				zval_ptr_dtor(&scratch_mask);
 			} else {
-				zend_class_entry *called_scope = func->common.scope;
+				/* Static methods are called on a class that can be a child
+				 * of the one declaring them, which static:: resolves to */
+				zend_class_entry *called_scope = func->common.scope ? dc_closure_called_scope(src) : NULL;
 				if (called_scope) {
 					ZVAL_STR_COPY(slot0, called_scope->name);
+				} else if (func->common.scope) {
+					ZVAL_STR_COPY(slot0, func->common.scope->name);
 				} else {
 					ZVAL_NULL(slot0);
 				}
@@ -3826,6 +3843,50 @@ PHP_FUNCTION(deepclone_to_array)
 
 static void dc_resolve(zval *value, zval *mask, zval *objects, uint32_t num_objects, HashTable *refs, HashTable *allowed_set, zval *retval);
 
+/* Check the shape of the value of a named closure, [obj_or_class_or_null,
+ * method] or [[obj_or_class_or_null, method], class, method] for non-public
+ * methods, and fetch its parts. Throws and returns false when malformed. */
+static bool dc_named_closure_parts(zval *value, zval **zobj, zval **zname, zend_string **priv_class, zend_string **priv_method)
+{
+	if (Z_TYPE_P(value) != IS_ARRAY) {
+		zend_value_error("deepclone_from_array(): malformed payload, named-closure value must be of type array, %s given", zend_zval_value_name(value));
+		return false;
+	}
+	zval *elem0 = zend_hash_index_find(Z_ARRVAL_P(value), 0);
+	zval *elem1 = zend_hash_index_find(Z_ARRVAL_P(value), 1);
+	if (!elem0 || !elem1) {
+		zend_value_error("deepclone_from_array(): malformed payload, named-closure value must have at least 2 elements");
+		return false;
+	}
+
+	zval *callable_arr = value;
+	*priv_class = *priv_method = NULL;
+
+	if (Z_TYPE_P(elem0) == IS_ARRAY) {
+		callable_arr = elem0;
+		if (Z_TYPE_P(elem1) != IS_STRING) {
+			zend_value_error("deepclone_from_array(): malformed payload, named-closure private class name must be of type string, %s given", zend_zval_value_name(elem1));
+			return false;
+		}
+		zval *elem2 = zend_hash_index_find(Z_ARRVAL_P(value), 2);
+		if (!elem2 || Z_TYPE_P(elem2) != IS_STRING) {
+			zend_value_error("deepclone_from_array(): malformed payload, named-closure private method name must be of type string");
+			return false;
+		}
+		*priv_class = Z_STR_P(elem1);
+		*priv_method = Z_STR_P(elem2);
+	}
+
+	*zobj = zend_hash_index_find(Z_ARRVAL_P(callable_arr), 0);
+	*zname = zend_hash_index_find(Z_ARRVAL_P(callable_arr), 1);
+	if (!*zobj || !*zname || Z_TYPE_P(*zname) != IS_STRING) {
+		zend_value_error("deepclone_from_array(): malformed payload, named-closure callable must be [obj_or_class_or_null, string]");
+		return false;
+	}
+
+	return true;
+}
+
 /* Check a mask that matches no value, or a refMasks entry that matches no
  * reference, as if it matched null, like the polyfill does: markers reject
  * it, unknown masks let it pass. Nothing is added to the payload. */
@@ -3948,47 +4009,12 @@ static void dc_resolve(zval *value, zval *mask, zval *objects, uint32_t num_obje
 
 	if (DC_MASK_IS_NAMED_CLOSURE(mask)) {
 		/* Named closure: value is [obj_or_class, method] or [[callable], class, method] */
-		if (Z_TYPE_P(value) != IS_ARRAY) {
-			zend_value_error("deepclone_from_array(): malformed payload, named-closure value must be of type array, %s given", zend_zval_value_name(value));
+		zval *zobj, *zname;
+		zend_string *priv_class, *priv_method;
+		if (!dc_named_closure_parts(value, &zobj, &zname, &priv_class, &priv_method)) {
 			return;
 		}
-		zval *arr = value;
-		zval *elem0 = zend_hash_index_find(Z_ARRVAL_P(arr), 0);
-		zval *elem1 = zend_hash_index_find(Z_ARRVAL_P(arr), 1);
-		if (!elem0 || !elem1) {
-			zend_value_error("deepclone_from_array(): malformed payload, named-closure value must have at least 2 elements");
-			return;
-		}
-
-		zval *callable_arr;
-		bool is_private = false;
-		zend_string *priv_class = NULL, *priv_method = NULL;
-
-		if (Z_TYPE_P(elem0) == IS_ARRAY) {
-			/* Private method: [[obj, name], class, method] */
-			callable_arr = elem0;
-			is_private = true;
-			if (Z_TYPE_P(elem1) != IS_STRING) {
-				zend_value_error("deepclone_from_array(): malformed payload, named-closure private class name must be of type string, %s given", zend_zval_value_name(elem1));
-				return;
-			}
-			priv_class = Z_STR_P(elem1);
-			zval *elem2 = zend_hash_index_find(Z_ARRVAL_P(arr), 2);
-			if (!elem2 || Z_TYPE_P(elem2) != IS_STRING) {
-				zend_value_error("deepclone_from_array(): malformed payload, named-closure private method name must be of type string");
-				return;
-			}
-			priv_method = Z_STR_P(elem2);
-		} else {
-			callable_arr = arr;
-		}
-
-		zval *zobj = zend_hash_index_find(Z_ARRVAL_P(callable_arr), 0);
-		zval *zname = zend_hash_index_find(Z_ARRVAL_P(callable_arr), 1);
-		if (!zobj || !zname || Z_TYPE_P(zname) != IS_STRING) {
-			zend_value_error("deepclone_from_array(): malformed payload, named-closure callable must be [obj_or_class_or_null, string]");
-			return;
-		}
+		bool is_private = priv_class != NULL;
 		zval resolved_obj;
 
 		if (Z_TYPE_P(zobj) == IS_LONG) {
@@ -4020,44 +4046,76 @@ static void dc_resolve(zval *value, zval *mask, zval *objects, uint32_t num_obje
 			ZVAL_COPY(&resolved_obj, zobj);
 		}
 
-		if (is_private) {
-			zend_class_entry *ce = zend_lookup_class(priv_class);
-			if (ce) {
-				zend_function *func = zend_hash_find_ptr_lc(&ce->function_table, priv_method);
-				if (func) {
-					dc_create_fake_closure(retval, func, ce, ce,
-						(Z_TYPE(resolved_obj) == IS_OBJECT) ? Z_OBJ(resolved_obj) : NULL);
-				}
-			}
-		} else {
-			zend_string *name = Z_STR_P(zname);
+		/* Like Closure::fromCallable(): the method is looked up on the class
+		 * of the object, or on the named class, or on the class that declares
+		 * it for the non-public ones, and the closure gets the scope of the
+		 * class that declares it and is called on the class of the object,
+		 * or on the named class */
+		zend_class_entry *called_scope = NULL;
+		zend_function *func = NULL;
+		zend_string *name = is_private ? priv_method : Z_STR_P(zname);
 
-			if (Z_TYPE(resolved_obj) == IS_NULL) {
-				zend_function *func = zend_hash_find_ptr_lc(CG(function_table), name);
-				if (func) {
-					dc_create_fake_closure(retval, func, NULL, NULL, NULL);
-				}
-			} else if (Z_TYPE(resolved_obj) == IS_OBJECT) {
-				zend_class_entry *ce = Z_OBJCE(resolved_obj);
-				zend_function *func = zend_hash_find_ptr_lc(&ce->function_table, name);
-				if (func) {
-					dc_create_fake_closure(retval, func, ce, ce, Z_OBJ(resolved_obj));
-				}
-			} else if (Z_TYPE(resolved_obj) == IS_STRING) {
-				zend_class_entry *ce = zend_lookup_class(Z_STR(resolved_obj));
-				if (ce) {
-					zend_function *func = zend_hash_find_ptr_lc(&ce->function_table, name);
-					if (func) {
-						dc_create_fake_closure(retval, func, ce, ce, NULL);
-					}
-				}
-			}
+		if (Z_TYPE(resolved_obj) == IS_OBJECT) {
+			called_scope = Z_OBJCE(resolved_obj);
+		} else if (Z_TYPE(resolved_obj) == IS_STRING) {
+			called_scope = zend_lookup_class(Z_STR(resolved_obj));
+		} else if (Z_TYPE(resolved_obj) != IS_NULL) {
+			zval_ptr_dtor(&resolved_obj);
+			zend_value_error("deepclone_from_array(): malformed payload, named-closure callable must be [obj_or_class_or_null, string]");
+			return;
 		}
-		if (Z_ISUNDEF_P(retval)) {
+
+		if (is_private) {
+			zend_class_entry *scope = zend_lookup_class(priv_class);
+			func = scope ? zend_hash_find_ptr_lc(&scope->function_table, name) : NULL;
+			if (func && !called_scope) {
+				called_scope = func->common.scope;
+			}
+		} else if (called_scope) {
+			func = zend_hash_find_ptr_lc(&called_scope->function_table, name);
+		} else if (Z_TYPE(resolved_obj) == IS_NULL) {
+			func = zend_hash_find_ptr_lc(CG(function_table), name);
+		}
+
+		if (!func && called_scope && !is_private
+		 && (Z_TYPE(resolved_obj) == IS_OBJECT ? called_scope->__call : called_scope->__callstatic)) {
+			/* A method that __call() or __callStatic() handles */
+			zval callable;
+			array_init_size(&callable, 2);
+			if (Z_TYPE(resolved_obj) == IS_OBJECT) {
+				Z_ADDREF(resolved_obj);
+				add_next_index_zval(&callable, &resolved_obj);
+			} else {
+				add_next_index_str(&callable, zend_string_copy(called_scope->name));
+			}
+			add_next_index_str(&callable, zend_string_copy(name));
+			zend_call_method_with_1_params(NULL, zend_ce_closure, NULL, "fromcallable", retval, &callable);
+			zval_ptr_dtor(&callable);
+			zval_ptr_dtor(&resolved_obj);
+			return;
+		}
+		if (!func) {
 			zval_ptr_dtor(&resolved_obj);
 			zend_value_error("deepclone_from_array(): malformed payload, named-closure function or method not found");
 			return;
 		}
+		if (func->common.scope) {
+			if (!instanceof_function(called_scope, func->common.scope)) {
+				zval_ptr_dtor(&resolved_obj);
+				zend_value_error("deepclone_from_array(): malformed payload, named-closure method %s::%s() cannot be called on %s",
+					ZSTR_VAL(func->common.scope->name), ZSTR_VAL(func->common.function_name), ZSTR_VAL(called_scope->name));
+				return;
+			}
+			if (!(func->common.fn_flags & ZEND_ACC_STATIC) && Z_TYPE(resolved_obj) != IS_OBJECT) {
+				zval_ptr_dtor(&resolved_obj);
+				zend_value_error("deepclone_from_array(): malformed payload, named-closure method %s::%s() is not static",
+					ZSTR_VAL(func->common.scope->name), ZSTR_VAL(func->common.function_name));
+				return;
+			}
+		}
+
+		dc_create_fake_closure(retval, func, func->common.scope, called_scope,
+			Z_TYPE(resolved_obj) == IS_OBJECT && !(func->common.fn_flags & ZEND_ACC_STATIC) ? Z_OBJ(resolved_obj) : NULL);
 		zval_ptr_dtor(&resolved_obj);
 		return;
 	}
@@ -4382,19 +4440,26 @@ static bool dc_class_can_be_ghost(const zend_class_entry *ce)
 	return true;
 }
 
-/* Eagerly enforce the allow-list on const-expr-closure markers inside a
- * deferred slot, replicating the gate dc_cexpr_resolve() applies before
- * zend_lookup_class(). Without this, lazy mode would delay the "class not
- * allowed" error to an arbitrary later point in the program. Only
- * well-shaped entries are checked: shape errors keep failing at resolve
- * time, exactly like the eager path reports them. */
-static void dc_lazy_gate_cexpr(zval *value, zval *mask, HashTable *allowed_set)
+/* Eagerly check the closure markers inside a deferred slot: the shape of
+ * named closures, and the allow-list on const-expr closures, replicating the
+ * gate dc_cexpr_resolve() applies before zend_lookup_class(). Without this,
+ * lazy mode would delay these errors about the payload itself to an
+ * arbitrary later point in the program. What depends on what the payload
+ * references, eg a function that doesn't exist, fails on first use. */
+static void dc_lazy_gate(zval *value, zval *mask, HashTable *allowed_set)
 {
 	if (UNEXPECTED(dc_check_stack_limit())) {
 		return;
 	}
+	if (DC_MASK_IS_NAMED_CLOSURE(mask)) {
+		/* Its shape doesn't depend on what the payload references */
+		zval *zobj, *zname;
+		zend_string *priv_class, *priv_method;
+		dc_named_closure_parts(value, &zobj, &zname, &priv_class, &priv_method);
+		return;
+	}
 	if (DC_MASK_IS_CONSTEXPR_CLOSURE(mask)) {
-		if (Z_TYPE_P(value) == IS_ARRAY) {
+		if (allowed_set && Z_TYPE_P(value) == IS_ARRAY) {
 			zval *zclass = zend_hash_index_find(Z_ARRVAL_P(value), 0);
 			if (zclass) {
 				ZVAL_DEREF(zclass);
@@ -4417,7 +4482,7 @@ static void dc_lazy_gate_cexpr(zval *value, zval *mask, HashTable *allowed_set)
 			? zend_hash_find(Z_ARRVAL_P(value), mkey)
 			: zend_hash_index_find(Z_ARRVAL_P(value), midx);
 		if (!slot) continue;
-		dc_lazy_gate_cexpr(slot, mval, allowed_set);
+		dc_lazy_gate(slot, mval, allowed_set);
 		if (UNEXPECTED(EG(exception))) {
 			return;
 		}
@@ -4579,8 +4644,8 @@ static bool dc_lazy_index_build(dc_lazy_ctx *ctx, HashTable *properties_ht, Hash
 				}
 
 				zval *marker = resolve_ids ? zend_hash_index_find(resolve_ids, obj_id) : NULL;
-				if (marker && allowed_set) {
-					dc_lazy_gate_cexpr(prop_val, marker, allowed_set);
+				if (marker) {
+					dc_lazy_gate(prop_val, marker, allowed_set);
 					if (UNEXPECTED(EG(exception))) {
 						goto prop_err;
 					}
@@ -5462,9 +5527,9 @@ PHP_FUNCTION(deepclone_from_array)
 					 || lazy_ctx->states[sid].props != NULL) {
 						continue;
 					}
-					if (st_mask && allowed_set) {
-						/* Same eager const-expr gate as deferred slots. */
-						dc_lazy_gate_cexpr(st_props, st_mask, allowed_set);
+					if (st_mask) {
+						/* Same eager gate as deferred slots. */
+						dc_lazy_gate(st_props, st_mask, allowed_set);
 						if (UNEXPECTED(EG(exception))) {
 							goto cleanup;
 						}
