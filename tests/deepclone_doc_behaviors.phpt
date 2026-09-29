@@ -194,5 +194,5 @@ echo "Done\n";
 5. DateTimeImmutable: OK
 5. DateTimeZone: OK
 5. DateInterval: OK
-6. top-level resource: OK (stream resource)
+6. top-level resource: OK (Type "stream resource" is not instantiable.)
 Done

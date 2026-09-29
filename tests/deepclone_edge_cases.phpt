@@ -74,6 +74,10 @@ bool(true)
 bool(true)
 bool(true)
 %Abool(true)
+
+Warning: serialize(): BadSleep::__sleep() should return an array only containing the names of instance-variables to serialize in %s on line %d
+
+Warning: serialize(): "123" returned as member variable from __sleep() but does not exist in %s on line %d
 bool(true)
 bool(true)
 bool(true)
