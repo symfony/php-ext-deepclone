@@ -20,6 +20,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - References that nothing else holds, eg after `unset()` of the other side,
   are exported as values, like `serialize()` and the polyfill do, instead of
   taking a reference id.
+- `deepclone_from_array()` rejected payloads that `deepclone_to_array()`
+  produced when a reference holds an array that holds a `&` to a reference
+  holding an object, a closure, an enum or an array, eg `$v = [&$arr, &$arr,
+  &$x]` with `$arr = ['x' => &$x]`.
+- `deepclone_from_array()` rejected `Serializable` objects whose data
+  references them back, eg `R:1;`, and leaked the objects already created when
+  a nested `__unserialize()` threw.
+- `deepclone_from_array()` writes typed properties like `unserialize()` and
+  the polyfill do: `null` on a non-nullable one and a scalar on one typed with
+  a backed enum throw a `TypeError` instead of leaving it uninitialized or
+  casting the scalar, which `deepclone_hydrate()` still does.
 
 ## [0.8.6] - 2026-09-29
 

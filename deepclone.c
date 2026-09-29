@@ -219,6 +219,9 @@ static zend_always_inline void dc_create_fake_closure(zval *res, zend_function *
 #define DEEPCLONE_HYDRATE_PRESERVE_REFS (1 << 2)
 #define DEEPCLONE_HYDRATE_FLAGS_MASK \
 	(DEEPCLONE_HYDRATE_CALL_HOOKS | DEEPCLONE_HYDRATE_NO_LAZY_INIT | DEEPCLONE_HYDRATE_PRESERVE_REFS)
+/* Internal: write like unserialize() does, without the conveniences of
+ * deepclone_hydrate() for null and backed enums */
+#define DC_WRITE_LIKE_UNSERIALIZE       (1 << 30)
 
 /* IS_PROP_REINITABLE (readonly clone-with bookkeeping) landed in PHP 8.3.
  * On 8.2 there is no such flag; clearing 0 bits is a no-op. */
@@ -1156,6 +1159,7 @@ static bool dc_write_backed_property(zend_object *obj, zend_property_info *pi,
 	 * Properties of internal classes are excluded too: their methods expect
 	 * them initialized, eg Exception::getTraceAsString() crashes otherwise. */
 	if (Z_TYPE_P(value) == IS_NULL
+		&& !(flags & DC_WRITE_LIKE_UNSERIALIZE)
 		&& ZEND_TYPE_IS_SET(pi->type)
 		&& !ZEND_TYPE_ALLOW_NULL(pi->type)
 		&& !DC_PROP_HAS_HOOKS(pi)
@@ -1181,6 +1185,7 @@ static bool dc_write_backed_property(zend_object *obj, zend_property_info *pi,
 	zval enum_holder;
 	bool enum_holder_used = false;
 	if ((Z_TYPE_P(value) == IS_LONG || Z_TYPE_P(value) == IS_STRING)
+		&& !(flags & DC_WRITE_LIKE_UNSERIALIZE)
 		&& ZEND_TYPE_HAS_NAME(pi->type)
 		&& !ZEND_TYPE_HAS_LIST(pi->type)
 		/* Only cast for types of the form `Enum` or `?Enum` — unions like
@@ -3869,6 +3874,10 @@ static ZEND_COLD zend_never_inline bool dc_resolve_unmatched_markers(HashTable *
  */
 static void dc_resolve(zval *value, zval *mask, zval *objects, uint32_t num_objects, HashTable *refs, HashTable *allowed_set, zval *retval)
 {
+	/* A reference that a hard-ref marker bound to it, eg the value of a ref
+	 * whose array holds an & to it and was resolved before it */
+	ZVAL_DEREF(value);
+
 	if (EXPECTED(DC_MASK_IS_OBJ_REF(mask))) {
 		if (UNEXPECTED(Z_TYPE_P(value) != IS_LONG)) {
 			zend_value_error("deepclone_from_array(): malformed payload, object reference value must be of type int, %s given", zend_zval_value_name(value));
@@ -4642,7 +4651,7 @@ static void dc_lazy_hydrate(dc_lazy_ctx *ctx, zend_object *obj, uint32_t id)
 
 		if (slot->pi) {
 			EG(fake_scope) = slot->scope_ce != zend_standard_class_def ? slot->scope_ce : NULL;
-			bool ok = dc_write_backed_property(obj, slot->pi, slot->name, &final_val, 0);
+			bool ok = dc_write_backed_property(obj, slot->pi, slot->name, &final_val, DC_WRITE_LIKE_UNSERIALIZE);
 			EG(fake_scope) = NULL;
 			zval_ptr_dtor(&final_val);
 			if (UNEXPECTED(!ok)) {
@@ -5320,6 +5329,16 @@ PHP_FUNCTION(deepclone_from_array)
 				DC_INVALID("deepclone_from_array(): Argument #1 ($data) failed to unserialize object %u", id);
 			}
 			PHP_VAR_UNSERIALIZE_DESTROY(var_hash);
+			if (UNEXPECTED(EG(exception))) {
+				/* Thrown by a delayed __unserialize() or __wakeup() call */
+				zval_ptr_dtor(&obj_zval);
+				goto cleanup;
+			}
+			/* A back-reference to the root, eg R:1; in its data, makes it a
+			 * reference */
+			if (Z_ISREF(obj_zval)) {
+				zend_unwrap_reference(&obj_zval);
+			}
 			/* The result is later dereferenced as a zend_object*; a malformed
 			 * payload can carry any serialize form (i:…, s:…, a:…), so reject
 			 * anything that did not decode to an object before storing it. */
@@ -5674,7 +5693,7 @@ PHP_FUNCTION(deepclone_from_array)
 					if (dc_is_backed_declared_property(use_pi)) {
 						/* deepclone_from_array always uses setRawValue semantics
 						 * (flags=0): payload-driven, same policy as unserialize(). */
-						bool ok = dc_write_backed_property(obj, use_pi, prop_name, &final_val, 0);
+						bool ok = dc_write_backed_property(obj, use_pi, prop_name, &final_val, DC_WRITE_LIKE_UNSERIALIZE);
 						zval_ptr_dtor(&final_val);
 						if (UNEXPECTED(!ok)) {
 							EG(fake_scope) = old_scope;
