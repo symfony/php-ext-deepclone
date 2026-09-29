@@ -75,6 +75,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   created without their internal state, the heaps empty with their default
   flags before PHP 8.5, and `MultipleIterator` without its iterators. Their
   user subclasses already were.
+- `deepclone_from_array()` throws `DeepClone\NotInstantiableException` for
+  abstract classes, interfaces, traits and enums, like `deepclone_hydrate()`
+  and the polyfill do, instead of an `Error`.
+- `deepclone_hydrate()` words its `DeepClone\NotInstantiableException`
+  messages `Type "X" is not instantiable.` like the other functions and the
+  polyfill do, instead of `Class "X" is not instantiable.`.
 
 ## [0.8.5] - 2026-09-23
 
