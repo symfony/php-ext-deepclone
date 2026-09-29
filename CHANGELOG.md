@@ -44,6 +44,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   returning `null`.
 - On PHP 8.4+, `deepclone_from_array()` checks the shape of the named closures
   that lazy objects hold right away, instead of when these are first used.
+- `deepclone_from_array()` rejects property names that start with a NUL byte,
+  which aren't legal PHP, instead of creating them. An array cast can give
+  such names to a `stdClass`, which `deepclone_to_array()` exports as they
+  are, like `serialize()`.
 
 ## [0.8.6] - 2026-09-29
 

@@ -4577,7 +4577,7 @@ static bool dc_lazy_index_build(dc_lazy_ctx *ctx, HashTable *properties_ht, Hash
 		zend_ulong prop_idx;
 		zval *id_values;
 		ZEND_HASH_FOREACH_KEY_VAL(Z_ARRVAL_P(scope_props), prop_idx, prop_name, id_values) {
-			if (Z_TYPE_P(id_values) != IS_ARRAY) {
+			if (Z_TYPE_P(id_values) != IS_ARRAY || (prop_name && ZSTR_LEN(prop_name) && ZSTR_VAL(prop_name)[0] == '\0')) {
 				continue; /* phase 8 reports it */
 			}
 			bool prop_is_numeric = (prop_name == NULL);
@@ -5657,6 +5657,12 @@ PHP_FUNCTION(deepclone_from_array)
 				if (Z_TYPE_P(id_values) != IS_ARRAY) {
 					EG(fake_scope) = old_scope;
 					DC_INVALID("deepclone_from_array(): Argument #1 ($data) \"properties\" value for \"%s::%s\" must be of type array, %s given", ZSTR_VAL(scope_name), ZSTR_VAL(prop_name), zend_zval_value_name(id_values));
+				}
+				if (UNEXPECTED(ZSTR_LEN(prop_name) && ZSTR_VAL(prop_name)[0] == '\0')) {
+					/* Not a legal name, which the engine refuses to access,
+					 * even if an array cast can give it to a stdClass */
+					EG(fake_scope) = old_scope;
+					DC_INVALID("deepclone_from_array(): Argument #1 ($data) \"properties\" names of scope \"%s\" cannot start with \"\\0\"", ZSTR_VAL(scope_name));
 				}
 
 				/* Get resolve markers for this property */
