@@ -428,6 +428,36 @@ static bool dc_unserializes_stateless(zend_class_entry *ce)
 	return module && (!strcmp(module, "dom") || !strcmp(module, "xsl") || !strcmp(module, "mysqli") || !strcmp(module, "soap"));
 }
 
+/* Whether the class is an internal one that keeps its state out of its
+ * properties and declares no serialization API, like Redis, other than the
+ * ones above, or a user class that extends one without declaring such an API.
+ * All three functions reject these: unserialize() creates them without that
+ * state, and some crash when used, or even destroyed, that way.
+ * deepclone_to_array() and deepclone_hydrate() probe the final ones instead. */
+static zend_never_inline bool dc_needs_internal_state_slow(zend_class_entry *ce)
+{
+	if (ce->serialize != NULL || ce->__serialize || ce->__unserialize
+	 || ce == php_ce_incomplete_class
+	 || zend_hash_find_known_hash(&ce->function_table, ZSTR_KNOWN(ZEND_STR_SLEEP))
+	 || zend_hash_find_known_hash(&ce->function_table, ZSTR_KNOWN(ZEND_STR_WAKEUP))) {
+		return false;
+	}
+
+	/* User classes inherit create_object from their closest internal parent */
+	while (ce && ce->type != ZEND_INTERNAL_CLASS) {
+		ce = ce->parent;
+	}
+
+	return ce && ce->create_object != NULL
+		&& !(ce->ce_flags & ZEND_ACC_FINAL)
+		&& !dc_unserializes_stateless(ce);
+}
+
+static zend_always_inline bool dc_needs_internal_state(zend_class_entry *ce)
+{
+	return UNEXPECTED(ce->create_object != NULL) && dc_needs_internal_state_slow(ce);
+}
+
 
 /* ── Helpers ────────────────────────────────────────────────── */
 
@@ -590,7 +620,8 @@ static zend_always_inline bool dc_refuses_serialization(zend_class_entry *ce)
 
 /* Look up the class of payload objects, rejecting the ones unserialize() can't
  * create: abstract classes, interfaces, traits and enums, and the classes that
- * refuse serialization. */
+ * refuse serialization; and the ones it would create without their internal
+ * state, which deepclone_to_array() rejects too. */
 static zend_class_entry *dc_lookup_payload_class(zend_string *class_name)
 {
 	zend_class_entry *ce = zend_lookup_class(class_name);
@@ -598,7 +629,7 @@ static zend_class_entry *dc_lookup_payload_class(zend_string *class_name)
 	if (UNEXPECTED(!ce)) {
 		zend_throw_exception_ex(dc_ce_class_not_found_exception, 0,
 			"Class \"%s\" not found.", ZSTR_VAL(class_name));
-	} else if (UNEXPECTED((ce->ce_flags & ZEND_ACC_UNINSTANTIABLE) || dc_refuses_serialization(ce))) {
+	} else if (UNEXPECTED((ce->ce_flags & ZEND_ACC_UNINSTANTIABLE) || dc_refuses_serialization(ce) || dc_needs_internal_state(ce))) {
 		zend_throw_exception_ex(dc_ce_not_instantiable_exception, 0,
 			"Type \"%s\" is not instantiable.", ZSTR_VAL(ce->name));
 		ce = NULL;
@@ -666,12 +697,7 @@ static uint8_t dc_get_class_info(dc_ctx *ctx, zend_class_entry *ce)
 		} else {
 			zval_ptr_dtor(&probe);
 		}
-	} else if (ce->type == ZEND_INTERNAL_CLASS
-	 && ce->create_object != NULL
-	 && ce->serialize == NULL
-	 && !(flags & (DC_CI_HAS_SERIALIZE | DC_CI_HAS_UNSERIALIZE | DC_CI_HAS_SLEEP | DC_CI_HAS_WAKEUP))
-	 && ce != php_ce_incomplete_class
-	 && !dc_unserializes_stateless(ce)) {
+	} else if (dc_needs_internal_state(ce)) {
 		flags |= DC_CI_NOT_INSTANTIABLE;
 	}
 
@@ -5832,9 +5858,8 @@ PHP_FUNCTION(deepclone_hydrate)
 		}
 		/* Reject classes that cannot function without their constructor,
 		 * using the same rules as dc_get_class_info / deepclone_from_array.
-		 * Internal classes are checked and cached; user classes pass unless
-		 * they refuse serialization, checked each time as the cache is
-		 * persistent and their names aren't. */
+		 * Internal classes are checked and cached; user classes are checked
+		 * each time as the cache is persistent and their names aren't. */
 		if (UNEXPECTED(ce->type == ZEND_INTERNAL_CLASS)) {
 			/* Per-thread cache (via module globals). Packs ce pointer + ok-bit
 			 * into the stored value: low bit is ok, high bits are the ce. A ce
@@ -5865,18 +5890,17 @@ PHP_FUNCTION(deepclone_hydrate)
 				if (ok && dc_refuses_serialization(ce)) {
 					ok = false;
 				}
-				if (ok && ce->create_object != NULL && ce != php_ce_incomplete_class && !has_ser_api
+				if (ok && dc_needs_internal_state(ce)) {
+					ok = false;
+				} else if (ok && ce->create_object != NULL && (ce->ce_flags & ZEND_ACC_FINAL)
+				 && ce != php_ce_incomplete_class && !has_ser_api
 				 && !(ce->__serialize) && !(zend_hash_find_known_hash(&ce->function_table, ZSTR_KNOWN(ZEND_STR_SLEEP)))) {
-					if (ce->ce_flags & ZEND_ACC_FINAL) {
-						zval probe;
-						if (object_init_ex(&probe, ce) != SUCCESS || EG(exception)) {
-							zend_clear_exception();
-							ok = false;
-						} else {
-							zval_ptr_dtor(&probe);
-						}
-					} else if (!dc_unserializes_stateless(ce)) {
+					zval probe;
+					if (object_init_ex(&probe, ce) != SUCCESS || EG(exception)) {
+						zend_clear_exception();
 						ok = false;
+					} else {
+						zval_ptr_dtor(&probe);
 					}
 				}
 				/* Internal final classes with create_object: the engine refuses
@@ -5935,7 +5959,7 @@ PHP_FUNCTION(deepclone_hydrate)
 					RETURN_THROWS();
 				}
 			}
-		} else if (UNEXPECTED(dc_refuses_serialization(ce))) {
+		} else if (UNEXPECTED(dc_refuses_serialization(ce) || dc_needs_internal_state(ce))) {
 			zend_throw_exception_ex(dc_ce_not_instantiable_exception, 0,
 				"Type \"%s\" is not instantiable.", ZSTR_VAL(ce->name));
 			RETURN_THROWS();
