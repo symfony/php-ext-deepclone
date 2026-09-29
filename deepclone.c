@@ -1155,11 +1155,14 @@ static bool dc_write_backed_property(zend_object *obj, zend_property_info *pi,
 	 * (no backing slot to "unset", and the set hook may handle null itself).
 	 * Skip the shortcut on lazy objects — a direct slot write would bypass
 	 * the lazy-props bookkeeping. On NO_LAZY_INIT + lazy we fall through to
-	 * the Reflection-based path below, which enforces type semantics. */
+	 * the Reflection-based path below, which enforces type semantics.
+	 * Properties of internal classes are excluded too: their methods expect
+	 * them initialized, eg Exception::getTraceAsString() crashes otherwise. */
 	if (Z_TYPE_P(value) == IS_NULL
 		&& ZEND_TYPE_IS_SET(pi->type)
 		&& !ZEND_TYPE_ALLOW_NULL(pi->type)
 		&& !DC_PROP_HAS_HOOKS(pi)
+		&& pi->ce->type == ZEND_USER_CLASS
 #if PHP_VERSION_ID >= 80400
 		&& zend_lazy_object_initialized(obj)
 #endif
@@ -1237,21 +1240,25 @@ static bool dc_write_backed_property(zend_object *obj, zend_property_info *pi,
 		zval_ptr_dtor(&old);
 	}
 	else if (UNEXPECTED(Z_ISREF_P(value)) && !DC_PROP_HAS_HOOKS(pi)) {
-		/* Binding a shared PHP &-reference to a typed declared property:
-		 * zend_std_write_property() only accepts dereferenced values (debug
-		 * builds assert on it), so mirror unserialize(): verify the current
-		 * referenced value against the property type, install the reference
-		 * itself in the slot, and record the property as a type source so
-		 * later writes through the reference keep being type-checked. */
-		if (UNEXPECTED(!zend_verify_prop_assignable_by_ref(pi, value, /* strict */ 1))) {
+		/* Binding a shared PHP &-reference to a declared property, typed or
+		 * written with CALL_HOOKS: zend_std_write_property() only accepts
+		 * dereferenced values (debug builds assert on it), so mirror
+		 * unserialize(): verify the current referenced value against the
+		 * property type, install the reference itself in the slot, and
+		 * record the property as a type source so later writes through the
+		 * reference keep being type-checked. */
+		bool typed = ZEND_TYPE_IS_SET(pi->type);
+		if (typed && UNEXPECTED(!zend_verify_prop_assignable_by_ref(pi, value, /* strict */ 1))) {
 			return false;
 		}
 		zval old;
 		ZVAL_COPY_VALUE(&old, slot);
 		ZVAL_COPY(slot, value);
 		Z_PROP_FLAG_P(slot) &= ~(IS_PROP_UNINIT | IS_PROP_REINITABLE);
-		ZEND_REF_ADD_TYPE_SOURCE(Z_REF_P(value), pi);
-		if (UNEXPECTED(Z_ISREF(old))) {
+		if (typed) {
+			ZEND_REF_ADD_TYPE_SOURCE(Z_REF_P(value), pi);
+		}
+		if (typed && UNEXPECTED(Z_ISREF(old))) {
 			/* The replaced reference was necessarily bound to this property
 			 * (every path that stores a reference in a typed slot adds the
 			 * type source); unbind it before releasing. */
@@ -3167,24 +3174,29 @@ build_scoped_props:
 				prop_name = arr_key;
 				zval *scope_zv = zend_hash_find(scope_map, arr_key);
 				scope_name = scope_zv ? Z_STR_P(scope_zv) : ZEND_STANDARD_CLASS_DEF_PTR->name;
-			} else if (key[1] == '*') {
-				/* Protected: \0*\0name. An undeclared one, eg returned by
-				 * __serialize(), can only be restored as a dynamic property. */
-				prop_name = zend_string_init_existing_interned(key + 3, key_len - 3, 0);
-				prop_name_owned = true;
-				zval *scope_zv = zend_hash_find(scope_map, prop_name);
-				scope_name = scope_zv ? Z_STR_P(scope_zv) : ZEND_STANDARD_CLASS_DEF_PTR->name;
 			} else {
-				/* Private: \0ClassName\0name */
-				const char *sep = memchr(key + 2, '\0', key_len - 2);
-				if (!sep) {
+				/* Mangled: \0*\0name or \0ClassName\0name, where the name
+				 * of an anonymous class contains a NUL. Malformed ones, eg
+				 * returned by __serialize(), are skipped with the notice of
+				 * unserialize(), which fails on them. */
+				const char *class_name, *unmangled;
+				size_t unmangled_len;
+				if (UNEXPECTED(zend_unmangle_property_name_ex(arr_key, &class_name, &unmangled, &unmangled_len) == FAILURE)) {
 					continue;
 				}
-				size_t class_len = sep - key - 1;
-				scope_name = zend_string_init_existing_interned(key + 1, class_len, 0);
-				scope_name_owned = true;
-				prop_name = zend_string_init_existing_interned(sep + 1, key_len - class_len - 2, 0);
+				prop_name = zend_string_init_existing_interned(unmangled, unmangled_len, 0);
 				prop_name_owned = true;
+				if (class_name[0] == '*') {
+					/* Protected. An undeclared one, eg returned by
+					 * __serialize(), can only be restored as a dynamic
+					 * property. */
+					zval *scope_zv = zend_hash_find(scope_map, prop_name);
+					scope_name = scope_zv ? Z_STR_P(scope_zv) : ZEND_STANDARD_CLASS_DEF_PTR->name;
+				} else {
+					/* Private */
+					scope_name = zend_string_init_existing_interned(class_name, unmangled - class_name - 1, 0);
+					scope_name_owned = true;
+				}
 			}
 
 			/* Skip default values, except for the call-context-sensitive Throwable

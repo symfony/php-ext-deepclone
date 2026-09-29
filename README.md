@@ -129,9 +129,10 @@ objects. `deepclone_from_array()` writes like the default, as `unserialize()`
 does.
 
 `deepclone_hydrate()` also forgives what rehydrating often trips on: `null`
-leaves a non-nullable typed property uninitialized instead of throwing, a
-scalar written to a property typed with a backed enum becomes the matching
-case, and writing the value a readonly property already holds does nothing.
+leaves a non-nullable typed property of a user class uninitialized instead of
+throwing, a scalar written to a property typed with a backed enum becomes the
+matching case, and writing the value a readonly property already holds does
+nothing.
 
 For `ArrayObject`, `SplObjectStorage` and the other classes that keep their
 state internally, call `__unserialize()` after instantiating them, or use
@@ -175,8 +176,8 @@ All three functions also reject internal classes that keep their state out of
 their properties and declare no serialization API, eg `Redis` or `Imagick`,
 and the user classes that extend them without declaring one: `unserialize()`
 creates them without that state, but some crash when used, or even destroyed,
-that way. The polyfill can't tell these classes apart and
-rejects the ones of the extensions it knows, eg zip, redis, relay or imagick.
+that way. The polyfill can't tell these classes apart and rejects the ones of
+the extensions it knows, eg zip, redis, relay or imagick.
 Only `MultipleIterator`, heaps before PHP 8.5 and the classes of the dom, xsl,
 mysqli and soap extensions, eg `DOMNodeList`, are created like `unserialize()`
 does.
