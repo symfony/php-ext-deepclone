@@ -77,11 +77,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   user subclasses already were.
 - The classes of the dom, xsl, mysqli and soap extensions that have no
   serialization API, like `DOMNodeList`, `XSLTProcessor`, `mysqli` or, on PHP
-  8.6, `SoapClient`, are
-  handled like `unserialize()` does too, instead of being rejected as not
-  instantiable: they are created without their internal state. Classes of
-  other extensions in that case, like `Redis` or `Imagick`, are still
-  rejected, as some of them crash when used without their constructor.
+  8.6, `SoapClient`, are handled like `unserialize()` does too, instead of
+  being rejected as not instantiable: they are created without their internal
+  state. Classes of other extensions in that case, like `Redis` or `Imagick`,
+  are still rejected, as some of them crash when used without their
+  constructor.
 - `deepclone_from_array()` throws `DeepClone\NotInstantiableException` for
   abstract classes, interfaces, traits and enums, like `deepclone_hydrate()`
   and the polyfill do, instead of an `Error`.
@@ -106,6 +106,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `deepclone_to_array()` keeps the marker of closures held by `&`
   references: named ones, and the ones declared in constant expressions, came
   back as the arrays that encode them.
+- `deepclone_to_array()` crashed on malformed mangled keys returned by
+  `__serialize()`, eg `"\0"` or `"\0*"`: they're skipped with the notice
+  `unserialize()` triggers before failing on them. Once their property table
+  got built, the private properties of anonymous classes also got a scope that
+  `deepclone_from_array()` rejected.
+- `deepclone_hydrate()` crashed when binding a `&` reference to an untyped
+  property with `DEEPCLONE_HYDRATE_CALL_HOOKS | DEEPCLONE_HYDRATE_PRESERVE_REFS`.
+- `deepclone_hydrate()` throws the `TypeError` of PHP for `null` on a
+  non-nullable typed property of an internal class, like the polyfill does,
+  instead of leaving it uninitialized: their methods expect it initialized, eg
+  `Exception::getTraceAsString()` crashed.
 
 ## [0.8.5] - 2026-09-23
 
