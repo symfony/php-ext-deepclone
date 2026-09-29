@@ -327,6 +327,10 @@ typedef struct {
 } dc_resolve_entry;
 
 #define DC_RLOG_INLINE 16
+/* Past the inline ones, entries are allocated by blocks, which never move
+ * as the log grows */
+#define DC_RLOG_BLOCK_SHIFT 6
+#define DC_RLOG_BLOCK_SIZE (1u << DC_RLOG_BLOCK_SHIFT)
 
 /* A property value to walk once the slots of all the properties of its
  * object are created */
@@ -372,9 +376,11 @@ struct _dc_ctx {
 	zval           classes;        /* deduped class names */
 	zval           properties;     /* [scope][name][id] => value */
 	zval           resolve;        /* [scope][name][id] => marker */
-	dc_resolve_entry *rlog;        /* property markers, until put in resolve */
+	/* Property markers, until put in resolve */
+	dc_resolve_entry **rlog_blocks;
+	uint32_t       rlog_blocks_count;
+	uint32_t       rlog_blocks_cap;
 	uint32_t       rlog_count;
-	uint32_t       rlog_cap;
 	dc_resolve_entry rlog_inline[DC_RLOG_INLINE];
 	/* The property values to walk, as a stack shared by the nested objects */
 	dc_pending_entry *pending;
@@ -461,6 +467,16 @@ static zend_always_inline bool dc_needs_internal_state(zend_class_entry *ce)
 
 /* ── Helpers ────────────────────────────────────────────────── */
 
+static zend_always_inline dc_resolve_entry *dc_rlog_at(dc_ctx *ctx, uint32_t idx)
+{
+	if (idx < DC_RLOG_INLINE) {
+		return &ctx->rlog_inline[idx];
+	}
+	idx -= DC_RLOG_INLINE;
+
+	return &ctx->rlog_blocks[idx >> DC_RLOG_BLOCK_SHIFT][idx & (DC_RLOG_BLOCK_SIZE - 1)];
+}
+
 static void dc_ctx_init(dc_ctx *ctx) {
 	zend_hash_init(&ctx->object_pool, 8, NULL, NULL, 0);
 	ctx->entries = NULL;
@@ -471,9 +487,10 @@ static void dc_ctx_init(dc_ctx *ctx) {
 	ZVAL_UNDEF(&ctx->classes);
 	ZVAL_UNDEF(&ctx->properties);
 	ZVAL_UNDEF(&ctx->resolve);
-	ctx->rlog = ctx->rlog_inline;
+	ctx->rlog_blocks = NULL;
+	ctx->rlog_blocks_count = 0;
+	ctx->rlog_blocks_cap = 0;
 	ctx->rlog_count = 0;
-	ctx->rlog_cap = DC_RLOG_INLINE;
 	ctx->pending = ctx->pending_inline;
 	ctx->pending_count = 0;
 	ctx->pending_cap = DC_PENDING_INLINE;
@@ -496,14 +513,18 @@ static void dc_ctx_destroy(dc_ctx *ctx) {
 	zval_ptr_dtor(&ctx->resolve);
 	/* Markers not moved to ctx->resolve after an exception */
 	for (uint32_t i = 0; i < ctx->rlog_count; i++) {
-		zend_string_release(ctx->rlog[i].scope);
-		if (ctx->rlog[i].name) {
-			zend_string_release(ctx->rlog[i].name);
+		dc_resolve_entry *re = dc_rlog_at(ctx, i);
+		zend_string_release(re->scope);
+		if (re->name) {
+			zend_string_release(re->name);
 		}
-		zval_ptr_dtor(&ctx->rlog[i].mask);
+		zval_ptr_dtor(&re->mask);
 	}
-	if (ctx->rlog != ctx->rlog_inline) {
-		efree(ctx->rlog);
+	for (uint32_t i = 0; i < ctx->rlog_blocks_count; i++) {
+		efree(ctx->rlog_blocks[i]);
+	}
+	if (ctx->rlog_blocks) {
+		efree(ctx->rlog_blocks);
 	}
 	if (ctx->pending != ctx->pending_inline) {
 		efree(ctx->pending);
@@ -930,17 +951,19 @@ static zend_always_inline zval *dc_name_subarray_find(HashTable *scope_ht, zend_
  * ownership of mask. Returns the index of the log entry. */
 static uint32_t dc_rlog_add(dc_ctx *ctx, dc_pool_entry *entry, zend_string *scope, zend_string *name, bool may_be_numeric, zval *mask)
 {
-	if (UNEXPECTED(ctx->rlog_count >= ctx->rlog_cap)) {
-		ctx->rlog_cap = ((ctx->rlog_cap * 3) >> 1) + 1;
-		if (ctx->rlog == ctx->rlog_inline) {
-			ctx->rlog = safe_emalloc(ctx->rlog_cap, sizeof(dc_resolve_entry), 0);
-			memcpy(ctx->rlog, ctx->rlog_inline, sizeof(ctx->rlog_inline));
-		} else {
-			ctx->rlog = safe_erealloc(ctx->rlog, ctx->rlog_cap, sizeof(dc_resolve_entry), 0);
+	uint32_t idx = ctx->rlog_count;
+	if (UNEXPECTED(idx >= DC_RLOG_INLINE && !((idx - DC_RLOG_INLINE) & (DC_RLOG_BLOCK_SIZE - 1)))) {
+		uint32_t block = (idx - DC_RLOG_INLINE) >> DC_RLOG_BLOCK_SHIFT;
+		if (block == ctx->rlog_blocks_count) {
+			if (block == ctx->rlog_blocks_cap) {
+				ctx->rlog_blocks_cap = ctx->rlog_blocks_cap ? ctx->rlog_blocks_cap * 2 : 8;
+				ctx->rlog_blocks = safe_erealloc(ctx->rlog_blocks, ctx->rlog_blocks_cap, sizeof(dc_resolve_entry *), 0);
+			}
+			ctx->rlog_blocks[ctx->rlog_blocks_count++] = emalloc(DC_RLOG_BLOCK_SIZE * sizeof(dc_resolve_entry));
 		}
 	}
-	uint32_t idx = ctx->rlog_count++;
-	dc_resolve_entry *re = &ctx->rlog[idx];
+	ctx->rlog_count++;
+	dc_resolve_entry *re = dc_rlog_at(ctx, idx);
 	re->scope = zend_string_copy(scope);
 	if (may_be_numeric && ZEND_HANDLE_NUMERIC(name, re->idx)) {
 		re->name = NULL;
@@ -953,7 +976,7 @@ static uint32_t dc_rlog_add(dc_ctx *ctx, dc_pool_entry *entry, zend_string *scop
 	if (entry->rlog_tail == UINT32_MAX) {
 		entry->rlog_head = idx;
 	} else {
-		ctx->rlog[entry->rlog_tail].next = idx;
+		dc_rlog_at(ctx, entry->rlog_tail)->next = idx;
 	}
 	entry->rlog_tail = idx;
 
@@ -978,8 +1001,9 @@ static void dc_rlog_flush(dc_ctx *ctx)
 		if (!e) {
 			continue;
 		}
-		for (uint32_t i = e->rlog_head; i != UINT32_MAX; i = ctx->rlog[i].next) {
-			dc_resolve_entry *re = &ctx->rlog[i];
+		for (uint32_t i = e->rlog_head; i != UINT32_MAX; ) {
+			dc_resolve_entry *re = dc_rlog_at(ctx, i);
+			i = re->next;
 			if (Z_TYPE(re->mask) == IS_UNDEF) {
 				ZVAL_NULL(&re->mask);
 			}
@@ -3625,7 +3649,7 @@ static void dc_unwrap_prop_ref(dc_ctx *ctx, dc_ref_entry *re)
 	ZVAL_COPY(slot, &re->cur_value);
 
 	if (re->prop_log_idx != UINT32_MAX) {
-		slot = &ctx->rlog[re->prop_log_idx].mask;
+		slot = &dc_rlog_at(ctx, re->prop_log_idx)->mask;
 		zval_ptr_dtor(slot);
 		ZVAL_COPY(slot, &re->cur_mask);
 	}
