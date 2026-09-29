@@ -5,6 +5,22 @@ All notable changes to this extension will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- `deepclone_to_array()` merged the objects that `__serialize()`,
+  `__sleep()` or `Serializable::serialize()` create and release while the
+  graph is walked, as their handles got reused, eg the dates of two
+  `DatePeriod`: they're kept alive until the payload is built. This also makes
+  `Serializable::serialize()` see the objects met before as back-references,
+  like `serialize()` does.
+- `deepclone_to_array()` calls `__serialize()` whatever its visibility, like
+  `serialize()` does, instead of throwing.
+- References that nothing else holds, eg after `unset()` of the other side,
+  are exported as values, like `serialize()` and the polyfill do, instead of
+  taking a reference id.
+
 ## [0.8.6] - 2026-09-29
 
 ### Changed

@@ -345,10 +345,9 @@ typedef struct {
 /* ── Object pool entry ──────────────────────────────────────── */
 
 typedef struct {
+	zend_object   *obj;           /* kept alive so that its handle isn't reused */
 	uint32_t       id;
 	uint32_t       cidx;          /* class index in the deduped classes[] array */
-	zend_string   *class_name;
-	bool           class_name_owned; /* true if class_name was allocated (Serializable) */
 	int            wakeup;        /* >0 = __wakeup order, <0 = __unserialize order, 0 = none */
 	HashTable     *props;         /* [scope][name] => value (already prepared) */
 	HashTable     *prop_mask;     /* [scope][name] => mask marker (or NULL) */
@@ -404,7 +403,6 @@ struct _dc_ctx {
 #define DC_CI_HAS_UNSERIALIZE  (1 << 0)
 #define DC_CI_HAS_WAKEUP       (1 << 1)
 #define DC_CI_HAS_SERIALIZE    (1 << 2)
-#define DC_CI_SERIALIZE_PUBLIC (1 << 3)
 #define DC_CI_HAS_SLEEP        (1 << 4)
 #define DC_CI_NOT_INSTANTIABLE (1 << 5)
 #define DC_CI_COMPUTED         (1 << 7)
@@ -537,14 +535,16 @@ static void dc_ctx_destroy(dc_ctx *ctx) {
 		for (uint32_t id = 0; id < ctx->next_obj_id; id++) {
 			dc_pool_entry *e = ctx->entries[id];
 			if (!e) continue;
-			if (e->class_name_owned) {
-				zend_string_release(e->class_name);
-			}
 			if (e->props) {
 				zend_array_destroy(e->props);
 			}
 			if (e->prop_mask) {
 				zend_array_destroy(e->prop_mask);
+			}
+			/* Undo the ref taken above, which can't make it a garbage cycle
+			 * root */
+			if (GC_DELREF(e->obj) == 0) {
+				zend_objects_store_del(e->obj);
 			}
 			efree(e);
 		}
@@ -675,9 +675,6 @@ static uint8_t dc_get_class_info(dc_ctx *ctx, zend_class_entry *ce)
 	}
 	if (ce->__serialize) {
 		flags |= DC_CI_HAS_SERIALIZE;
-		if (ce->__serialize->common.fn_flags & ZEND_ACC_PUBLIC) {
-			flags |= DC_CI_SERIALIZE_PUBLIC;
-		}
 	}
 	/* __sleep and __wakeup have no direct ce field — use known-string lookup */
 	if (zend_hash_find_known_hash(&ce->function_table, ZSTR_KNOWN(ZEND_STR_SLEEP))) {
@@ -1361,6 +1358,19 @@ static bool dc_bind_dynamic_property_ref(zend_object *obj, zend_string *name, zv
 static void dc_copy_value(dc_ctx *ctx, zval *src, zval *dst, zval *mask_dst);
 static void dc_copy_array(dc_ctx *ctx, HashTable *src_ht, zval *dst, zval *mask_dst);
 
+/* Like ReflectionReference::fromArrayElement(), take the value of a reference
+ * that nothing else holds, eg after unset() of the other side, unless it's
+ * the array holding it */
+static zend_always_inline zval *dc_unshared_ref_value(zval *val, HashTable *ht)
+{
+	if (UNEXPECTED(Z_ISREF_P(val)) && Z_REFCOUNT_P(val) == 1
+	 && (Z_TYPE_P(Z_REFVAL_P(val)) != IS_ARRAY || Z_ARRVAL_P(Z_REFVAL_P(val)) != ht)) {
+		return Z_REFVAL_P(val);
+	}
+
+	return val;
+}
+
 static void dc_copy_array(dc_ctx *ctx, HashTable *src_ht, zval *dst, zval *mask_dst)
 {
 	zend_string *key;
@@ -1397,7 +1407,7 @@ static void dc_copy_array(dc_ctx *ctx, HashTable *src_ht, zval *dst, zval *mask_
 		zval *dst_slot = dst_ht->arPacked;
 		zval *mask_slot = mask_ht->arPacked;
 		ZEND_HASH_PACKED_FOREACH_VAL(src_ht, src_val) {
-			dc_copy_value(ctx, src_val, dst_slot, mask_slot);
+			dc_copy_value(ctx, dc_unshared_ref_value(src_val, src_ht), dst_slot, mask_slot);
 			if (UNEXPECTED(EG(exception))) return;
 			dst_slot++;
 			mask_slot++;
@@ -1436,7 +1446,7 @@ static void dc_copy_array(dc_ctx *ctx, HashTable *src_ht, zval *dst, zval *mask_
 			new_dst_slot  = zend_hash_index_add_new(Z_ARRVAL_P(dst), idx, &undef);
 			new_mask_slot = zend_hash_index_add_new(Z_ARRVAL_P(mask_dst), idx, &null_marker);
 		}
-		dc_copy_value(ctx, src_val, new_dst_slot, new_mask_slot);
+		dc_copy_value(ctx, dc_unshared_ref_value(src_val, src_ht), new_dst_slot, new_mask_slot);
 		if (UNEXPECTED(EG(exception))) return;
 	} ZEND_HASH_FOREACH_END();
 }
@@ -2907,10 +2917,13 @@ static void dc_process_object(dc_ctx *ctx, zval *src, zval *dst, zval *mask_dst)
 
 	/* Allocate pool entry */
 	dc_pool_entry *entry = emalloc(sizeof(dc_pool_entry));
+	/* The pool is keyed by handle: objects that __serialize() or __sleep()
+	 * create, eg DatePeriod::__serialize() on its dates, would be freed after
+	 * their walk and their handle reused by the next ones */
+	entry->obj = obj;
+	GC_ADDREF(obj);
 	entry->id = ctx->next_obj_id++;
 	entry->cidx = UINT32_MAX;
-	entry->class_name = ce->name;
-	entry->class_name_owned = false;
 	entry->wakeup = 0;
 	entry->props = NULL;
 	entry->prop_mask = NULL;
@@ -2957,11 +2970,7 @@ static void dc_process_object(dc_ctx *ctx, zval *src, zval *dst, zval *mask_dst)
 
 	/* ── __serialize ────────────────────────────── */
 	if (ci & DC_CI_HAS_SERIALIZE) {
-		if (UNEXPECTED(!(ci & DC_CI_SERIALIZE_PUBLIC))) {
-			zend_throw_error(NULL, "Call to non-public method %s::__serialize()", ZSTR_VAL(ce->name));
-			zval_ptr_dtor(&props_zval);
-			return;
-		}
+		/* Like serialize(), which calls it whatever its visibility */
 		zend_call_method_with_0_params(obj, ce, &ce->__serialize, "__serialize", &retval);
 		if (UNEXPECTED(EG(exception))) {
 			zval_ptr_dtor(&props_zval);
@@ -2992,9 +3001,9 @@ static void dc_process_object(dc_ctx *ctx, zval *src, zval *dst, zval *mask_dst)
 		php_var_serialize(&buf, src, &var_hash);
 		PHP_VAR_SERIALIZE_DESTROY(var_hash);
 
-		entry->class_name = smart_str_extract(&buf);
-		entry->class_name_owned = true;
-		entry->cidx = dc_class_index(ctx, entry->class_name);
+		zend_string *serialized = smart_str_extract(&buf);
+		entry->cidx = dc_class_index(ctx, serialized);
+		zend_string_release(serialized);
 		entry->props = NULL;
 		entry->prop_mask = NULL;
 		zval_ptr_dtor(&props_zval);
@@ -3016,6 +3025,7 @@ static void dc_process_object(dc_ctx *ctx, zval *src, zval *dst, zval *mask_dst)
 			/* Roll back the pool entry and write null into the parent slot */
 			zval_ptr_dtor(&props_zval);
 			ctx->entries[entry->id] = NULL;
+			OBJ_RELEASE(entry->obj);
 			efree(entry);
 			zend_hash_index_del(&ctx->object_pool, handle);
 			ctx->next_obj_id--;
@@ -3250,7 +3260,7 @@ next_prop:
 
 prepare_props:
 	/* Compute and cache the deduped class index */
-	entry->cidx = dc_class_index(ctx, entry->class_name);
+	entry->cidx = dc_class_index(ctx, ce->name);
 
 	if (has_unserialize) {
 		/* For __unserialize objects: prepare a flat array as the state argument */

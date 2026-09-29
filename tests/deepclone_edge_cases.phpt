@@ -27,11 +27,8 @@ class PrivateSerialize {
     private function __serialize(): array { return []; }
     public function __unserialize(array $d): void {}
 }');
-try {
-    @deepclone_to_array(new PrivateSerialize());
-} catch (Error $e) {
-    var_dump(str_contains($e->getMessage(), 'non-public') || str_contains($e->getMessage(), 'private'));
-}
+// Called like serialize() does, whatever its visibility
+var_dump(deepclone_from_array(@deepclone_to_array(new PrivateSerialize())) instanceof PrivateSerialize);
 
 // ── __sleep returning non-string ──
 class BadSleep {
