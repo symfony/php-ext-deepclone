@@ -61,6 +61,7 @@
 #include "Zend/zend_interfaces.h"
 #include "ext/spl/spl_iterators.h"
 #include "ext/spl/spl_exceptions.h"
+#include "ext/spl/spl_array.h"
 #include "ext/spl/spl_heap.h"
 #include "ext/spl/spl_observer.h"
 
@@ -3003,6 +3004,15 @@ static void dc_process_object(dc_ctx *ctx, zval *src, zval *dst, zval *mask_dst)
 			zval_ptr_dtor(&retval);
 			zval_ptr_dtor(&props_zval);
 			return;
+		}
+		/* ArrayObject and ArrayIterator return their storage without separating it, so that writing to the object later would change the payload */
+		if (instanceof_function(ce, spl_ce_ArrayObject) || instanceof_function(ce, spl_ce_ArrayIterator)) {
+			zval *storage = zend_hash_index_find(Z_ARRVAL(retval), 1);
+			if (storage && Z_TYPE_P(storage) == IS_ARRAY && Z_REFCOUNTED_P(storage) && Z_REFCOUNT_P(storage) > 1) {
+				SEPARATE_ARRAY(&retval);
+				storage = zend_hash_index_find(Z_ARRVAL(retval), 1);
+				SEPARATE_ARRAY(storage);
+			}
 		}
 		if (has_unserialize) {
 			zval_ptr_dtor(&props_zval);
