@@ -62,6 +62,20 @@ jobs:
             echo "::endgroup::"
           done
 
+  package-xml:
+    name: "package.xml version"
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check that package.xml matches PHP_DEEPCLONE_VERSION
+        run: |
+          header=$(sed -n 's/^#define PHP_DEEPCLONE_VERSION "\(.*\)"$/\1/p' php_deepclone.h)
+          release=$(sed -n '0,/<release>/s/.*<release>\(.*\)<\/release>.*/\1/p' package.xml)
+          echo "php_deepclone.h: $header, package.xml: $release"
+          test -n "$header" && test "$header" = "$release"
+
   asan:
     name: "Linux 8.4 NTS + ASAN/UBSAN"
     runs-on: ubuntu-latest

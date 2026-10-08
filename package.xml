@@ -1,0 +1,70 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<package packagerversion="1.10.15" version="2.0" xmlns="http://pear.php.net/dtd/package-2.0" xmlns:tasks="http://pear.php.net/dtd/tasks-1.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://pear.php.net/dtd/tasks-1.0 http://pear.php.net/dtd/tasks-1.0.xsd http://pear.php.net/dtd/package-2.0 http://pear.php.net/dtd/package-2.0.xsd">
+ <name>deepclone</name>
+ <channel>pecl.php.net</channel>
+ <summary>Deep-clone any serializable PHP value as a pure array payload</summary>
+ <description>This extension deep-clones any serializable PHP value, faster and with less memory than unserialize(serialize()): strings and arrays keep their copy-on-write semantics. It turns the value into a payload made of scalars and nested arrays only, and back. That is the format of Symfony's DeepCloner, which uses the extension when it is loaded and its polyfill otherwise.</description>
+ <lead>
+  <name>Nicolas Grekas</name>
+  <user>nicolas-grekas</user>
+  <email>p@tchwork.com</email>
+  <active>yes</active>
+ </lead>
+ <date>2026-10-07</date>
+ <time>09:31:28</time>
+ <version>
+  <release>0.8.8</release>
+  <api>0.8.8</api>
+ </version>
+ <stability>
+  <release>beta</release>
+  <api>beta</api>
+ </stability>
+ <license uri="https://opensource.org/licenses/MIT">MIT</license>
+ <notes>
+Fixed: deepclone_to_array() separates the storage that ArrayObject and ArrayIterator return from __serialize(), as these classes write to it in place: changing such an object after the call changed the payload too. See CHANGELOG.md for details.
+ </notes>
+ <contents>
+  <dir name="/">
+   <file name="config.m4" role="src" />
+   <file name="config.w32" role="src" />
+   <file name="deepclone.c" role="src" />
+   <file name="php_deepclone.h" role="src" />
+   <file name="deepclone_arginfo.h" role="src" />
+   <file name="deepclone.stub.php" role="src" />
+   <file name="README.md" role="doc" />
+   <file name="CHANGELOG.md" role="doc" />
+   <file name="LICENSE" role="doc" />
+  </dir>
+ </contents>
+ <dependencies>
+  <required>
+   <php>
+    <min>8.2.0</min>
+   </php>
+   <pearinstaller>
+    <min>1.4.8</min>
+   </pearinstaller>
+  </required>
+ </dependencies>
+ <providesextension>deepclone</providesextension>
+ <extsrcrelease />
+ <changelog>
+  <release>
+   <date>2026-10-07</date>
+   <time>09:31:28</time>
+   <version>
+    <release>0.8.8</release>
+    <api>0.8.8</api>
+   </version>
+   <stability>
+    <release>beta</release>
+    <api>beta</api>
+   </stability>
+   <license uri="https://opensource.org/licenses/MIT">MIT</license>
+   <notes>
+See CHANGELOG.md
+   </notes>
+  </release>
+ </changelog>
+</package>
