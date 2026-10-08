@@ -10,11 +10,11 @@
   <email>p@tchwork.com</email>
   <active>yes</active>
  </lead>
- <date>2026-10-07</date>
- <time>09:31:28</time>
+ <date>2026-10-08</date>
+ <time>16:53:39</time>
  <version>
-  <release>0.8.8</release>
-  <api>0.8.8</api>
+  <release>0.8.9</release>
+  <api>0.8.9</api>
  </version>
  <stability>
   <release>beta</release>
@@ -22,7 +22,7 @@
  </stability>
  <license uri="https://opensource.org/licenses/MIT">MIT</license>
  <notes>
-Fixed: deepclone_to_array() separates the storage that ArrayObject and ArrayIterator return from __serialize(), as these classes write to it in place: changing such an object after the call changed the payload too. See CHANGELOG.md for details.
+Added: a package.xml, so that install-php-extensions builds the extension. See CHANGELOG.md for details.
  </notes>
  <contents>
   <dir name="/">
@@ -51,11 +51,11 @@ Fixed: deepclone_to_array() separates the storage that ArrayObject and ArrayIter
  <extsrcrelease />
  <changelog>
   <release>
-   <date>2026-10-07</date>
-   <time>09:31:28</time>
+   <date>2026-10-08</date>
+   <time>16:53:39</time>
    <version>
-    <release>0.8.8</release>
-    <api>0.8.8</api>
+    <release>0.8.9</release>
+    <api>0.8.9</api>
    </version>
    <stability>
     <release>beta</release>
