@@ -5,6 +5,20 @@ All notable changes to this extension will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- `deepclone_from_array()` read the wakeup flags of `"objectMeta"` as 32-bit
+  integers, so `4294967295` read as `-1` and `-4294967296` as no flag. Only
+  their sign matters now.
+- When `deepclone_from_array()` returns lazy ghosts, it checks the markers of
+  their properties and states right away, like for other objects. Unknown
+  object or reference ids, values of the wrong type and malformed closures were
+  reported on first access before.
+- A const-expr closure with a negative or too large closure index is reported
+  before its class is looked up, like its other malformed parts.
+
 ## [0.8.9] - 2026-10-08
 
 ### Added
