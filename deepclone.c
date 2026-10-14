@@ -2104,54 +2104,73 @@ static void ZEND_FASTCALL dc_attr_new_instance_wrapper(INTERNAL_FUNCTION_PARAMET
 }
 #endif /* PHP_VERSION_ID >= 80500 */
 
-/* deepclone_from_array() counterpart: resolve a declaration-site reference
- * back to a live Closure. */
-static void dc_cexpr_resolve(zval *value, HashTable *allowed_set, zval *retval)
+/* Check the shape of the value of a const-expr closure, [class, site,
+ * attribute index, closure index, line], its class against the allow-list and
+ * the range of its closure index, and fetch its parts. Throws and returns
+ * false when malformed. */
+static bool dc_cexpr_parts(zval *value, HashTable *allowed_set, zval **zclass, zval **zsite, zval **zattr, zval **zord, zval **zline)
 {
 	if (Z_TYPE_P(value) != IS_ARRAY) {
 		zend_value_error("deepclone_from_array(): malformed payload, const-expr-closure value must be of type array, %s given", zend_zval_value_name(value));
-		return;
+		return false;
 	}
 	HashTable *ht = Z_ARRVAL_P(value);
-	zval *zclass = zend_hash_index_find(ht, 0);
-	zval *zsite = zend_hash_index_find(ht, 1);
-	zval *zattr = zend_hash_index_find(ht, 2);
-	zval *zord = zend_hash_index_find(ht, 3);
-	zval *zline = zend_hash_index_find(ht, 4);
-	if (!zclass || !zsite || !zattr || !zord || !zline || zend_hash_num_elements(ht) != 5) {
+	*zclass = zend_hash_index_find(ht, 0);
+	*zsite = zend_hash_index_find(ht, 1);
+	*zattr = zend_hash_index_find(ht, 2);
+	*zord = zend_hash_index_find(ht, 3);
+	*zline = zend_hash_index_find(ht, 4);
+	if (!*zclass || !*zsite || !*zattr || !*zord || !*zline || zend_hash_num_elements(ht) != 5) {
 		zend_value_error("deepclone_from_array(): malformed payload, const-expr-closure value must have 5 elements");
-		return;
+		return false;
 	}
-	ZVAL_DEREF(zclass);
-	ZVAL_DEREF(zsite);
-	ZVAL_DEREF(zattr);
-	ZVAL_DEREF(zord);
-	ZVAL_DEREF(zline);
-	if (Z_TYPE_P(zclass) != IS_STRING) {
-		zend_value_error("deepclone_from_array(): malformed payload, const-expr-closure class name must be of type string, %s given", zend_zval_value_name(zclass));
-		return;
+	ZVAL_DEREF(*zclass);
+	ZVAL_DEREF(*zsite);
+	ZVAL_DEREF(*zattr);
+	ZVAL_DEREF(*zord);
+	ZVAL_DEREF(*zline);
+	if (Z_TYPE_P(*zclass) != IS_STRING) {
+		zend_value_error("deepclone_from_array(): malformed payload, const-expr-closure class name must be of type string, %s given", zend_zval_value_name(*zclass));
+		return false;
 	}
-	if (Z_TYPE_P(zsite) != IS_STRING) {
-		zend_value_error("deepclone_from_array(): malformed payload, const-expr-closure site must be of type string, %s given", zend_zval_value_name(zsite));
-		return;
+	if (Z_TYPE_P(*zsite) != IS_STRING) {
+		zend_value_error("deepclone_from_array(): malformed payload, const-expr-closure site must be of type string, %s given", zend_zval_value_name(*zsite));
+		return false;
 	}
-	if (Z_TYPE_P(zattr) != IS_NULL && Z_TYPE_P(zattr) != IS_LONG) {
-		zend_value_error("deepclone_from_array(): malformed payload, const-expr-closure attribute index must be of type int or null, %s given", zend_zval_value_name(zattr));
-		return;
+	if (Z_TYPE_P(*zattr) != IS_NULL && Z_TYPE_P(*zattr) != IS_LONG) {
+		zend_value_error("deepclone_from_array(): malformed payload, const-expr-closure attribute index must be of type int or null, %s given", zend_zval_value_name(*zattr));
+		return false;
 	}
-	if (Z_TYPE_P(zord) != IS_LONG) {
-		zend_value_error("deepclone_from_array(): malformed payload, const-expr-closure closure index must be of type int, %s given", zend_zval_value_name(zord));
-		return;
+	if (Z_TYPE_P(*zord) != IS_LONG) {
+		zend_value_error("deepclone_from_array(): malformed payload, const-expr-closure closure index must be of type int, %s given", zend_zval_value_name(*zord));
+		return false;
 	}
-	if (Z_TYPE_P(zline) != IS_LONG) {
-		zend_value_error("deepclone_from_array(): malformed payload, const-expr-closure line must be of type int, %s given", zend_zval_value_name(zline));
-		return;
+	if (Z_TYPE_P(*zline) != IS_LONG) {
+		zend_value_error("deepclone_from_array(): malformed payload, const-expr-closure line must be of type int, %s given", zend_zval_value_name(*zline));
+		return false;
 	}
 
 	/* Gate before zend_lookup_class(): the payload must not be able to
 	 * autoload, let alone evaluate, classes outside the allow-list. */
-	if (!dc_class_allowed(allowed_set, Z_STR_P(zclass))) {
-		zend_value_error("deepclone_from_array(): class \"%s\" is not allowed", Z_STRVAL_P(zclass));
+	if (!dc_class_allowed(allowed_set, Z_STR_P(*zclass))) {
+		zend_value_error("deepclone_from_array(): class \"%s\" is not allowed", Z_STRVAL_P(*zclass));
+		return false;
+	}
+
+	if (Z_LVAL_P(*zord) < 0 || Z_LVAL_P(*zord) > UINT32_MAX) {
+		zend_value_error("deepclone_from_array(): malformed payload, const-expr-closure references unknown closure index " ZEND_LONG_FMT, Z_LVAL_P(*zord));
+		return false;
+	}
+
+	return true;
+}
+
+/* deepclone_from_array() counterpart: resolve a declaration-site reference
+ * back to a live Closure. */
+static void dc_cexpr_resolve(zval *value, HashTable *allowed_set, zval *retval)
+{
+	zval *zclass, *zsite, *zattr, *zord, *zline;
+	if (!dc_cexpr_parts(value, allowed_set, &zclass, &zsite, &zattr, &zord, &zline)) {
 		return;
 	}
 
@@ -2167,11 +2186,6 @@ static void dc_cexpr_resolve(zval *value, HashTable *allowed_set, zval *retval)
 	bool attr_site = Z_TYPE_P(zattr) == IS_LONG;
 	zend_long want_ord = Z_LVAL_P(zord);
 	zend_long line = Z_LVAL_P(zline);
-
-	if (want_ord < 0 || want_ord > UINT32_MAX) {
-		zend_value_error("deepclone_from_array(): malformed payload, const-expr-closure references unknown closure index " ZEND_LONG_FMT, want_ord);
-		return;
-	}
 
 	/* Resolve the site to a target: its attribute list + evaluation scope,
 	 * and for value sites the const-expr source zval. */
@@ -4292,13 +4306,14 @@ static void dc_resolve(zval *value, zval *mask, zval *objects, uint32_t num_obje
  * reference cycle is visible to the GC through dc_lazy_ctx_get_gc() and the
  * engine's lazy-object get_gc, so abandoned graphs are collectable.
  *
- * Structural validation (object ids, scopes, declared-property matches) and
- * the const-expr-closure allow-list gate stay eager: malformed payloads keep
+ * Structural validation (object ids, scopes, declared-property matches, the
+ * shape of the markers and the object and ref ids they reference) and the
+ * const-expr-closure allow-list gate stay eager: malformed payloads keep
  * failing inside deepclone_from_array(). What can surface lazily, at first
- * access, are value-level resolution errors (unknown class or enum case,
- * stale const-expr line, type errors), like any native lazy-object
- * initializer. A failing initializer is reverted by the engine and the
- * ghost stays uninitialized and retryable. */
+ * access, are the errors that depend on what the payload references (unknown
+ * function, class or enum case, stale const-expr line, type errors), like any
+ * native lazy-object initializer. A failing initializer is reverted by the
+ * engine and the ghost stays uninitialized and retryable. */
 
 typedef struct {
 	zend_class_entry   *scope_ce;   /* resolved scope (zend_standard_class_def for public scope) */
@@ -4450,38 +4465,102 @@ static bool dc_class_can_be_ghost(const zend_class_entry *ce)
 	return true;
 }
 
-/* Eagerly check the closure markers inside a deferred slot: the shape of
- * named closures, and the allow-list on const-expr closures, replicating the
- * gate dc_cexpr_resolve() applies before zend_lookup_class(). Without this,
- * lazy mode would delay these errors about the payload itself to an
- * arbitrary later point in the program. What depends on what the payload
- * references, eg a function that doesn't exist, fails on first use. */
-static void dc_lazy_gate(zval *value, zval *mask, HashTable *allowed_set)
+/* Check the hard-ref id of a value, or of a slot of an array mask, like
+ * dc_resolve() does, against the "refs" of the payload, which are the keys of
+ * the refs table it resolves against. */
+static bool dc_lazy_gate_ref_id(zval *value, bool slot, HashTable *refs)
+{
+	ZVAL_DEREF(value);
+	if (Z_TYPE_P(value) != IS_LONG) {
+		if (slot) {
+			zend_value_error("deepclone_from_array(): malformed payload, hard-ref slot must be of type int, %s given", zend_zval_value_name(value));
+		} else {
+			zend_value_error("deepclone_from_array(): malformed payload, hard-ref value must be of type int, %s given", zend_zval_value_name(value));
+		}
+		return false;
+	}
+	if (Z_LVAL_P(value) <= ZEND_LONG_MIN || Z_LVAL_P(value) >= 0) {
+		zend_value_error("deepclone_from_array(): malformed payload, ref id out of range");
+		return false;
+	}
+	if (!refs || !zend_hash_index_exists(refs, -Z_LVAL_P(value))) {
+		zend_value_error("deepclone_from_array(): malformed payload, unknown ref id " ZEND_LONG_FMT, -Z_LVAL_P(value));
+		return false;
+	}
+	return true;
+}
+
+/* Whether value is an object id that mask marks, the most common marker, which
+ * spares a call to dc_lazy_gate() */
+#define DC_LAZY_GATE_IS_OBJ_ID(value, mask, num_objects) \
+	(DC_MASK_IS_OBJ_REF(mask) && Z_TYPE_P(value) == IS_LONG && (zend_ulong) Z_LVAL_P(value) < (num_objects))
+
+/* Eagerly check the markers inside a deferred slot, with the errors of
+ * dc_resolve(): the shape of their values, the object and ref ids they
+ * reference, and the allow-list on const-expr closures. Without this, lazy
+ * mode would delay these errors about the payload itself to an arbitrary
+ * later point in the program. What depends on what the payload references,
+ * eg a function or an enum case that doesn't exist, fails on first use. */
+static void dc_lazy_gate(zval *value, zval *mask, uint32_t num_objects, HashTable *refs, HashTable *allowed_set)
 {
 	if (UNEXPECTED(dc_check_stack_limit())) {
 		return;
 	}
-	if (DC_MASK_IS_NAMED_CLOSURE(mask)) {
-		/* Its shape doesn't depend on what the payload references */
-		zval *zobj, *zname;
-		zend_string *priv_class, *priv_method;
-		dc_named_closure_parts(value, &zobj, &zname, &priv_class, &priv_method);
-		return;
-	}
-	if (DC_MASK_IS_CONSTEXPR_CLOSURE(mask)) {
-		if (allowed_set && Z_TYPE_P(value) == IS_ARRAY) {
-			zval *zclass = zend_hash_index_find(Z_ARRVAL_P(value), 0);
-			if (zclass) {
-				ZVAL_DEREF(zclass);
-				if (Z_TYPE_P(zclass) == IS_STRING
-				 && !dc_class_allowed(allowed_set, Z_STR_P(zclass))) {
-					zend_value_error("deepclone_from_array(): class \"%s\" is not allowed", Z_STRVAL_P(zclass));
-				}
+	ZVAL_DEREF(value);
+
+	if (DC_MASK_IS_OBJ_REF(mask)) {
+		if (Z_TYPE_P(value) != IS_LONG) {
+			zend_value_error("deepclone_from_array(): malformed payload, object reference value must be of type int, %s given", zend_zval_value_name(value));
+		} else if (Z_LVAL_P(value) >= 0) {
+			if ((zend_ulong) Z_LVAL_P(value) >= num_objects) {
+				zend_value_error("deepclone_from_array(): malformed payload, unknown object id " ZEND_LONG_FMT, Z_LVAL_P(value));
 			}
+		} else if (Z_LVAL_P(value) <= ZEND_LONG_MIN) {
+			zend_value_error("deepclone_from_array(): malformed payload, ref id out of range");
+		} else if (!refs || !zend_hash_index_exists(refs, -Z_LVAL_P(value))) {
+			zend_value_error("deepclone_from_array(): malformed payload, unknown ref id " ZEND_LONG_FMT, -Z_LVAL_P(value));
 		}
 		return;
 	}
-	if (Z_TYPE_P(mask) != IS_ARRAY || Z_TYPE_P(value) != IS_ARRAY) {
+	if (DC_MASK_IS_HARD_REF(mask)) {
+		dc_lazy_gate_ref_id(value, false, refs);
+		return;
+	}
+	if (DC_MASK_IS_NAMED_CLOSURE(mask)) {
+		zval *zobj, *zname;
+		zend_string *priv_class, *priv_method;
+		if (!dc_named_closure_parts(value, &zobj, &zname, &priv_class, &priv_method)) {
+			return;
+		}
+		if (Z_TYPE_P(zobj) == IS_LONG) {
+			zend_long id = Z_LVAL_P(zobj);
+			if (id >= 0 ? (zend_ulong) id >= num_objects
+					: id <= ZEND_LONG_MIN || !refs || !zend_hash_index_exists(refs, -id)) {
+				zend_value_error("deepclone_from_array(): malformed payload, named-closure references unknown id " ZEND_LONG_FMT, id);
+			}
+		} else if (Z_TYPE_P(zobj) != IS_OBJECT && Z_TYPE_P(zobj) != IS_STRING && Z_TYPE_P(zobj) != IS_NULL) {
+			zend_value_error("deepclone_from_array(): malformed payload, named-closure callable must be [obj_or_class_or_null, string]");
+		}
+		return;
+	}
+	if (DC_MASK_IS_CONSTEXPR_CLOSURE(mask)) {
+		zval *zclass, *zsite, *zattr, *zord, *zline;
+		dc_cexpr_parts(value, allowed_set, &zclass, &zsite, &zattr, &zord, &zline);
+		return;
+	}
+	if (Z_TYPE_P(mask) == IS_STRING && ZSTR_LEN(Z_STR_P(mask)) == 1 && ZSTR_VAL(Z_STR_P(mask))[0] == 'e') {
+		if (Z_TYPE_P(value) != IS_STRING) {
+			zend_value_error("deepclone_from_array(): malformed payload, enum value must be of type string, %s given", zend_zval_value_name(value));
+		} else if (!strstr(Z_STRVAL_P(value), "::")) {
+			zend_value_error("deepclone_from_array(): malformed payload, enum value must match \"Class::Case\"");
+		}
+		return;
+	}
+	if (Z_TYPE_P(mask) != IS_ARRAY) {
+		return;
+	}
+	if (Z_TYPE_P(value) != IS_ARRAY) {
+		zend_value_error("deepclone_from_array(): malformed payload, array-mask value must be of type array, %s given", zend_zval_value_name(value));
 		return;
 	}
 	zend_string *mkey;
@@ -4491,10 +4570,21 @@ static void dc_lazy_gate(zval *value, zval *mask, HashTable *allowed_set)
 		zval *slot = mkey
 			? zend_hash_find(Z_ARRVAL_P(value), mkey)
 			: zend_hash_index_find(Z_ARRVAL_P(value), midx);
-		if (!slot) continue;
-		dc_lazy_gate(slot, mval, allowed_set);
-		if (UNEXPECTED(EG(exception))) {
-			return;
+		zval null_val;
+		if (!slot) {
+			/* Checked as if it were null, like dc_resolve_unmatched_mask() */
+			ZVAL_NULL(&null_val);
+			slot = &null_val;
+		}
+		if (Z_TYPE_P(mval) == IS_FALSE) {
+			if (!dc_lazy_gate_ref_id(slot, true, refs)) {
+				return;
+			}
+		} else if (!DC_LAZY_GATE_IS_OBJ_ID(slot, mval, num_objects)) {
+			dc_lazy_gate(slot, mval, num_objects, refs, allowed_set);
+			if (UNEXPECTED(EG(exception))) {
+				return;
+			}
 		}
 	} ZEND_HASH_FOREACH_END();
 }
@@ -4513,7 +4603,7 @@ static void dc_lazy_gate(zval *value, zval *mask, HashTable *allowed_set)
  * (non-string scope keys, non-array levels) are skipped consistently by
  * both passes. */
 static bool dc_lazy_index_build(dc_lazy_ctx *ctx, HashTable *properties_ht, HashTable *resolve_ht,
-	zend_string **class_names, zend_class_entry **class_ces, uint32_t num_classes,
+	HashTable *refs_ht, zend_string **class_names, zend_class_entry **class_ces, uint32_t num_classes,
 	const bool *is_ghost, const uint32_t *lazy_slot_counts)
 {
 	HashTable *allowed_set = ctx->allowed_set;
@@ -4654,8 +4744,8 @@ static bool dc_lazy_index_build(dc_lazy_ctx *ctx, HashTable *properties_ht, Hash
 				}
 
 				zval *marker = resolve_ids ? zend_hash_index_find(resolve_ids, obj_id) : NULL;
-				if (marker) {
-					dc_lazy_gate(prop_val, marker, allowed_set);
+				if (marker && !DC_LAZY_GATE_IS_OBJ_ID(prop_val, marker, num_objects)) {
+					dc_lazy_gate(prop_val, marker, num_objects, refs_ht, allowed_set);
 					if (UNEXPECTED(EG(exception))) {
 						goto prop_err;
 					}
@@ -5203,7 +5293,8 @@ PHP_FUNCTION(deepclone_from_array)
 					if (!obj_wakeups) {
 						obj_wakeups = ecalloc(num_objects, sizeof(int));
 					}
-					obj_wakeups[id] = (int) Z_LVAL_P(wk);
+					/* Only the sign matters, which a cast to int could flip */
+					obj_wakeups[id] = ZEND_NORMALIZE_BOOL(Z_LVAL_P(wk));
 				}
 			} else if (Z_TYPE_P(meta) == IS_LONG) {
 				cidx_val = Z_LVAL_P(meta);
@@ -5488,7 +5579,7 @@ PHP_FUNCTION(deepclone_from_array)
 		if (!dc_lazy_index_build(lazy_ctx,
 				zproperties ? Z_ARRVAL_P(zproperties) : NULL,
 				zresolve ? Z_ARRVAL_P(zresolve) : NULL,
-				class_names, class_ces, num_classes,
+				zrefs ? Z_ARRVAL_P(zrefs) : NULL, class_names, class_ces, num_classes,
 				is_ghost, lazy_slot_counts)) {
 			goto cleanup;
 		}
@@ -5539,7 +5630,8 @@ PHP_FUNCTION(deepclone_from_array)
 					}
 					if (st_mask) {
 						/* Same eager gate as deferred slots. */
-						dc_lazy_gate(st_props, st_mask, allowed_set);
+						dc_lazy_gate(st_props, st_mask, num_objects,
+							zrefs ? Z_ARRVAL_P(zrefs) : NULL, allowed_set);
 						if (UNEXPECTED(EG(exception))) {
 							goto cleanup;
 						}
