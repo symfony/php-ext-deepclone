@@ -10,8 +10,8 @@
   <email>p@tchwork.com</email>
   <active>yes</active>
  </lead>
- <date>2026-10-08</date>
- <time>16:53:39</time>
+ <date>2026-10-14</date>
+ <time>11:12:05</time>
  <version>
   <release>0.8.9</release>
   <api>0.8.9</api>
@@ -22,7 +22,7 @@
  </stability>
  <license uri="https://opensource.org/licenses/MIT">MIT</license>
  <notes>
-Added: a package.xml, so that install-php-extensions builds the extension. See CHANGELOG.md for details.
+Added: a package.xml, so that install-php-extensions builds the extension. Changed: deepclone_from_array() is faster. Fixed: malformed payloads reported like the polyfill does. See CHANGELOG.md for details.
  </notes>
  <contents>
   <dir name="/">
@@ -51,8 +51,8 @@ Added: a package.xml, so that install-php-extensions builds the extension. See C
  <extsrcrelease />
  <changelog>
   <release>
-   <date>2026-10-08</date>
-   <time>16:53:39</time>
+   <date>2026-10-14</date>
+   <time>11:12:05</time>
    <version>
     <release>0.8.9</release>
     <api>0.8.9</api>

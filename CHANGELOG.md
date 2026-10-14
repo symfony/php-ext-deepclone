@@ -5,7 +5,12 @@ All notable changes to this extension will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.8.9] - 2026-10-14
+
+### Added
+
+- A `package.xml`, so that `install-php-extensions` builds the extension, eg
+  `install-php-extensions symfony/php-ext-deepclone@v0.8.9` in a Dockerfile.
 
 ### Changed
 
@@ -25,13 +30,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reported on first access before.
 - A const-expr closure with a negative or too large closure index is reported
   before its class is looked up, like its other malformed parts.
-
-## [0.8.9] - 2026-10-08
-
-### Added
-
-- A `package.xml`, so that `install-php-extensions` builds the extension, eg
-  `install-php-extensions symfony/php-ext-deepclone@v0.8.9` in a Dockerfile.
 
 ## [0.8.8] - 2026-10-07
 
