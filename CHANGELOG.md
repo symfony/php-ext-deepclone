@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `deepclone_from_array()` is faster: 14% fewer instructions on the cached
+  payloads of a Symfony app, 18% on a graph of 1600 objects. It resolves
+  object ids inline, and writes typed properties right after checking their
+  type, like `deepclone_hydrate()` now does too.
+
 ### Fixed
 
 - `deepclone_from_array()` read the wakeup flags of `"objectMeta"` as 32-bit
