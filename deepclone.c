@@ -1255,6 +1255,30 @@ static bool dc_write_backed_property(zend_object *obj, zend_property_info *pi,
 		ZVAL_COPY(slot, value);
 		zval_ptr_dtor(&old);
 	}
+	else if (!DC_PROP_HAS_HOOKS(pi) && !call_hooks && !Z_ISREF_P(value)
+		&& Z_TYPE_P(slot) != IS_REFERENCE
+		&& (Z_TYPE_P(slot) != IS_UNDEF ? !(pi->flags & ZEND_ACC_READONLY) : (Z_PROP_FLAG_P(slot) & IS_PROP_UNINIT))
+		&& obj->handlers->write_property == zend_std_write_property)
+	{
+		/* A typed property that zend_std_write_property() would only check
+		 * the type of before writing it, in the scope of the class that
+		 * declares it: the slot contains no reference, no __set() applies and a
+		 * readonly one isn't initialized yet. Do the same without looking
+		 * the property up. */
+		zval tmp;
+		ZVAL_COPY(&tmp, value);
+		/* Not strict, as zend_std_write_property() decides from the frame of
+		 * this internal function */
+		if (UNEXPECTED(!zend_verify_property_type(pi, &tmp, false))) {
+			zval_ptr_dtor(&tmp);
+		} else {
+			zval old;
+			ZVAL_COPY_VALUE(&old, slot);
+			ZVAL_COPY_VALUE(slot, &tmp);
+			Z_PROP_FLAG_P(slot) &= ~(IS_PROP_UNINIT | IS_PROP_REINITABLE);
+			zval_ptr_dtor(&old);
+		}
+	}
 	else if (UNEXPECTED(Z_ISREF_P(value)) && !DC_PROP_HAS_HOOKS(pi)) {
 		/* Binding a shared PHP &-reference to a declared property, typed or
 		 * written with CALL_HOOKS: zend_std_write_property() only accepts
@@ -1373,6 +1397,14 @@ static bool dc_bind_dynamic_property_ref(zend_object *obj, zend_string *name, zv
 #define DC_MASK_IS_HARD_REF(m)          (Z_TYPE_P(m) == IS_FALSE)
 #define DC_MASK_IS_NAMED_CLOSURE(m)     (Z_TYPE_P(m) == IS_LONG && Z_LVAL_P(m) == 0)
 #define DC_MASK_IS_CONSTEXPR_CLOSURE(m) (Z_TYPE_P(m) == IS_LONG && Z_LVAL_P(m) == 1)
+/* Whether a mask can be or nest a closure marker, which spares a call to scan
+ * the most common markers */
+#define DC_MASK_MAY_HOLD_CLOSURE(m)     (Z_TYPE_P(m) == IS_LONG || Z_TYPE_P(m) == IS_ARRAY)
+
+/* Whether mask marks value as the id of an object, the most common marker,
+ * which spares a call to dc_resolve() or dc_lazy_gate() */
+#define DC_MASK_IS_OBJ_ID(value, mask, num_objects) \
+	(DC_MASK_IS_OBJ_REF(mask) && Z_TYPE_P(value) == IS_LONG && (zend_ulong) Z_LVAL_P(value) < (num_objects))
 
 static void dc_copy_value(dc_ctx *ctx, zval *src, zval *dst, zval *mask_dst);
 static void dc_copy_array(dc_ctx *ctx, HashTable *src_ht, zval *dst, zval *mask_dst);
@@ -4247,6 +4279,8 @@ static void dc_resolve(zval *value, zval *mask, zval *objects, uint32_t num_obje
 			}
 			zval_ptr_dtor(slot);
 			ZVAL_COPY(slot, ref_slot);
+		} else if (DC_MASK_IS_OBJ_ID(slot, mval, num_objects) && Z_TYPE(objects[Z_LVAL_P(slot)]) == IS_OBJECT) {
+			ZVAL_COPY(slot, &objects[Z_LVAL_P(slot)]);
 		} else {
 			zval resolved;
 			ZVAL_UNDEF(&resolved);
@@ -4490,11 +4524,6 @@ static bool dc_lazy_gate_ref_id(zval *value, bool slot, HashTable *refs)
 	return true;
 }
 
-/* Whether value is an object id that mask marks, the most common marker, which
- * spares a call to dc_lazy_gate() */
-#define DC_LAZY_GATE_IS_OBJ_ID(value, mask, num_objects) \
-	(DC_MASK_IS_OBJ_REF(mask) && Z_TYPE_P(value) == IS_LONG && (zend_ulong) Z_LVAL_P(value) < (num_objects))
-
 /* Eagerly check the markers inside a deferred slot, with the errors of
  * dc_resolve(): the shape of their values, the object and ref ids they
  * reference, and the allow-list on const-expr closures. Without this, lazy
@@ -4580,7 +4609,7 @@ static void dc_lazy_gate(zval *value, zval *mask, uint32_t num_objects, HashTabl
 			if (!dc_lazy_gate_ref_id(slot, true, refs)) {
 				return;
 			}
-		} else if (!DC_LAZY_GATE_IS_OBJ_ID(slot, mval, num_objects)) {
+		} else if (!DC_MASK_IS_OBJ_ID(slot, mval, num_objects)) {
 			dc_lazy_gate(slot, mval, num_objects, refs, allowed_set);
 			if (UNEXPECTED(EG(exception))) {
 				return;
@@ -4744,7 +4773,7 @@ static bool dc_lazy_index_build(dc_lazy_ctx *ctx, HashTable *properties_ht, Hash
 				}
 
 				zval *marker = resolve_ids ? zend_hash_index_find(resolve_ids, obj_id) : NULL;
-				if (marker && !DC_LAZY_GATE_IS_OBJ_ID(prop_val, marker, num_objects)) {
+				if (marker && !DC_MASK_IS_OBJ_ID(prop_val, marker, num_objects)) {
 					dc_lazy_gate(prop_val, marker, num_objects, refs_ht, allowed_set);
 					if (UNEXPECTED(EG(exception))) {
 						goto prop_err;
@@ -5008,43 +5037,54 @@ static bool dc_mask_has_closure(zval *mask)
 	}
 	zval *v;
 	ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(mask), v) {
-		if (dc_mask_has_closure(v)) {
+		if (DC_MASK_MAY_HOLD_CLOSURE(v) && dc_mask_has_closure(v)) {
 			return true;
 		}
 	} ZEND_HASH_FOREACH_END();
 	return false;
 }
 
-/* Like dc_mask_has_closure() but matches only the named-closure marker
- * (LONG(0)), ignoring const-expr-closure references (LONG(1)). */
-static bool dc_mask_has_named_closure(zval *mask)
+/* Closure markers that a mask or a payload can carry */
+#define DC_NAMED_CLOSURES    1
+#define DC_CONSTEXPR_CLOSURES 2
+
+/* Find the closure markers of a mask, stopping at the first named closure. */
+static int dc_mask_closures(zval *mask)
 {
 	if (mask == NULL) {
-		return false;
+		return 0;
 	}
 	if (DC_MASK_IS_NAMED_CLOSURE(mask)) {
-		return true;
+		return DC_NAMED_CLOSURES;
+	}
+	if (DC_MASK_IS_CONSTEXPR_CLOSURE(mask)) {
+		return DC_CONSTEXPR_CLOSURES;
 	}
 	if (Z_TYPE_P(mask) != IS_ARRAY) {
-		return false;
+		return 0;
 	}
+	int found = 0;
 	zval *v;
 	ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(mask), v) {
-		if (dc_mask_has_named_closure(v)) {
-			return true;
+		if (DC_MASK_MAY_HOLD_CLOSURE(v)) {
+			found |= dc_mask_closures(v);
+			if (found & DC_NAMED_CLOSURES) {
+				break;
+			}
 		}
 	} ZEND_HASH_FOREACH_END();
-	return false;
+	return found;
 }
 
-/* Scan the four payload regions that can carry closure markers — the top
- * mask, the resolve table, the reference masks and the replayed state masks —
- * for a named-closure marker. Mirrors the region set used by the
- * allowed_classes "Closure" gate below. */
-static bool dc_payload_has_named_closure(zval *zmask, zval *zresolve, zval *zref_masks, zval *zstates)
+/* Find the closure markers of the four payload regions that can carry them -
+ * the top mask, the resolve table, the reference masks and the replayed state
+ * masks - stopping at the first named closure. Mirrors the region set used by
+ * the allowed_classes "Closure" gate below. */
+static int dc_payload_closures(zval *zmask, zval *zresolve, zval *zref_masks, zval *zstates)
 {
-	if (dc_mask_has_named_closure(zmask)) {
-		return true;
+	int found = dc_mask_closures(zmask);
+	if (found & DC_NAMED_CLOSURES) {
+		return found;
 	}
 	if (zresolve) {
 		zval *scope;
@@ -5052,8 +5092,9 @@ static bool dc_payload_has_named_closure(zval *zmask, zval *zresolve, zval *zref
 			if (Z_TYPE_P(scope) != IS_ARRAY) continue;
 			zval *name;
 			ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(scope), name) {
-				if (dc_mask_has_named_closure(name)) {
-					return true;
+				found |= dc_mask_closures(name);
+				if (found & DC_NAMED_CLOSURES) {
+					return found;
 				}
 			} ZEND_HASH_FOREACH_END();
 		} ZEND_HASH_FOREACH_END();
@@ -5061,8 +5102,9 @@ static bool dc_payload_has_named_closure(zval *zmask, zval *zresolve, zval *zref
 	if (zref_masks) {
 		zval *rmask;
 		ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(zref_masks), rmask) {
-			if (dc_mask_has_named_closure(rmask)) {
-				return true;
+			found |= dc_mask_closures(rmask);
+			if (found & DC_NAMED_CLOSURES) {
+				return found;
 			}
 		} ZEND_HASH_FOREACH_END();
 	}
@@ -5070,14 +5112,14 @@ static bool dc_payload_has_named_closure(zval *zmask, zval *zresolve, zval *zref
 		zval *state;
 		ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(zstates), state) {
 			if (Z_TYPE_P(state) == IS_ARRAY) {
-				zval *smask = zend_hash_index_find(Z_ARRVAL_P(state), 2);
-				if (smask && dc_mask_has_named_closure(smask)) {
-					return true;
+				found |= dc_mask_closures(zend_hash_index_find(Z_ARRVAL_P(state), 2));
+				if (found & DC_NAMED_CLOSURES) {
+					return found;
 				}
 			}
 		} ZEND_HASH_FOREACH_END();
 	}
-	return false;
+	return found;
 }
 
 PHP_FUNCTION(deepclone_from_array)
@@ -5236,9 +5278,12 @@ PHP_FUNCTION(deepclone_from_array)
 	 * resolve only to closures the named class itself declares. The scan runs
 	 * before any object is instantiated, so a payload carrying a named closure
 	 * is rejected wholesale rather than failing mid-hydration. */
-	if (!allow_named_closures
-			&& dc_payload_has_named_closure(zmask, zresolve, zref_masks, zstates)) {
-		DC_INVALID("deepclone_from_array(): resolving a closure over a named callable requires enabling the \"allow_named_closures\" option; do it only if you trust the input");
+	int closures = DC_NAMED_CLOSURES | DC_CONSTEXPR_CLOSURES;
+	if (!allow_named_closures) {
+		closures = dc_payload_closures(zmask, zresolve, zref_masks, zstates);
+		if (closures & DC_NAMED_CLOSURES) {
+			DC_INVALID("deepclone_from_array(): resolving a closure over a named callable requires enabling the \"allow_named_closures\" option; do it only if you trust the input");
+		}
 	}
 
 	/* ── Build objectMeta ── */
@@ -5326,7 +5371,7 @@ PHP_FUNCTION(deepclone_from_array)
 	 * fully eagerly and no context is created. Class lookups for candidate
 	 * nodes happen here instead of in the creation loop below: same lookups,
 	 * same ClassNotFoundException, just earlier in the same call. */
-	if (num_objects && (zresolve || zstates)) {
+	if (num_objects && closures && (zresolve || zstates)) {
 		bool *has_closure_slot = ecalloc(num_objects, sizeof(bool));
 		bool any_closure = false;
 		if (zresolve) {
@@ -5341,7 +5386,7 @@ PHP_FUNCTION(deepclone_from_array)
 					zval *rs_mask;
 					ZEND_HASH_FOREACH_NUM_KEY_VAL(Z_ARRVAL_P(rs_ids), rs_id, rs_mask) {
 						if (rs_id < num_objects && !has_closure_slot[rs_id]
-						 && dc_mask_has_closure(rs_mask)) {
+						 && DC_MASK_MAY_HOLD_CLOSURE(rs_mask) && dc_mask_has_closure(rs_mask)) {
 							has_closure_slot[rs_id] = true;
 							any_closure = true;
 						}
@@ -5800,6 +5845,10 @@ PHP_FUNCTION(deepclone_from_array)
 				zend_ulong obj_id;
 				zval *prop_val;
 				uint32_t matched_markers = 0;
+				/* The last class looked up for a stdClass-scoped name, as
+				 * the objects of a property often share their class */
+				zend_class_entry *std_ce = NULL;
+				zend_property_info *std_pi = NULL;
 				ZEND_HASH_FOREACH_NUM_KEY_VAL(Z_ARRVAL_P(id_values), obj_id, prop_val) {
 					if (UNEXPECTED(obj_id >= num_objects)) {
 						EG(fake_scope) = old_scope;
@@ -5829,11 +5878,15 @@ PHP_FUNCTION(deepclone_from_array)
 					zval *marker = resolve_ids ? zend_hash_index_find(resolve_ids, obj_id) : NULL;
 					if (marker) {
 						matched_markers++;
-						ZVAL_UNDEF(&final_val);
-						dc_resolve(prop_val, marker, objects, num_objects, refs, allowed_set, &final_val);
-						if (EG(exception)) {
-							EG(fake_scope) = old_scope;
-							goto cleanup;
+						if (DC_MASK_IS_OBJ_ID(prop_val, marker, num_objects) && Z_TYPE(objects[Z_LVAL_P(prop_val)]) == IS_OBJECT) {
+							ZVAL_COPY(&final_val, &objects[Z_LVAL_P(prop_val)]);
+						} else {
+							ZVAL_UNDEF(&final_val);
+							dc_resolve(prop_val, marker, objects, num_objects, refs, allowed_set, &final_val);
+							if (EG(exception)) {
+								EG(fake_scope) = old_scope;
+								goto cleanup;
+							}
 						}
 					} else {
 						ZVAL_COPY_DEREF(&final_val, prop_val);
@@ -5844,7 +5897,9 @@ PHP_FUNCTION(deepclone_from_array)
 					 * look up pi via obj->ce — this also preserves references
 					 * (zend_std_write_property can't accept IS_REFERENCE). */
 					zend_property_info *use_pi = pi;
-					if (!use_pi && scope_is_std && obj->ce != zend_standard_class_def) {
+					if (!use_pi && scope_is_std && obj->ce == std_ce) {
+						use_pi = std_pi;
+					} else if (!use_pi && scope_is_std && obj->ce != zend_standard_class_def) {
 						zval *zv = zend_hash_find_known_hash(&obj->ce->properties_info, prop_name);
 						if (zv) {
 							zend_property_info *candidate = Z_PTR_P(zv);
@@ -5857,6 +5912,8 @@ PHP_FUNCTION(deepclone_from_array)
 									ZSTR_VAL(scope_name), ZSTR_VAL(prop_name), obj_id);
 							}
 						}
+						std_ce = obj->ce;
+						std_pi = use_pi;
 					} else if (!use_pi && !scope_is_std) {
 						zval_ptr_dtor(&final_val);
 						EG(fake_scope) = old_scope;
