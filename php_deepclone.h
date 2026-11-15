@@ -4,7 +4,7 @@
 extern zend_module_entry deepclone_module_entry;
 #define phpext_deepclone_ptr &deepclone_module_entry
 
-#define PHP_DEEPCLONE_VERSION "0.8.9"
+#define PHP_DEEPCLONE_VERSION "0.8.10"
 
 ZEND_BEGIN_MODULE_GLOBALS(deepclone)
 	HashTable hydrate_cache;

@@ -10,11 +10,11 @@
   <email>p@tchwork.com</email>
   <active>yes</active>
  </lead>
- <date>2026-10-14</date>
- <time>11:12:05</time>
+ <date>2026-11-15</date>
+ <time>09:37:15</time>
  <version>
-  <release>0.8.9</release>
-  <api>0.8.9</api>
+  <release>0.8.10</release>
+  <api>0.8.10</api>
  </version>
  <stability>
   <release>beta</release>
@@ -22,7 +22,7 @@
  </stability>
  <license uri="https://opensource.org/licenses/MIT">MIT</license>
  <notes>
-Added: a package.xml, so that install-php-extensions builds the extension. Changed: deepclone_from_array() is faster. Fixed: malformed payloads reported like the polyfill does. See CHANGELOG.md for details.
+Fixed: GC crashes on lazy ghosts with PHP 8.4.27, 8.5.12 and 8.6. See CHANGELOG.md for details.
  </notes>
  <contents>
   <dir name="/">
@@ -51,11 +51,11 @@ Added: a package.xml, so that install-php-extensions builds the extension. Chang
  <extsrcrelease />
  <changelog>
   <release>
-   <date>2026-10-14</date>
-   <time>11:12:05</time>
+   <date>2026-11-15</date>
+   <time>09:37:15</time>
    <version>
-    <release>0.8.9</release>
-    <api>0.8.9</api>
+    <release>0.8.10</release>
+    <api>0.8.10</api>
    </version>
    <stability>
     <release>beta</release>
