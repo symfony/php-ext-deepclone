@@ -243,6 +243,17 @@ static zend_always_inline void dc_create_fake_closure(zval *res, zend_function *
 # define IS_PROP_REINITABLE (0)
 #endif
 
+/* Since PHP 8.6, serialize() prints names in full in its warnings, with %pS,
+ * instead of cutting them at their first NUL byte, eg the mangled property
+ * names that __sleep() returns. */
+#if PHP_VERSION_ID >= 80600
+# define DC_SER_NAME_FMT "%pS"
+# define DC_SER_NAME(s) (s)
+#else
+# define DC_SER_NAME_FMT "%s"
+# define DC_SER_NAME(s) ZSTR_VAL(s)
+#endif
+
 /* The stub-generated header relies on the compat shims above (specifically
  * zend_register_internal_class_with_flags on PHP < 8.4), so it has to be
  * included after this point. */
@@ -3270,7 +3281,7 @@ static void dc_sleep_add(HashTable *selected, zend_string *key, zval *val, zend_
 	}
 	if (!zend_hash_add(selected, key, val)) {
 		zend_error(PHP_VERSION_ID >= 80300 ? E_WARNING : E_NOTICE,
-			"serialize(): \"%s\" is returned from __sleep() multiple times", ZSTR_VAL(name));
+			"serialize(): \"" DC_SER_NAME_FMT "\" is returned from __sleep() multiple times", DC_SER_NAME(name));
 		return;
 	}
 	Z_TRY_ADDREF_P(val);
@@ -3376,7 +3387,7 @@ static bool dc_sleep_properties(dc_ctx *ctx, zval *src, HashTable *names, HashTa
 
 		ZVAL_DEREF(name_val);
 		if (Z_TYPE_P(name_val) != IS_STRING) {
-			zend_error(E_WARNING, "serialize(): %s::__sleep() should return an array only containing the names of instance-variables to serialize", ZSTR_VAL(ce->name));
+			zend_error(E_WARNING, "serialize(): " DC_SER_NAME_FMT "::__sleep() should return an array only containing the names of instance-variables to serialize", DC_SER_NAME(ce->name));
 		}
 		name = zval_get_tmp_string(name_val, &tmp_name);
 		if (EG(exception)) {
@@ -3395,7 +3406,7 @@ static bool dc_sleep_properties(dc_ctx *ctx, zval *src, HashTable *names, HashTa
 			} else if (zend_bitset_in(seen, OBJ_PROP_TO_NUM(pi->offset))) {
 				found = true;
 				zend_error(PHP_VERSION_ID >= 80300 ? E_WARNING : E_NOTICE,
-					"serialize(): \"%s\" is returned from __sleep() multiple times", ZSTR_VAL(name));
+					"serialize(): \"" DC_SER_NAME_FMT "\" is returned from __sleep() multiple times", DC_SER_NAME(name));
 			} else {
 				found = true;
 				zend_bitset_incl(seen, OBJ_PROP_TO_NUM(pi->offset));
@@ -3415,7 +3426,7 @@ static bool dc_sleep_properties(dc_ctx *ctx, zval *src, HashTable *names, HashTa
 			}
 		}
 		if (!found && !EG(exception)) {
-			zend_error(E_WARNING, "serialize(): \"%s\" returned as member variable from __sleep() but does not exist", ZSTR_VAL(name));
+			zend_error(E_WARNING, "serialize(): \"" DC_SER_NAME_FMT "\" returned as member variable from __sleep() but does not exist", DC_SER_NAME(name));
 		}
 		zend_tmp_string_release(tmp_name);
 		if (UNEXPECTED(EG(exception))) {
@@ -3555,7 +3566,7 @@ static void dc_process_object(dc_ctx *ctx, zval *src, zval *dst, zval *mask_dst)
 			return;
 		}
 		if (UNEXPECTED(Z_TYPE(retval) != IS_ARRAY)) {
-			zend_type_error("%s::__serialize() must return an array", ZSTR_VAL(ce->name));
+			zend_type_error(DC_SER_NAME_FMT "::__serialize() must return an array", DC_SER_NAME(ce->name));
 			zval_ptr_dtor(&retval);
 			zval_ptr_dtor(&props_zval);
 			return;
@@ -3610,7 +3621,7 @@ static void dc_process_object(dc_ctx *ctx, zval *src, zval *dst, zval *mask_dst)
 		}
 		if (UNEXPECTED(Z_TYPE(retval) != IS_ARRAY)) {
 			zval_ptr_dtor(&retval);
-			zend_error(E_WARNING, "serialize(): %s::__sleep() should return an array only containing the names of instance-variables to serialize", ZSTR_VAL(ce->name));
+			zend_error(E_WARNING, "serialize(): " DC_SER_NAME_FMT "::__sleep() should return an array only containing the names of instance-variables to serialize", DC_SER_NAME(ce->name));
 			/* Roll back the pool entry and write null into the parent slot */
 			zval_ptr_dtor(&props_zval);
 			ctx->entries[entry->id] = NULL;

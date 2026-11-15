@@ -69,8 +69,7 @@ function run(callable $f): array
 {
     $warnings = [];
     set_error_handler(static function ($type, $message) use (&$warnings) {
-        // Names are cut at their first NUL byte, as serialize() does before 8.6.0RC5 (see php/php-src#25418)
-        $warnings[] = [$type, preg_replace('/"([^"\0]*+)\0[^"]*+"/', '"$1"', $message)];
+        $warnings[] = [$type, $message];
 
         return true;
     });
@@ -87,7 +86,8 @@ function check(string $label, object|array $value): void
     $clone = run(static fn () => deepclone_from_array(deepclone_to_array($value)));
     echo $label, ': ', $clone[0], $native === $clone ? '' : "\n  serialize(): ".$native[0], "\n";
     foreach ($clone[1] as [$type, $message]) {
-        echo '  ', $message, "\n";
+        // Since PHP 8.6, the names aren't cut at their first NUL byte
+        echo '  ', strtr($message, ["\0" => '~']), "\n";
     }
     if ($native[1] !== $clone[1]) {
         echo "  serialize() warnings differ\n";
@@ -134,11 +134,11 @@ same name twice: Sleeper{a="changed", ~*~b="default", ~Sleeper~c="default"}
 same name twice, default value: Sleeper{a="default", ~*~b="default", ~Sleeper~c="default"}
   serialize(): "a" is returned from __sleep() multiple times
 bare then mangled protected name: Sleeper{a="default", ~*~b="changed", ~Sleeper~c="default"}
-  serialize(): "" is returned from __sleep() multiple times
+  serialize(): "%S" is returned from __sleep() multiple times
 mangled then bare protected name: Sleeper{a="default", ~*~b="changed", ~Sleeper~c="default"}
   serialize(): "b" is returned from __sleep() multiple times
 bare then mangled private name: Sleeper{a="default", ~*~b="default", ~Sleeper~c="changed"}
-  serialize(): "" is returned from __sleep() multiple times
+  serialize(): "%S" is returned from __sleep() multiple times
 missing and repeated names: Sleeper{a="changed", ~*~b="default", ~Sleeper~c="default"}
   serialize(): "x" returned as member variable from __sleep() but does not exist
   serialize(): "a" is returned from __sleep() multiple times
@@ -155,7 +155,7 @@ names that are not strings: Sleeper{a="changed", ~*~b="default", ~Sleeper~c="def
 dynamic properties: DynamicSleeper{a="changed", x=2, y=1}
   serialize(): "x" is returned from __sleep() multiple times
 __unserialize(): UnserializingSleeper{a="default", ~*~b="default", ~UnserializingSleeper~c="default", keys="~UnserializingSleeper~c,~*~b,a"}
-  serialize(): "" is returned from __sleep() multiple times
+  serialize(): "%S" is returned from __sleep() multiple times
   serialize(): "x" returned as member variable from __sleep() but does not exist
 __sleep() not returning an array: [null]
   serialize(): NotAnArray::__sleep() should return an array only containing the names of instance-variables to serialize
