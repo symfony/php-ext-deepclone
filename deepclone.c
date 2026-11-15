@@ -4470,9 +4470,16 @@ static HashTable *dc_lazy_ctx_get_gc(zend_object *object, zval **table, int *n)
 	for (uint32_t i = 0; i < ctx->num_objects; i++) {
 		zend_get_gc_buffer_add_zval(gc_buffer, &ctx->objects[i]);
 	}
+	/* The values of the refs table, not the table: since GH-24050 (PHP
+	 * 8.4.27, 8.5.12), the GC destroys the table that get_gc returns for a
+	 * garbage cycle, and this one is part of the context. */
+	zval *ref;
+	ZEND_HASH_FOREACH_VAL(&ctx->refs, ref) {
+		zend_get_gc_buffer_add_zval(gc_buffer, ref);
+	} ZEND_HASH_FOREACH_END();
 	zend_get_gc_buffer_use(gc_buffer, table, n);
 
-	return &ctx->refs;
+	return NULL;
 }
 
 #if PHP_VERSION_ID >= 80400
