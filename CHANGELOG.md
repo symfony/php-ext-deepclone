@@ -5,6 +5,15 @@ All notable changes to this extension will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- The GC could corrupt memory when it collected the lazy ghosts that
+  `deepclone_from_array()` returns, on PHP 8.4.27, 8.5.12 and 8.6. Since
+  GH-24050, PHP destroys the table that `get_gc` returns for a garbage cycle.
+  The extension returned a table that is part of the context of the ghosts.
+
 ## [0.8.9] - 2026-10-14
 
 ### Added

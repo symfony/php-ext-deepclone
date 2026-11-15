@@ -69,7 +69,8 @@ function run(callable $f): array
 {
     $warnings = [];
     set_error_handler(static function ($type, $message) use (&$warnings) {
-        $warnings[] = [$type, $message];
+        // Names are cut at their first NUL byte, as serialize() does before 8.6.0RC5 (see php/php-src#25418)
+        $warnings[] = [$type, preg_replace('/"([^"\0]*+)\0[^"]*+"/', '"$1"', $message)];
 
         return true;
     });
