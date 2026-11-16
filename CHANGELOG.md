@@ -5,6 +5,19 @@ All notable changes to this extension will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- `deepclone_to_array()` crashed on a `stdClass` object whose property table
+  has integer keys. `ArrayObject` writes such keys to the object it wraps.
+- `deepclone_to_array()` crashed when `__sleep()`, `__serialize()` or a lazy
+  initializer assigned a new value to a `&` reference of the graph that holds
+  the object being exported.
+- `deepclone_to_array()` stops at the exception that an error handler throws
+  while it reads the state of an object. It went on before, and could replace
+  the exception with a `NotInstantiableException`.
+
 ## [0.8.10] - 2026-11-15
 
 ### Fixed
