@@ -729,9 +729,8 @@ static uint8_t dc_get_class_info(dc_ctx *ctx, zend_class_entry *ce)
 		if (object_init_ex(&probe, ce) != SUCCESS || EG(exception)) {
 			zend_clear_exception();
 			flags |= DC_CI_NOT_INSTANTIABLE;
-		} else {
-			zval_ptr_dtor(&probe);
 		}
+		zval_ptr_dtor(&probe);
 	} else if (dc_needs_internal_state(ce)) {
 		flags |= DC_CI_NOT_INSTANTIABLE;
 	}
@@ -1480,11 +1479,17 @@ static void dc_copy_array(dc_ctx *ctx, HashTable *src_ht, zval *dst, zval *mask_
 		 * IS_INDIRECT slots into the object. Resolve them like the native
 		 * serializer does, or the payload would retain pointers that dangle
 		 * once the source object is released. */
+		zval slot_value;
+		ZVAL_UNDEF(&slot_value);
 		if (UNEXPECTED(Z_TYPE_P(src_val) == IS_INDIRECT)) {
 			src_val = Z_INDIRECT_P(src_val);
 			if (Z_TYPE_P(src_val) == IS_UNDEF) {
 				continue;
 			}
+			/* Walk a copy: user code that runs during the walk can write to
+			 * the property */
+			ZVAL_COPY(&slot_value, dc_unshared_ref_value(src_val, src_ht));
+			src_val = &slot_value;
 		}
 		zval undef, null_marker;
 		ZVAL_UNDEF(&undef);
@@ -1498,6 +1503,7 @@ static void dc_copy_array(dc_ctx *ctx, HashTable *src_ht, zval *dst, zval *mask_
 			new_mask_slot = zend_hash_index_add_new(Z_ARRVAL_P(mask_dst), idx, &null_marker);
 		}
 		dc_copy_value(ctx, dc_unshared_ref_value(src_val, src_ht), new_dst_slot, new_mask_slot);
+		zval_ptr_dtor(&slot_value);
 		if (UNEXPECTED(EG(exception))) return;
 	} ZEND_HASH_FOREACH_END();
 }
@@ -2432,6 +2438,7 @@ static void dc_copy_value(dc_ctx *ctx, zval *src, zval *dst, zval *mask_dst)
 
 	bool is_ref = 0;
 	uint32_t ref_idx = 0;
+	zval ref_value;
 
 	/* ── Reference detection (cold — refs are rare) ── */
 	if (UNEXPECTED(Z_ISREF_P(src))) {
@@ -2457,7 +2464,10 @@ static void dc_copy_value(dc_ctx *ctx, zval *src, zval *dst, zval *mask_dst)
 		 * Store the index — the recursive walk may realloc ctx->refs. */
 		dc_ref_add(ctx, ref, inner, inner);
 		ref_idx = ctx->refs_count - 1;
-		src = inner;
+		/* Walk a copy of the value, which the entry above keeps alive: user
+		 * code that runs during the walk can assign through the reference */
+		ZVAL_COPY_VALUE(&ref_value, inner);
+		src = &ref_value;
 	}
 
 	/* ── Scalar fast path (hot — most leaves are scalars) ──
@@ -3019,7 +3029,20 @@ static void dc_process_object(dc_ctx *ctx, zval *src, zval *dst, zval *mask_dst)
 		HashTable *ht = obj->properties;
 		if (ht && zend_hash_num_elements(ht) > 0) {
 			zval scope_arr;
-			ZVAL_ARR(&scope_arr, zend_array_dup(ht));
+			HashTable *props = NULL;
+			/* An ArrayObject that wraps the object writes integer keys to its
+			 * property table: name the properties by strings, like serialize()
+			 * does. A table that never got such a key has no next one. */
+			if (UNEXPECTED(HT_IS_PACKED(ht) || ht->nNextFreeElement != ZEND_LONG_MIN)) {
+				props = zend_symtable_to_proptable(ht);
+				if (props == ht) {
+					if (!(GC_FLAGS(ht) & IS_ARRAY_IMMUTABLE)) {
+						GC_DELREF(ht);
+					}
+					props = NULL;
+				}
+			}
+			ZVAL_ARR(&scope_arr, props ? props : zend_array_dup(ht));
 			zend_hash_add_new(Z_ARRVAL(props_zval), ce->name, &scope_arr);
 		}
 		has_unserialize = false;
@@ -3333,6 +3356,11 @@ next_prop:
 
 		if (need_release_array_value) {
 			zend_release_properties(array_value);
+		}
+		/* Thrown by an error handler or by a destructor */
+		if (UNEXPECTED(EG(exception))) {
+			zval_ptr_dtor(&props_zval);
+			return;
 		}
 	}
 
@@ -6228,9 +6256,8 @@ PHP_FUNCTION(deepclone_hydrate)
 					if (object_init_ex(&probe, ce) != SUCCESS || EG(exception)) {
 						zend_clear_exception();
 						ok = false;
-					} else {
-						zval_ptr_dtor(&probe);
 					}
+					zval_ptr_dtor(&probe);
 				}
 				/* Internal final classes with create_object: the engine refuses
 				 * newInstanceWithoutConstructor() for them (INTERNAL + create_object
