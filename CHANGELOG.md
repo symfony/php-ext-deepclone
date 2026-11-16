@@ -14,6 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `unserialize()`. The conversion called `__toString()` on an object that
   might not be hydrated yet, and crashed on a `BcMath\Number` that still
   waits for its state.
+- `deepclone_hydrate()` doesn't create a string anymore for each key that
+  names a protected or private property.
 
 ### Fixed
 
@@ -68,6 +70,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - References bound to a typed property that a child class redeclares are
   tracked by that property. Destroying the object could corrupt memory when
   the reference was bound through the scope of the parent class.
+- `deepclone_hydrate()` accepts the keys that an `(array)` cast gives to the
+  private properties of an anonymous class, whose name contains a NUL byte.
+- `deepclone_hydrate()` rejects mangled keys for `stdClass` objects, like for
+  other classes: `"\0*\0foo"` created a public `foo` property.
+- `$allowed_classes` can hold `&` references, eg after a `foreach` by
+  reference on the list, like the `allowed_classes` option of `unserialize()`.
 
 ## [0.8.10] - 2026-11-15
 

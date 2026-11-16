@@ -893,6 +893,8 @@ static HashTable *dc_build_allowed_set(HashTable *list, const char *func_name)
 	zend_hash_init(set, zend_hash_num_elements(list), NULL, NULL, 0);
 	zval *entry;
 	ZEND_HASH_FOREACH_VAL(list, entry) {
+		/* Eg left by a foreach by reference */
+		ZVAL_DEREF(entry);
 		if (Z_TYPE_P(entry) != IS_STRING) {
 			zend_hash_destroy(set);
 			efree(set);
@@ -6511,60 +6513,69 @@ PHP_FUNCTION(deepclone_hydrate)
 		 * specifically targets a declared protected / private slot. */
 		zend_class_entry *scope_ce = obj_ce;
 		zend_string *real_name = prop_key;
-		bool real_name_owned = false;
 		bool is_mangled = false;
 
 		if (key_len > 0 && key[0] == '\0') {
 			is_mangled = true;
-			/* Find second NUL separator */
-			const char *sep = memchr(key + 1, '\0', key_len - 1);
-			if (UNEXPECTED(!sep || sep == key + 1)) {
-				zend_value_error("deepclone_hydrate(): Argument #2 ($vars) contains an invalid mangled key");
-				if (prop_key_owned) zend_string_release(prop_key);
-				zval_ptr_dtor(&obj_zval);
-				RETURN_THROWS();
-			}
-			size_t class_len = sep - (key + 1);
-			size_t name_len = key_len - class_len - 2;
+			const char *sep = NULL;
 
-			/* Reject embedded NUL in the property name portion */
-			if (UNEXPECTED(memchr(sep + 1, '\0', name_len) != NULL)) {
-				zend_value_error("deepclone_hydrate(): Argument #2 ($vars) contains an invalid mangled key");
-				if (prop_key_owned) zend_string_release(prop_key);
-				zval_ptr_dtor(&obj_zval);
-				RETURN_THROWS();
-			}
-			real_name = zend_string_init(sep + 1, name_len, 0);
-			real_name_owned = true;
-
-			if (class_len != 1 || key[1] != '*') {
-				/* "\0ClassName\0propName" — resolve and validate the scope.
-				 * Must be obj_ce or a parent; no autoloader is triggered. */
-				if (class_len == ZSTR_LEN(obj_ce->name)
-				    && !memcmp(key + 1, ZSTR_VAL(obj_ce->name), class_len)) {
-					scope_ce = obj_ce;
-				} else {
-					scope_ce = NULL;
-					for (zend_class_entry *p = obj_ce->parent; p; p = p->parent) {
-						if (class_len == ZSTR_LEN(p->name)
-						    && !memcmp(key + 1, ZSTR_VAL(p->name), class_len)) {
-							scope_ce = p;
-							break;
-						}
-					}
-					if (UNEXPECTED(!scope_ce)) {
-						zend_value_error("deepclone_hydrate(): Argument #2 ($vars) key scope \"%.*s\" is not a parent of \"%s\"",
-							(int) class_len, key + 1, ZSTR_VAL(obj_ce->name));
-						zend_string_release(real_name);
-						if (prop_key_owned) zend_string_release(prop_key);
-						zval_ptr_dtor(&obj_zval);
-						RETURN_THROWS();
-					}
+			/* "\0ClassName\0propName": the scope must be obj_ce or a parent,
+			 * no autoloader is triggered. The name of an anonymous class
+			 * contains a NUL, so look for these names before cutting the key
+			 * at its second NUL. */
+			for (zend_class_entry *p = obj_ce; p; p = p->parent) {
+				size_t class_len = ZSTR_LEN(p->name);
+				if (key_len > class_len + 1 && key[class_len + 1] == '\0'
+				 && !memcmp(key + 1, ZSTR_VAL(p->name), class_len)) {
+					scope_ce = p;
+					sep = key + class_len + 1;
+					break;
 				}
 			}
-			/* "\0*\0propName" keeps scope_ce = obj_ce and lets properties_info
-			 * lookup find the entry (protected props are inherited under bare
-			 * name, so pi->ce will point at the declaring class). */
+			if (!sep) {
+				sep = memchr(key + 1, '\0', key_len - 1);
+				if (UNEXPECTED(!sep || sep == key + 1)) {
+					zend_value_error("deepclone_hydrate(): Argument #2 ($vars) contains an invalid mangled key");
+					if (prop_key_owned) zend_string_release(prop_key);
+					zval_ptr_dtor(&obj_zval);
+					RETURN_THROWS();
+				}
+				/* "\0*\0propName" keeps scope_ce = obj_ce: protected properties
+				 * are inherited under their bare name */
+				if (sep != key + 2 || key[1] != '*') {
+					scope_ce = NULL;
+				}
+			}
+			const char *name = sep + 1;
+			size_t name_len = key + key_len - name;
+
+			/* Reject embedded NUL in the property name portion */
+			if (UNEXPECTED(memchr(name, '\0', name_len) != NULL)) {
+				zend_value_error("deepclone_hydrate(): Argument #2 ($vars) contains an invalid mangled key");
+				if (prop_key_owned) zend_string_release(prop_key);
+				zval_ptr_dtor(&obj_zval);
+				RETURN_THROWS();
+			}
+			if (UNEXPECTED(!scope_ce)) {
+				zend_value_error("deepclone_hydrate(): Argument #2 ($vars) key scope \"%.*s\" is not a parent of \"%s\"",
+					(int) (sep - key - 1), key + 1, ZSTR_VAL(obj_ce->name));
+				if (prop_key_owned) zend_string_release(prop_key);
+				zval_ptr_dtor(&obj_zval);
+				RETURN_THROWS();
+			}
+
+			/* A mangled key targets a declared property, never a dynamic one,
+			 * so a stdClass object has none. The name is taken from the
+			 * properties of the scope, which spares creating a string. */
+			zval *declared = zend_hash_str_find(&scope_ce->properties_info, name, name_len);
+			if (UNEXPECTED(!declared)) {
+				zend_value_error("deepclone_hydrate(): Argument #2 ($vars) key scope \"%s\" does not declare a \"%.*s\" property",
+					ZSTR_VAL(scope_ce->name), (int) name_len, name);
+				if (prop_key_owned) zend_string_release(prop_key);
+				zval_ptr_dtor(&obj_zval);
+				RETURN_THROWS();
+			}
+			real_name = ((Bucket *) declared)->key;
 		}
 
 		/* Default: the input's PHP & references are dropped (dereferenced) on
@@ -6588,7 +6599,6 @@ PHP_FUNCTION(deepclone_hydrate)
 
 			if (dc_is_backed_declared_property(pi)) {
 				if (UNEXPECTED(!dc_write_backed_property(obj, pi, real_name, v, flags))) {
-					if (real_name_owned) zend_string_release(real_name);
 					if (prop_key_owned) zend_string_release(prop_key);
 					zval_ptr_dtor(&obj_zval);
 					RETURN_THROWS();
@@ -6600,7 +6610,6 @@ PHP_FUNCTION(deepclone_hydrate)
 				 * private slot via the "\0*\0name" or "\0Class\0name" form. */
 				zend_value_error("deepclone_hydrate(): Argument #2 ($vars) key scope \"%s\" does not declare a \"%s\" property",
 					ZSTR_VAL(scope_ce->name), ZSTR_VAL(real_name));
-				if (real_name_owned) zend_string_release(real_name);
 				if (prop_key_owned) zend_string_release(prop_key);
 				zval_ptr_dtor(&obj_zval);
 				RETURN_THROWS();
@@ -6618,7 +6627,6 @@ PHP_FUNCTION(deepclone_hydrate)
 					zend_update_property_ex(scope_ce, obj, real_name, Z_ISREF_P(v) ? Z_REFVAL_P(v) : v);
 				}
 				if (UNEXPECTED(EG(exception))) {
-					if (real_name_owned) zend_string_release(real_name);
 					if (prop_key_owned) zend_string_release(prop_key);
 					zval_ptr_dtor(&obj_zval);
 					RETURN_THROWS();
@@ -6626,7 +6634,6 @@ PHP_FUNCTION(deepclone_hydrate)
 			}
 		}
 
-		if (real_name_owned) zend_string_release(real_name);
 		if (prop_key_owned) zend_string_release(prop_key);
 	} ZEND_HASH_FOREACH_END();
 
