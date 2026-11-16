@@ -158,6 +158,11 @@ $ao->__unserialize([ArrayObject::ARRAY_AS_PROPS, ['x' => 1], []]);
   `unserialize(serialize())`;
 - copy-on-write for strings and arrays of scalars.
 
+The order of dynamic properties isn't always preserved. They're restored in
+the order that their names first appear in the graph. Eg the second object of
+`[(object) ['a' => 1, 'b' => 2], (object) ['b' => 3, 'a' => 4]]` comes back
+with `a` before `b`.
+
 ## Errors
 
 `deepclone_to_array()` and `deepclone_hydrate()` throw
