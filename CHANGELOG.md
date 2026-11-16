@@ -26,6 +26,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   attributes that take literals only. For the others, the extension doesn't
   build the property table of each object of the instance anymore, which
   tripled the memory they use.
+- `deepclone_to_array()` scans nested arrays once to tell whether they can be
+  shared as is. It scanned them again at each level when one held an object:
+  400 levels of 200 scalars over an object took 20 ms, and take 3 ms now.
+- `deepclone_to_array()` shares the state that `__serialize()` returns when
+  it holds scalars only, like it does for the arrays of properties. It copied
+  it before: one million integers took 30 ms and 17 MB.
 
 ### Fixed
 
@@ -132,6 +138,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - With the extension loaded on PHP 8.5 and 8.6,
   `ReflectionAttribute::newInstance()` threw an `Error`, or didn't return,
   when the instance holds an array that references itself.
+- When it reached the stack limit on deeply nested arrays,
+  `deepclone_to_array()` went on level after level, each one throwing again:
+  200,000 levels took 90 s and chained 16,000 errors. It throws once now.
 
 ## [0.8.10] - 2026-11-15
 
