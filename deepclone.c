@@ -395,6 +395,8 @@ typedef struct {
 
 /* ── Traversal context ──────────────────────────────────────── */
 
+#define DC_CLASS_INFO_LAST 8
+
 struct _dc_ctx {
 	HashTable      object_pool;    /* obj_handle => dc_pool_entry */
 	dc_pool_entry **entries;       /* indexed by entry->id (id-ordered iteration) */
@@ -433,12 +435,23 @@ struct _dc_ctx {
 
 	/* Class info cache: class_name => [has_unserialize, has_wakeup, serialize_method, has_sleep] */
 	HashTable      class_info;
+	/* The same for the classes met last, by address */
+	struct {
+		zend_class_entry *ce;
+		uint8_t           info;
+	} class_info_last[DC_CLASS_INFO_LAST];
 
 	/* Proto cache: class_name => (array) prototype */
 	HashTable      proto_cache;
 
 	/* Const-expr closures: class => (closure key => payload), built on demand */
 	HashTable     *cexpr_index;
+
+	/* Slot names cache: class => unmangled names of its non-public declared
+	 * properties, by slot; and the last class that was looked up */
+	HashTable      slot_names;
+	zend_class_entry *slot_names_ce;
+	zend_string  **slot_names_last;
 };
 
 /* ── Class info cache entry ─────────────────────────────────── */
@@ -563,7 +576,10 @@ static void dc_ctx_init(dc_ctx *ctx) {
 	ctx->allowed_ht = NULL;
 	zend_hash_init(&ctx->scope_cache, 4, NULL, ZVAL_PTR_DTOR, 0);
 	zend_hash_init(&ctx->class_info, 4, NULL, NULL, 0);
+	memset(ctx->class_info_last, 0, sizeof(ctx->class_info_last));
 	zend_hash_init(&ctx->proto_cache, 4, NULL, ZVAL_PTR_DTOR, 0);
+	zend_hash_init(&ctx->slot_names, 4, NULL, NULL, 0);
+	ctx->slot_names_ce = NULL;
 	ctx->gc_runs = dc_gc_runs();
 }
 
@@ -645,6 +661,20 @@ static void dc_ctx_destroy(dc_ctx *ctx) {
 	if (ctx->cexpr_index) {
 		zend_array_destroy(ctx->cexpr_index);
 	}
+	if (zend_hash_num_elements(&ctx->slot_names)) {
+		zend_ulong ce_addr;
+		zend_string **names;
+		ZEND_HASH_FOREACH_NUM_KEY_PTR(&ctx->slot_names, ce_addr, names) {
+			zend_class_entry *ce = (zend_class_entry *) (uintptr_t) ce_addr;
+			for (int i = 0; i < ce->default_properties_count; i++) {
+				if (names[i]) {
+					zend_string_release(names[i]);
+				}
+			}
+			efree(names);
+		} ZEND_HASH_FOREACH_END();
+	}
+	zend_hash_destroy(&ctx->slot_names);
 	if (ctx->allowed_ht) {
 		zend_hash_destroy(ctx->allowed_ht);
 		efree(ctx->allowed_ht);
@@ -742,12 +772,19 @@ static zend_class_entry *dc_lookup_payload_class(zend_string *class_name)
 	return ce;
 }
 
-static uint8_t dc_get_class_info(dc_ctx *ctx, zend_class_entry *ce)
+static zend_never_inline uint8_t dc_get_class_info(dc_ctx *ctx, zend_class_entry *ce)
 {
+	uint32_t last = (uint32_t) (((uintptr_t) ce >> 6) & (DC_CLASS_INFO_LAST - 1));
+
+	if (EXPECTED(ctx->class_info_last[last].ce == ce)) {
+		return ctx->class_info_last[last].info;
+	}
+
 	zval *cached = zend_hash_find(&ctx->class_info, ce->name);
 
 	if (EXPECTED(cached)) {
-		return (uint8_t) Z_LVAL_P(cached);
+		ctx->class_info_last[last].ce = ce;
+		return ctx->class_info_last[last].info = (uint8_t) Z_LVAL_P(cached);
 	}
 
 	uint8_t flags = DC_CI_COMPUTED;
@@ -804,7 +841,8 @@ static uint8_t dc_get_class_info(dc_ctx *ctx, zend_class_entry *ce)
 	zval zflags;
 	ZVAL_LONG(&zflags, flags);
 	zend_hash_add_new(&ctx->class_info, ce->name, &zflags);
-	return flags;
+	ctx->class_info_last[last].ce = ce;
+	return ctx->class_info_last[last].info = flags;
 }
 
 /* Get or build the scope map for a class: property_name => declaring_class_name */
@@ -3067,18 +3105,48 @@ handle_value:
 
 /* ── Object processing ──────────────────────────────────────── */
 
-/* Add prop, the value of a declared property, to props[scope][name], unless
- * it holds its default value, as found in default_props */
-static zend_always_inline void dc_add_slot_property(HashTable *props, zend_class_entry *ce, zend_property_info *prop_info, zval *prop, zval *default_props)
+/* The names of the non-public properties of ce without their scope prefix, by
+ * slot. Unmangling them for each object was a large part of the slot walk. */
+static zend_never_inline zend_string **dc_slot_names_slow(dc_ctx *ctx, zend_class_entry *ce)
+{
+	zend_string **names = zend_hash_index_find_ptr(&ctx->slot_names, (zend_ulong) (uintptr_t) ce);
+
+	if (!names) {
+		names = ecalloc(ce->default_properties_count, sizeof(zend_string *));
+		for (int i = 0; i < ce->default_properties_count; i++) {
+			zend_property_info *prop_info = ce->properties_info_table[i];
+			if (!prop_info || (prop_info->flags & (ZEND_ACC_STATIC | ZEND_ACC_PUBLIC))) {
+				continue;
+			}
+			const char *class_name_unused, *unmangled_name;
+			size_t unmangled_len;
+			zend_unmangle_property_name_ex(prop_info->name, &class_name_unused, &unmangled_name, &unmangled_len);
+			/* Try to get an existing interned string (free for common names) */
+			names[i] = zend_string_init_existing_interned(unmangled_name, unmangled_len, 0);
+		}
+		zend_hash_index_add_new_ptr(&ctx->slot_names, (zend_ulong) (uintptr_t) ce, names);
+	}
+	ctx->slot_names_ce = ce;
+	ctx->slot_names_last = names;
+
+	return names;
+}
+
+static zend_always_inline zend_string **dc_slot_names(dc_ctx *ctx, zend_class_entry *ce)
+{
+	return EXPECTED(ctx->slot_names_ce == ce) ? ctx->slot_names_last : dc_slot_names_slow(ctx, ce);
+}
+
+/* Add prop, the value of a declared property of an object of class ce, to
+ * props[scope][name], unless it holds its default value, as found in
+ * default_props */
+static zend_always_inline void dc_add_slot_property(dc_ctx *ctx, HashTable *props, zend_class_entry *ce, zend_property_info *prop_info, zval *prop, zval *default_props)
 {
 	/* Unwrap references with refcount == 1 */
 	if (Z_ISREF_P(prop) && Z_REFCOUNT_P(prop) == 1) {
 		prop = Z_REFVAL_P(prop);
 	}
 
-	/* Unmangle prop_info->name for non-public properties */
-	const char *unmangled_name;
-	size_t unmangled_len;
 	zend_string *prop_name;
 	zend_string *scope_name;
 
@@ -3087,10 +3155,8 @@ static zend_always_inline void dc_add_slot_property(HashTable *props, zend_class
 		scope_name = !(prop_info->flags & (ZEND_ACC_PROTECTED_SET | ZEND_ACC_PRIVATE_SET))
 			? ZEND_STANDARD_CLASS_DEF_PTR->name : prop_info->ce->name;
 	} else {
-		const char *class_name_unused;
-		zend_unmangle_property_name_ex(prop_info->name, &class_name_unused, &unmangled_name, &unmangled_len);
-		/* Try to get an existing interned string (free for common names) */
-		prop_name = zend_string_init_existing_interned(unmangled_name, unmangled_len, 0);
+		prop_name = dc_slot_names(ctx, ce)[OBJ_PROP_TO_NUM(prop_info->offset)];
+		ZEND_ASSERT(prop_name);
 		scope_name = prop_info->ce->name;
 	}
 
@@ -3103,9 +3169,6 @@ static zend_always_inline void dc_add_slot_property(HashTable *props, zend_class
 			bool is_trace = zend_string_equals(prop_name, dc_str_trace)
 				&& (instanceof_function(ce, zend_ce_exception) || instanceof_function(ce, zend_ce_error));
 			if (!is_trace) {
-				if (!(prop_info->flags & ZEND_ACC_PUBLIC)) {
-					zend_string_release(prop_name);
-				}
 				return;
 			}
 		}
@@ -3121,9 +3184,6 @@ static zend_always_inline void dc_add_slot_property(HashTable *props, zend_class
 	}
 	Z_TRY_ADDREF_P(prop);
 	zend_hash_add(Z_ARRVAL_P(scope_ht), prop_name, prop);
-	if (!(prop_info->flags & ZEND_ACC_PUBLIC)) {
-		zend_string_release(prop_name);
-	}
 }
 
 /* Whether the property table of an object, when built, holds its declared
@@ -3229,7 +3289,7 @@ static zend_property_info *dc_sleep_find_slot(zend_class_entry *ce, zend_string 
  * the property table or, for objects that have only declared properties, to
  * scoped by scope and name, leaving default values out like the slot walk of
  * dc_process_object(). Returns false when an exception is thrown. */
-static bool dc_sleep_properties(zval *src, HashTable *names, HashTable *selected, HashTable *scoped)
+static bool dc_sleep_properties(dc_ctx *ctx, zval *src, HashTable *names, HashTable *selected, HashTable *scoped)
 {
 	zend_object *obj = Z_OBJ_P(src);
 	zend_class_entry *ce = obj->ce;
@@ -3277,7 +3337,7 @@ static bool dc_sleep_properties(zval *src, HashTable *names, HashTable *selected
 			} else {
 				found = true;
 				zend_bitset_incl(seen, OBJ_PROP_TO_NUM(pi->offset));
-				dc_add_slot_property(scoped, ce, pi, val, CE_DEFAULT_PROPERTIES_TABLE(ce));
+				dc_add_slot_property(ctx, scoped, ce, pi, val, CE_DEFAULT_PROPERTIES_TABLE(ce));
 			}
 		} else if (props) {
 			found = dc_sleep_add_from_table(selected, props, name, name, obj);
@@ -3502,7 +3562,7 @@ static void dc_process_object(dc_ctx *ctx, zval *src, zval *dst, zval *mask_dst)
 		if (!has_unserialize && dc_has_declared_properties_only(src)) {
 			/* Like the slot walk below, in the order of the names */
 			may_have_numeric_names = false;
-			bool ok = dc_sleep_properties(src, Z_ARRVAL(retval), NULL, Z_ARRVAL(props_zval));
+			bool ok = dc_sleep_properties(ctx, src, Z_ARRVAL(retval), NULL, Z_ARRVAL(props_zval));
 			zval_ptr_dtor(&retval);
 			if (UNEXPECTED(!ok)) {
 				zval_ptr_dtor(&props_zval);
@@ -3511,7 +3571,7 @@ static void dc_process_object(dc_ctx *ctx, zval *src, zval *dst, zval *mask_dst)
 			goto prepare_props;
 		}
 		array_value = zend_new_array(zend_hash_num_elements(Z_ARRVAL(retval)));
-		bool ok = dc_sleep_properties(src, Z_ARRVAL(retval), array_value, NULL);
+		bool ok = dc_sleep_properties(ctx, src, Z_ARRVAL(retval), array_value, NULL);
 		zval_ptr_dtor(&retval);
 		if (UNEXPECTED(!ok)) {
 			zend_array_release(array_value);
@@ -3572,7 +3632,7 @@ static void dc_process_object(dc_ctx *ctx, zval *src, zval *dst, zval *mask_dst)
 			if (Z_TYPE_P(prop) == IS_UNDEF) {
 				continue;
 			}
-			dc_add_slot_property(Z_ARRVAL(props_zval), ce, prop_info, prop, default_props);
+			dc_add_slot_property(ctx, Z_ARRVAL(props_zval), ce, prop_info, prop, default_props);
 		}
 
 		goto prepare_props;
