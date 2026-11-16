@@ -141,6 +141,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - When it reached the stack limit on deeply nested arrays,
   `deepclone_to_array()` went on level after level, each one throwing again:
   200,000 levels took 90 s and chained 16,000 errors. It throws once now.
+- `deepclone_from_array()` replays the states of final internal classes like
+  `BcMath\Number` before any user code runs. A payload that orders its states
+  another way than `deepclone_to_array()` gave such an object to the
+  `__unserialize()` or `__wakeup()` of another one before it was initialized,
+  and reading a `BcMath\Number` in that state crashes.
 
 ## [0.8.10] - 2026-11-15
 
