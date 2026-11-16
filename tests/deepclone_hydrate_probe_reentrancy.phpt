@@ -2,6 +2,7 @@
 deepclone_hydrate() instantiability probe stays isolated when called inside another unserialize() (symfony/symfony#64323)
 --EXTENSIONS--
 deepclone
+bcmath
 --SKIPIF--
 <?php if (!class_exists('BcMath\Number')) die('skip requires BcMath\Number (PHP 8.4+ with ext/bcmath)'); ?>
 --INI--

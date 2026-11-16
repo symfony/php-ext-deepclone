@@ -45,6 +45,17 @@ jobs:
       - name: make
         run: make -j$(nproc)
 
+      - name: Check that the extension loads
+        run: php -d extension=modules/deepclone.so -r 'exit((int) !extension_loaded("deepclone"));'
+
+      - name: Link the extensions that the tests load
+        run: |
+          # "make test" sets extension_dir to modules/
+          for ext in bcmath dom mongodb opcache tidy; do
+            so="$(php-config --extension-dir)/$ext.so"
+            [ ! -f "$so" ] || ln -s "$so" modules/
+          done
+
       - name: make test
         run: |
           export NO_INTERACTION=1
@@ -77,19 +88,29 @@ jobs:
           test -n "$header" && test "$header" = "$release"
 
   asan:
-    name: "Linux 8.4 NTS + ASAN/UBSAN"
+    name: "Linux 8.5 NTS + ASAN/UBSAN"
     runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v7
 
-      - name: Setup PHP 8.4 with ASAN
-        uses: shivammathur/setup-php@v2
-        with:
-          php-version: '8.4'
-          extensions: mongodb, tidy
-          coverage: none
-          tools: none
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends \
+            build-essential autoconf pkg-config bison re2c
+
+      - name: Build PHP 8.5 with ASAN
+        run: |
+          # A PHP built without ASAN can't load an extension built with it
+          mkdir ../php-src
+          curl -sL https://github.com/php/php-src/archive/refs/heads/PHP-8.5.tar.gz | tar xz --strip-components=1 -C ../php-src
+          cd ../php-src
+          ./buildconf --force
+          ./configure --enable-debug --enable-address-sanitizer --disable-all --enable-cli --enable-bcmath --disable-cgi --disable-phpdbg
+          make -j$(nproc)
+          sudo make install
+          php -v
 
       - name: phpize
         run: phpize
@@ -102,6 +123,9 @@ jobs:
 
       - name: make
         run: make -j$(nproc)
+
+      - name: Check that the extension loads
+        run: php -d extension=modules/deepclone.so -r 'exit((int) !extension_loaded("deepclone"));'
 
       - name: make test
         env:
@@ -123,8 +147,13 @@ jobs:
           done
 
   debug:
-    name: "Linux 8.4 NTS debug build (leak detection)"
+    name: "Linux ${{ matrix.php }} NTS debug build (leak detection)"
     runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        php: ['8.4', '8.5', '8.6']
 
     steps:
       - uses: actions/checkout@v7
@@ -133,14 +162,17 @@ jobs:
         run: |
           sudo apt-get update -q
           sudo apt-get install -y --no-install-recommends \
-            build-essential autoconf pkg-config bison re2c \
-            libxml2-dev libsqlite3-dev
+            build-essential autoconf pkg-config bison re2c
 
-      - name: Build PHP 8.4 with --enable-debug
+      - name: Build PHP ${{ matrix.php }} with --enable-debug
         run: |
-          curl -sL https://www.php.net/distributions/php-8.4.18.tar.gz | tar xz
-          cd php-8.4.18
-          ./configure --enable-debug --disable-all --enable-cli --enable-reflection --enable-spl --disable-cgi --disable-phpdbg
+          # The head of the branch, to catch what the next patch release changes
+          mkdir ../php-src
+          curl -sL https://github.com/php/php-src/archive/refs/heads/PHP-${{ matrix.php }}.tar.gz | tar xz --strip-components=1 -C ../php-src
+          cd ../php-src
+          ./buildconf --force
+          # OPcache is always built as of PHP 8.5
+          ./configure --enable-debug --disable-all --enable-cli --enable-bcmath ${{ matrix.php == '8.4' && '--enable-opcache' || '' }} --disable-cgi --disable-phpdbg
           make -j$(nproc)
           sudo make install
           php -v
@@ -151,11 +183,28 @@ jobs:
           ./configure --enable-deepclone
           make -j$(nproc)
 
+      - name: Check that the extension loads
+        run: php -d extension=modules/deepclone.so -r 'exit((int) !extension_loaded("deepclone"));'
+
+      - name: Link the extensions that the tests load
+        run: |
+          # "make test" sets extension_dir to modules/
+          for ext in bcmath dom mongodb opcache tidy; do
+            so="$(php-config --extension-dir)/$ext.so"
+            [ ! -f "$so" ] || ln -s "$so" modules/
+          done
+
       - name: Run tests (Zend MM leak detection active)
         env:
           NO_INTERACTION: "1"
           REPORT_EXIT_STATUS: "1"
         run: make test TESTS="-q --show-diff tests/"
+
+      - name: Run tests with OPcache
+        env:
+          NO_INTERACTION: "1"
+          REPORT_EXIT_STATUS: "1"
+        run: make test TESTS="-q --show-diff ${{ matrix.php == '8.4' && '-d zend_extension=opcache' || '' }} -d opcache.enable_cli=1 -d opcache.file_update_protection=0 tests/"
 
       - name: Show failing test diffs
         if: failure()
@@ -174,19 +223,30 @@ jobs:
     # file or directory"). Instead, do checkout on the x86_64 host and
     # spawn the i386 container manually for the build/test step. i386
     # binaries run natively on x86_64 hosts — no qemu involved. Debian
-    # Bookworm still ships PHP 8.2 on i386, which is enough to validate
-    # the source compiles and runs correctly when sizeof(zend_long) == 4.
-    name: "Linux i386 PHP 8.2"
-    runs-on: ubuntu-latest
+    # Bookworm ships PHP 8.2 on i386 and Trixie ships PHP 8.4, which is
+    # enough to validate the source compiles and runs correctly when
+    # sizeof(zend_long) == 4. The job stays on ubuntu-24.04: on
+    # ubuntu-26.04, the container fails to resolve deb.debian.org.
+    name: "Linux i386 PHP ${{ matrix.php }}"
+    runs-on: ubuntu-24.04
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - php: '8.2'
+            debian: bookworm
+          - php: '8.4'
+            debian: trixie
 
     steps:
       - uses: actions/checkout@v7
 
-      - name: Build and test inside i386/debian:bookworm
+      - name: Build and test inside i386/debian:${{ matrix.debian }}
         run: |
           docker run --rm --platform linux/386 -v "$PWD:/work" -w /work \
             -e NO_INTERACTION=1 -e REPORT_EXIT_STATUS=1 \
-            i386/debian:bookworm sh -eu -c '
+            i386/debian:${{ matrix.debian }} sh -eu -c '
               apt-get update
               apt-get install -y --no-install-recommends \
                 build-essential autoconf pkg-config ca-certificates \
@@ -195,6 +255,7 @@ jobs:
               ./configure --enable-deepclone \
                 CFLAGS="-Wall -Wextra -Werror -Wno-unused-parameter -Wno-sign-compare"
               make -j"$(nproc)"
+              php -d extension=modules/deepclone.so -r "exit((int) !extension_loaded(\"deepclone\"));"
               make test TESTS="-q --show-diff tests/"
             '
 
@@ -232,6 +293,7 @@ jobs:
           phpize
           ./configure --enable-deepclone
           make -j$(sysctl -n hw.ncpu)
+          php -d extension=modules/deepclone.so -r 'exit((int) !extension_loaded("deepclone"));'
           NO_INTERACTION=1 REPORT_EXIT_STATUS=1 make test TESTS="-q --show-diff tests/"
 
   windows-matrix:
