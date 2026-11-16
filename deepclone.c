@@ -267,6 +267,27 @@ static zend_always_inline bool dc_check_stack_limit(void)
 	return false;
 }
 
+/* Run a native serialization, or unserialization, in a context of its own,
+ * then restore the one of the serialize() or unserialize() call in progress,
+ * if any. Called from Serializable::serialize() or ::unserialize(), the native
+ * functions would otherwise join the context of the outer call: the string
+ * of an object would reference values of the outer stream, and unserializing
+ * one would leave its result, a variable of the calling function, in the
+ * table of the outer call. The methods that the native call runs still
+ * nest in its context, as they do in a top-level call. */
+#define DC_SERIALIZE_CONTEXT_ENTER(which) \
+	unsigned dc_saved_lock = BG(serialize_lock); \
+	unsigned dc_saved_level = BG(which).level; \
+	void *dc_saved_data = BG(which).data; \
+	BG(serialize_lock) = 0; \
+	BG(which).level = 0; \
+	BG(which).data = NULL
+
+#define DC_SERIALIZE_CONTEXT_LEAVE(which) \
+	BG(serialize_lock) = dc_saved_lock; \
+	BG(which).level = dc_saved_level; \
+	BG(which).data = dc_saved_data
+
 /* We key ctx->ref_map on raw zend_reference pointers. Pre-hashing is
  * unsafe because zend_hash uses the stored key as a bucket-chain identity
  * (p->h == h), not just for distribution. The ref_map is sparse enough
@@ -3252,9 +3273,11 @@ static void dc_process_object(dc_ctx *ctx, zval *src, zval *dst, zval *mask_dst)
 	if (UNEXPECTED(ce->serialize != NULL || ce == php_ce_incomplete_class)) {
 		smart_str buf = {0};
 		php_serialize_data_t var_hash;
+		DC_SERIALIZE_CONTEXT_ENTER(serialize);
 		PHP_VAR_SERIALIZE_INIT(var_hash);
 		php_var_serialize(&buf, src, &var_hash);
 		PHP_VAR_SERIALIZE_DESTROY(var_hash);
+		DC_SERIALIZE_CONTEXT_LEAVE(serialize);
 
 		zend_string *serialized = smart_str_extract(&buf);
 		entry->cidx = dc_class_index(ctx, serialized);
@@ -5718,17 +5741,19 @@ PHP_FUNCTION(deepclone_from_array)
 
 		if (ZSTR_LEN(class_name) > 1 && ZSTR_VAL(class_name)[1] == ':') {
 			php_unserialize_data_t var_hash;
+			DC_SERIALIZE_CONTEXT_ENTER(unserialize);
 			PHP_VAR_UNSERIALIZE_INIT(var_hash);
 			if (allowed_set) {
 				php_var_unserialize_set_allowed_classes(var_hash, allowed_set);
 			}
 			const unsigned char *p = (const unsigned char *)ZSTR_VAL(class_name);
 			const unsigned char *end = p + ZSTR_LEN(class_name);
-			if (!php_var_unserialize(&obj_zval, &p, end, &var_hash)) {
-				PHP_VAR_UNSERIALIZE_DESTROY(var_hash);
+			bool unserialized = php_var_unserialize(&obj_zval, &p, end, &var_hash);
+			PHP_VAR_UNSERIALIZE_DESTROY(var_hash);
+			DC_SERIALIZE_CONTEXT_LEAVE(unserialize);
+			if (!unserialized) {
 				DC_INVALID("deepclone_from_array(): Argument #1 ($data) failed to unserialize object %u", id);
 			}
-			PHP_VAR_UNSERIALIZE_DESTROY(var_hash);
 			if (UNEXPECTED(EG(exception))) {
 				/* Thrown by a delayed __unserialize() or __wakeup() call */
 				zval_ptr_dtor(&obj_zval);
