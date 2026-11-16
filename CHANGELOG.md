@@ -84,6 +84,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Serializable` objects as back-references to the stream of the outer
   `serialize()` call, eg `r:2;`, which nothing else can restore. They're
   serialized in a context of their own too.
+- On PHP 8.4 and 8.5, `deepclone_hydrate()` with
+  `DEEPCLONE_HYDRATE_NO_LAZY_INIT` could corrupt the memory of the next
+  request when user code called it while the request shuts down, eg from the
+  `stream_close()` of a stream wrapper or from the save handler of a session.
 
 ## [0.8.10] - 2026-11-15
 

@@ -1115,8 +1115,13 @@ static bool dc_set_raw_value_without_lazy_init(zend_object *obj,
 {
 	HashTable *cache = &DC_G(lazy_init_refl_cache);
 	zend_object *refl_obj = NULL;
+	/* The cache is released when the request shuts down. User code can still
+	 * run after that, eg the stream_close() of a stream wrapper or the save
+	 * handler of a session: nothing would release what it adds to the cache,
+	 * which the next request would then find. */
+	bool cached = !DC_G(lazy_init_refl_cache_closed);
 
-	if (cache->nTableSize) {
+	if (cached && cache->nTableSize) {
 		refl_obj = zend_hash_index_find_ptr(cache, (zend_ulong) (uintptr_t) pi);
 	}
 
@@ -1142,12 +1147,14 @@ static bool dc_set_raw_value_without_lazy_init(zend_object *obj,
 			return false;
 		}
 
-		if (!cache->nTableSize) {
-			zend_hash_init(cache, 8, NULL, dc_lazy_refl_cache_dtor, 0);
-		}
 		refl_obj = Z_OBJ(refl_zv);
-		zend_hash_index_add_ptr(cache, (zend_ulong) (uintptr_t) pi, refl_obj);
-		/* Cache holds the only reference; refcount stays at 1. */
+		if (cached) {
+			if (!cache->nTableSize) {
+				zend_hash_init(cache, 8, NULL, dc_lazy_refl_cache_dtor, 0);
+			}
+			zend_hash_index_add_ptr(cache, (zend_ulong) (uintptr_t) pi, refl_obj);
+			/* Cache holds the only reference; refcount stays at 1. */
+		}
 	}
 
 	zval method_args[2];
@@ -1161,6 +1168,9 @@ static bool dc_set_raw_value_without_lazy_init(zend_object *obj,
 
 	zval_ptr_dtor(&method_args[0]);
 	zval_ptr_dtor(&method_args[1]);
+	if (UNEXPECTED(!cached)) {
+		OBJ_RELEASE(refl_obj);
+	}
 
 	return !EG(exception);
 }
@@ -6805,6 +6815,7 @@ static PHP_GINIT_FUNCTION(deepclone)
 #if defined(COMPILE_DL_DEEPCLONE) && defined(ZTS)
 	ZEND_TSRMLS_CACHE_UPDATE();
 #endif
+	deepclone_globals->lazy_init_refl_cache_closed = 0;
 	zend_hash_init(&deepclone_globals->hydrate_cache, 8, NULL, NULL, 1);
 	/* lazy_init_refl_cache holds zend_object* (request-scoped). Initialized
 	 * lazily on first use in RINIT-equivalent flow; cleared in RSHUTDOWN. */
@@ -6838,10 +6849,23 @@ static PHP_RSHUTDOWN_FUNCTION(deepclone)
 		zend_hash_destroy(cache);
 		memset(cache, 0, sizeof(HashTable));
 	}
+#if PHP_VERSION_ID >= 80400 && PHP_VERSION_ID < 80600
+	/* Until the request is over, see dc_set_raw_value_without_lazy_init() */
+	DC_G(lazy_init_refl_cache_closed) = 1;
+#endif
 	/* attr_provenance is NOT cleared here: it is a persistent, per-worker
 	 * cache that survives across requests (freed in GSHUTDOWN). */
 	return SUCCESS;
 }
+
+#if PHP_VERSION_ID >= 80400 && PHP_VERSION_ID < 80600
+static ZEND_MODULE_POST_ZEND_DEACTIVATE_D(deepclone)
+{
+	DC_G(lazy_init_refl_cache_closed) = 0;
+
+	return SUCCESS;
+}
+#endif
 
 PHP_MINFO_FUNCTION(deepclone)
 {
@@ -6866,7 +6890,11 @@ zend_module_entry deepclone_module_entry = {
 	PHP_MODULE_GLOBALS(deepclone),
 	PHP_GINIT(deepclone),
 	PHP_GSHUTDOWN(deepclone),
+#if PHP_VERSION_ID >= 80400 && PHP_VERSION_ID < 80600
+	ZEND_MODULE_POST_ZEND_DEACTIVATE_N(deepclone),
+#else
 	NULL, /* post-deactivate */
+#endif
 	STANDARD_MODULE_PROPERTIES_EX
 };
 
