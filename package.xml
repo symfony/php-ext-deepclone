@@ -10,11 +10,11 @@
   <email>p@tchwork.com</email>
   <active>yes</active>
  </lead>
- <date>2026-11-15</date>
- <time>09:37:15</time>
+ <date>2026-11-16</date>
+ <time>20:40:35</time>
  <version>
-  <release>0.8.10</release>
-  <api>0.8.10</api>
+  <release>0.8.11</release>
+  <api>0.8.11</api>
  </version>
  <stability>
   <release>beta</release>
@@ -22,7 +22,7 @@
  </stability>
  <license uri="https://opensource.org/licenses/MIT">MIT</license>
  <notes>
-Fixed: GC crashes on lazy ghosts with PHP 8.4.27, 8.5.12 and 8.6. See CHANGELOG.md for details.
+Fixed: crashes, memory corruptions and wrong results in deepclone_to_array(), deepclone_from_array() and deepclone_hydrate(). Changed: deepclone_to_array() and the ReflectionAttribute wrappers are faster, deepclone_from_array() doesn't convert objects to strings anymore. See CHANGELOG.md for details.
  </notes>
  <contents>
   <dir name="/">
@@ -51,11 +51,11 @@ Fixed: GC crashes on lazy ghosts with PHP 8.4.27, 8.5.12 and 8.6. See CHANGELOG.
  <extsrcrelease />
  <changelog>
   <release>
-   <date>2026-11-15</date>
-   <time>09:37:15</time>
+   <date>2026-11-16</date>
+   <time>20:40:35</time>
    <version>
-    <release>0.8.10</release>
-    <api>0.8.10</api>
+    <release>0.8.11</release>
+    <api>0.8.11</api>
    </version>
    <stability>
     <release>beta</release>
