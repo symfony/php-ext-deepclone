@@ -387,6 +387,7 @@ struct _dc_ctx {
 	bool           is_static;
 	bool           allow_named_closures; /* opt-in: encode closures over named callables by name */
 	HashTable     *allowed_ht;     /* allowed class names set (or NULL = all) */
+	uint32_t       gc_runs;        /* runs of the cycle collector when the walk started */
 
 	/* Output structures built incrementally during traversal */
 	zval           classes;        /* deduped class names */
@@ -492,6 +493,14 @@ static zend_always_inline dc_resolve_entry *dc_rlog_at(dc_ctx *ctx, uint32_t idx
 	return &ctx->rlog_blocks[idx >> DC_RLOG_BLOCK_SHIFT][idx & (DC_RLOG_BLOCK_SIZE - 1)];
 }
 
+static zend_always_inline uint32_t dc_gc_runs(void)
+{
+	zend_gc_status status;
+	zend_gc_get_status(&status);
+
+	return status.runs;
+}
+
 static void dc_ctx_init(dc_ctx *ctx) {
 	zend_hash_init(&ctx->object_pool, 8, NULL, NULL, 0);
 	ctx->entries = NULL;
@@ -519,6 +528,7 @@ static void dc_ctx_init(dc_ctx *ctx) {
 	zend_hash_init(&ctx->scope_cache, 4, NULL, ZVAL_PTR_DTOR, 0);
 	zend_hash_init(&ctx->class_info, 4, NULL, NULL, 0);
 	zend_hash_init(&ctx->proto_cache, 4, NULL, ZVAL_PTR_DTOR, 0);
+	ctx->gc_runs = dc_gc_runs();
 }
 
 static void dc_ctx_destroy(dc_ctx *ctx) {
@@ -546,6 +556,12 @@ static void dc_ctx_destroy(dc_ctx *ctx) {
 	}
 	zend_hash_destroy(&ctx->class_map);
 	if (ctx->entries) {
+		/* When the cycle collector ran during the walk, it took the objects
+		 * that only the pool kept alive off its roots: give them back, or the
+		 * cycles they're part of would never be collected. Otherwise they're
+		 * still there, which spares rooting the whole graph. */
+		bool gc_ran = ctx->gc_runs != dc_gc_runs();
+
 		/* Free any remaining pool entries (entries whose props/prop_mask were
 		 * transferred into the output have those fields nulled out by
 		 * dc_build_output before reaching here). */
@@ -558,9 +574,10 @@ static void dc_ctx_destroy(dc_ctx *ctx) {
 			if (e->prop_mask) {
 				zend_array_destroy(e->prop_mask);
 			}
-			/* Undo the ref taken above, which can't make it a garbage cycle
-			 * root */
-			if (GC_DELREF(e->obj) == 0) {
+			/* Undo the ref taken when the object was pooled */
+			if (UNEXPECTED(gc_ran)) {
+				OBJ_RELEASE(e->obj);
+			} else if (GC_DELREF(e->obj) == 0) {
 				zend_objects_store_del(e->obj);
 			}
 			efree(e);
@@ -569,6 +586,9 @@ static void dc_ctx_destroy(dc_ctx *ctx) {
 	}
 	if (ctx->refs) {
 		for (uint32_t i = 0; i < ctx->refs_count; i++) {
+			zval ref;
+			ZVAL_REF(&ref, ctx->refs[i].ref);
+			zval_ptr_dtor(&ref);
 			zval_ptr_dtor(&ctx->refs[i].orig_type);
 			zval_ptr_dtor(&ctx->refs[i].cur_value);
 			zval_ptr_dtor(&ctx->refs[i].cur_mask);
@@ -620,6 +640,10 @@ static uint32_t dc_ref_add(dc_ctx *ctx, zend_reference *ref, zval *orig, zval *c
 		ctx->refs = safe_erealloc(ctx->refs, ctx->refs_cap, sizeof(dc_ref_entry), 0);
 	}
 	uint32_t idx = ctx->refs_count++;
+	/* References are told apart by their address: keep them alive, or the
+	 * ones that user code creates and releases during the walk would be
+	 * taken for each other */
+	GC_ADDREF(ref);
 	ctx->refs[idx].ref = ref;
 	ctx->refs[idx].id = idx + 1;  /* 1-based */
 	ctx->refs[idx].count = 0;
@@ -814,6 +838,8 @@ static HashTable *dc_get_proto(dc_ctx *ctx, zend_class_entry *ce) {
 	} else {
 		array_init(&proto_arr);
 	}
+	/* The prototype was never constructed: don't run its destructor */
+	zend_object_store_ctor_failed(Z_OBJ(proto_zval));
 	zval_ptr_dtor(&proto_zval);
 	zend_hash_add_new(&ctx->proto_cache, ce->name, &proto_arr);
 	return Z_ARRVAL(proto_arr);
@@ -2832,16 +2858,22 @@ static zend_property_info *dc_sleep_find_slot(zend_class_entry *ce, zend_string 
 		if (!sep) {
 			return NULL;
 		}
-		size_t class_len = sep - n - 1;
-		if (class_len == 1 && n[1] == '*') {
-			pi = zend_hash_str_find_ptr(&ce->properties_info, sep + 1, len - 3);
+		const char *class_name = n + 1, *prop_name = sep + 1;
+		/* The name of an anonymous class contains a NUL */
+		const char *anon_sep = memchr(prop_name, '\0', n + len - prop_name);
+		if (anon_sep) {
+			prop_name = anon_sep + 1;
+		}
+		size_t class_len = prop_name - class_name - 1, prop_len = n + len - prop_name;
+		if (class_len == 1 && class_name[0] == '*') {
+			pi = zend_hash_str_find_ptr(&ce->properties_info, prop_name, prop_len);
 			if (pi && !(pi->flags & ZEND_ACC_PROTECTED)) {
 				pi = NULL;
 			}
 		} else {
 			for (zend_class_entry *scope = ce; scope; scope = scope->parent) {
-				if (ZSTR_LEN(scope->name) == class_len && !memcmp(ZSTR_VAL(scope->name), n + 1, class_len)) {
-					pi = zend_hash_str_find_ptr(&scope->properties_info, sep + 1, len - class_len - 2);
+				if (ZSTR_LEN(scope->name) == class_len && !memcmp(ZSTR_VAL(scope->name), class_name, class_len)) {
+					pi = zend_hash_str_find_ptr(&scope->properties_info, prop_name, prop_len);
 					if (pi && (!(pi->flags & ZEND_ACC_PRIVATE) || pi->ce != scope)) {
 						pi = NULL;
 					}
@@ -2913,7 +2945,7 @@ static bool dc_sleep_properties(zval *src, HashTable *names, HashTable *selected
 			} else {
 				found = true;
 				zend_bitset_incl(seen, OBJ_PROP_TO_NUM(pi->offset));
-				dc_add_slot_property(scoped, ce, pi, val, ce->default_properties_table);
+				dc_add_slot_property(scoped, ce, pi, val, CE_DEFAULT_PROPERTIES_TABLE(ce));
 			}
 		} else if (props) {
 			found = dc_sleep_add_from_table(selected, props, name, name, obj);
@@ -3195,7 +3227,7 @@ static void dc_process_object(dc_ctx *ctx, zval *src, zval *dst, zval *mask_dst)
 		/* Default-value comparison: use default_properties_table for user classes.
 		 * For internal classes (Error, etc.), skip — their constructors modify
 		 * defaults so the table doesn't reflect runtime state. */
-		zval *default_props = (ce->type == ZEND_USER_CLASS) ? ce->default_properties_table : NULL;
+		zval *default_props = (ce->type == ZEND_USER_CLASS) ? CE_DEFAULT_PROPERTIES_TABLE(ce) : NULL;
 
 		for (uint32_t i = 0; i < ce->default_properties_count; i++) {
 			prop_info = ce->properties_info_table[i];
