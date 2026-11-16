@@ -4267,7 +4267,11 @@ static void dc_resolve(zval *value, zval *mask, zval *objects, uint32_t num_obje
 			zend_value_error("deepclone_from_array(): malformed payload, unknown ref id " ZEND_LONG_FMT, rid);
 			return;
 		}
-		if (UNEXPECTED(ref_slot == value)) {
+		/* The value was dereferenced above: so is the target, which another
+		 * marker can have turned into a reference already */
+		zval *target = ref_slot;
+		ZVAL_DEREF(target);
+		if (UNEXPECTED(target == value)) {
 			zend_value_error("deepclone_from_array(): malformed payload, ref id " ZEND_LONG_FMT " cannot reference itself", rid);
 			return;
 		}
@@ -4370,6 +4374,12 @@ static void dc_resolve(zval *value, zval *mask, zval *objects, uint32_t num_obje
 			zend_value_error("deepclone_from_array(): malformed payload, named-closure function or method not found");
 			return;
 		}
+		if (UNEXPECTED(func->common.fn_flags & ZEND_ACC_ABSTRACT)) {
+			zval_ptr_dtor(&resolved_obj);
+			zend_value_error("deepclone_from_array(): malformed payload, named-closure method %s::%s() is abstract",
+				ZSTR_VAL(func->common.scope->name), ZSTR_VAL(func->common.function_name));
+			return;
+		}
 		if (func->common.scope) {
 			if (!instanceof_function(called_scope, func->common.scope)) {
 				zval_ptr_dtor(&resolved_obj);
@@ -4441,6 +4451,9 @@ static void dc_resolve(zval *value, zval *mask, zval *objects, uint32_t num_obje
 	}
 
 	/* Array mask: recurse, handling & refs inline */
+	if (UNEXPECTED(dc_check_stack_limit())) {
+		return;
+	}
 	if (Z_TYPE_P(value) != IS_ARRAY) {
 		zend_value_error("deepclone_from_array(): malformed payload, array-mask value must be of type array, %s given", zend_zval_value_name(value));
 		return;
@@ -5062,7 +5075,7 @@ static void dc_lazy_hydrate(dc_lazy_ctx *ctx, zend_object *obj, uint32_t id)
 				goto restore;
 			}
 		} else {
-			ZVAL_COPY(&final_val, slot->value);
+			ZVAL_COPY_DEREF(&final_val, slot->value);
 		}
 
 		if (slot->pi) {
@@ -5106,7 +5119,7 @@ static void dc_lazy_hydrate(dc_lazy_ctx *ctx, zend_object *obj, uint32_t id)
 					goto restore;
 				}
 			} else {
-				ZVAL_COPY(&resolved, st->props);
+				ZVAL_COPY_DEREF(&resolved, st->props);
 			}
 			/* Flagged-but-method-less classes are rejected by the eager
 			 * phase-9 validation; the guard only matters for initializers
@@ -5254,7 +5267,7 @@ static bool dc_mask_has_closure(zval *mask)
 	if (DC_MASK_IS_NAMED_CLOSURE(mask) || DC_MASK_IS_CONSTEXPR_CLOSURE(mask)) {
 		return true;
 	}
-	if (Z_TYPE_P(mask) != IS_ARRAY) {
+	if (Z_TYPE_P(mask) != IS_ARRAY || UNEXPECTED(dc_check_stack_limit())) {
 		return false;
 	}
 	zval *v;
@@ -5282,7 +5295,7 @@ static int dc_mask_closures(zval *mask)
 	if (DC_MASK_IS_CONSTEXPR_CLOSURE(mask)) {
 		return DC_CONSTEXPR_CLOSURES;
 	}
-	if (Z_TYPE_P(mask) != IS_ARRAY) {
+	if (Z_TYPE_P(mask) != IS_ARRAY || UNEXPECTED(dc_check_stack_limit())) {
 		return 0;
 	}
 	int found = 0;
@@ -5507,6 +5520,10 @@ PHP_FUNCTION(deepclone_from_array)
 			DC_INVALID("deepclone_from_array(): resolving a closure over a named callable requires enabling the \"allow_named_closures\" option; do it only if you trust the input");
 		}
 	}
+	/* The scans above stop at the stack limit */
+	if (UNEXPECTED(EG(exception))) {
+		goto cleanup;
+	}
 
 	/* ── Build objectMeta ── */
 	if (Z_TYPE_P(zobject_meta) == IS_LONG) {
@@ -5688,6 +5705,10 @@ PHP_FUNCTION(deepclone_from_array)
 			}
 		}
 		efree(has_closure_slot);
+		/* The scan above stops at the stack limit */
+		if (UNEXPECTED(EG(exception))) {
+			goto cleanup;
+		}
 
 		if (any_ghost) {
 			ZVAL_OBJ(&lazy_ctx_zv, dc_lazy_ctx_create(dc_lazy_ctx_ce));
@@ -5917,20 +5938,27 @@ PHP_FUNCTION(deepclone_from_array)
 	if (zrefs && Z_TYPE_P(zrefs) == IS_ARRAY) {
 		/* First pass: populate refs with unresolved copies (needed for self-refs) */
 		zend_ulong rid;
+		zend_string *rkey;
 		zval *rval;
-		ZEND_HASH_FOREACH_NUM_KEY_VAL(Z_ARRVAL_P(zrefs), rid, rval) {
+		ZEND_HASH_FOREACH_KEY_VAL(Z_ARRVAL_P(zrefs), rid, rkey, rval) {
 			zval copy;
 			ZVAL_COPY(&copy, rval);
-			zend_hash_index_add_new(refs, rid, &copy);
+			/* No id can reference a string key: keep it apart from the ids */
+			if (UNEXPECTED(rkey)) {
+				zend_hash_add_new(refs, rkey, &copy);
+			} else {
+				zend_hash_index_add_new(refs, rid, &copy);
+			}
 		} ZEND_HASH_FOREACH_END();
 	}
 
 	/* Second pass: resolve those with masks, updating in-place */
 	if (zref_masks) {
 		zend_ulong rid;
+		zend_string *rkey;
 		zval *rmask;
-		ZEND_HASH_FOREACH_NUM_KEY_VAL(Z_ARRVAL_P(zref_masks), rid, rmask) {
-			zval *slot = zend_hash_index_find(refs, rid);
+		ZEND_HASH_FOREACH_KEY_VAL(Z_ARRVAL_P(zref_masks), rid, rkey, rmask) {
+			zval *slot = UNEXPECTED(rkey) ? zend_hash_find(refs, rkey) : zend_hash_index_find(refs, rid);
 			if (UNEXPECTED(!slot)) {
 				if (!dc_resolve_unmatched_mask(rmask, objects, num_objects, refs, allowed_set)) {
 					goto cleanup;
@@ -5941,6 +5969,11 @@ PHP_FUNCTION(deepclone_from_array)
 			ZVAL_UNDEF(&resolved);
 			dc_resolve(slot, rmask, objects, num_objects, refs, allowed_set, &resolved);
 			if (EG(exception)) goto cleanup;
+			/* A hard-ref marker on the value of a reference: a reference
+			 * can't hold another one, it takes the value of its target */
+			if (UNEXPECTED(Z_ISREF(resolved))) {
+				zend_unwrap_reference(&resolved);
+			}
 			/* Write through reference if slot was made into one (by dc_resolve) */
 			if (Z_ISREF_P(slot)) {
 				zval *inner = Z_REFVAL_P(slot);
@@ -6239,7 +6272,7 @@ PHP_FUNCTION(deepclone_from_array)
 					dc_resolve(sprops, smask, objects, num_objects, refs, allowed_set, &resolved_props);
 					if (EG(exception)) goto cleanup;
 				} else {
-					ZVAL_COPY(&resolved_props, sprops);
+					ZVAL_COPY_DEREF(&resolved_props, sprops);
 				}
 				zend_call_method_with_1_params(Z_OBJ_P(obj_zval), unser_ce,
 					&unser_ce->__unserialize, "__unserialize", NULL, &resolved_props);
