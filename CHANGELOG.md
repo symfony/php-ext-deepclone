@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `deepclone_from_array()` doesn't convert an object to a string anymore when
+  a payload puts it in a `string` property: it throws a `TypeError`, like
+  `unserialize()`. The conversion called `__toString()` on an object that
+  might not be hydrated yet, and crashed on a `BcMath\Number` that still
+  waits for its state.
+
 ### Fixed
 
 - `deepclone_to_array()` crashed on a `stdClass` object whose property table
@@ -32,6 +40,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   enum case, unlike without OPcache.
 - `deepclone_to_array()` finds the private properties of anonymous classes
   when `__sleep()` returns them by their mangled name.
+- `deepclone_hydrate()` wrote to the property table that a `stdClass` object
+  shares with a clone, or with the array it was cast from or to: the write
+  changed them too.
+- `deepclone_hydrate()` and `deepclone_from_array()` could corrupt memory
+  when the destructor of a value they replace in a `stdClass` object, or in a
+  dynamic property bound to a reference, wrote to the same object.
+- `deepclone_hydrate()` wrote to the lazy proxy itself once it is initialized,
+  instead of its real instance. On a lazy object that isn't initialized, the
+  default flags ran set hooks, and neither converted scalars to backed enums
+  nor left `null` properties uninitialized.
+- `deepclone_hydrate()` let `null` uninitialize a readonly property, which
+  could then be written again, and bound readonly properties to references
+  with `DEEPCLONE_HYDRATE_PRESERVE_REFS`.
+- `deepclone_hydrate()` loads the backed enum of a property when needed to
+  convert a scalar to its case. The conversion was skipped when the enum
+  wasn't loaded yet.
+- `deepclone_hydrate()` calls `__set()` for an untyped property that was
+  unset, and writes through the reference that an untyped property holds,
+  like `ReflectionProperty::setRawValue()`.
+- With `DEEPCLONE_HYDRATE_PRESERVE_REFS`, the value of a reference is
+  converted like other values: to the type of the property, to the case of a
+  backed enum, and `null` leaves the property uninitialized.
+- With `DEEPCLONE_HYDRATE_PRESERVE_REFS`, binding a reference to a new dynamic
+  property triggers the "Creation of dynamic property" deprecation, like
+  writing a value does.
+- References bound to a typed property that a child class redeclares are
+  tracked by that property. Destroying the object could corrupt memory when
+  the reference was bound through the scope of the parent class.
 
 ## [0.8.10] - 2026-11-15
 
