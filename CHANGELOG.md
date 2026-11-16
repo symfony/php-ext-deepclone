@@ -32,6 +32,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `deepclone_to_array()` shares the state that `__serialize()` returns when
   it holds scalars only, like it does for the arrays of properties. It copied
   it before: one million integers took 30 ms and 17 MB.
+- `deepclone_to_array()` removes the scope prefix from the names of protected
+  and private properties once per class, instead of once per object, and
+  looks the classes it met last up by address: exporting a graph of 5,700
+  objects that describe entities needs 11% fewer instructions.
 
 ### Fixed
 
