@@ -505,6 +505,15 @@ static zend_always_inline bool dc_needs_internal_state(zend_class_entry *ce)
 	return UNEXPECTED(ce->create_object != NULL) && dc_needs_internal_state_slow(ce);
 }
 
+/* The engine refuses to create these classes without calling their
+ * constructor: their bare instance can be unusable until __unserialize() ran,
+ * eg reading a BcMath\Number crashes before that. */
+static zend_always_inline bool dc_needs_early_state(const zend_class_entry *ce)
+{
+	return ce->type == ZEND_INTERNAL_CLASS && ce->create_object != NULL
+		&& (ce->ce_flags & ZEND_ACC_FINAL) && ce->__unserialize != NULL;
+}
+
 
 /* ── Helpers ────────────────────────────────────────────────── */
 
@@ -5561,6 +5570,10 @@ PHP_FUNCTION(deepclone_from_array)
 	uint32_t num_objects = 0;
 	uint32_t *obj_class_ids = NULL;
 	int *obj_wakeups = NULL;
+	/* Objects whose state is replayed before the other ones, see below */
+	bool *early_states = NULL;
+	bool has_early_states = false;
+	bool states_check_only = false;
 	bool refs_inited = false;
 	/* Lazy hydration: non-NULL once at least one node is ghost-eligible.
 	 * The context then owns objects/refs/allowed_set: ghost initializers
@@ -6011,6 +6024,9 @@ PHP_FUNCTION(deepclone_from_array)
 			if (UNEXPECTED(ce->__unserialize != NULL && (!obj_wakeups || obj_wakeups[id] >= 0))) {
 				DC_INVALID("deepclone_from_array(): Argument #1 ($data) object %u of class %s has an __unserialize() method but \"objectMeta\" does not flag it for an __unserialize state", id, ZSTR_VAL(ce->name));
 			}
+			if (UNEXPECTED(dc_needs_early_state(ce))) {
+				has_early_states = true;
+			}
 #if PHP_VERSION_ID >= 80400
 			if (is_ghost && is_ghost[id]) {
 				/* Lazy node: create an uninitialized ghost whose initializer
@@ -6175,8 +6191,61 @@ PHP_FUNCTION(deepclone_from_array)
 		} ZEND_HASH_FOREACH_END();
 	}
 
+	/* ── Early states ──────────────────────────────
+	 *
+	 * The bare instance of some internal classes is unusable until its
+	 * __unserialize() ran. Replay these states before any user code can be
+	 * given such an instance: the __unserialize() or __wakeup() of another
+	 * object, when a payload orders the states that way, or __set(). */
+	if (UNEXPECTED(has_early_states)) {
+		early_states = ecalloc(num_objects, sizeof(bool));
+		if (zstates) {
+			zval *state;
+			ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(zstates), state) {
+				if (Z_TYPE_P(state) != IS_ARRAY) {
+					continue;
+				}
+				zval *zid    = zend_hash_index_find(Z_ARRVAL_P(state), 0);
+				zval *sprops = zend_hash_index_find(Z_ARRVAL_P(state), 1);
+				zval *smask  = zend_hash_index_find(Z_ARRVAL_P(state), 2);
+				/* Malformed entries are reported by the states loop below */
+				if (!zid || Z_TYPE_P(zid) != IS_LONG || !sprops
+				 || Z_LVAL_P(zid) < 0 || (zend_ulong) Z_LVAL_P(zid) >= num_objects
+				 || obj_wakeups[Z_LVAL_P(zid)] >= 0 || early_states[Z_LVAL_P(zid)]) {
+					continue;
+				}
+				zval *obj_zval = &objects[Z_LVAL_P(zid)];
+				zend_class_entry *unser_ce = Z_OBJCE_P(obj_zval);
+				if (!dc_needs_early_state(unser_ce)) {
+					continue;
+				}
+				early_states[Z_LVAL_P(zid)] = true;
+				zval resolved_props;
+				if (smask) {
+					ZVAL_UNDEF(&resolved_props);
+					dc_resolve(sprops, smask, objects, num_objects, refs, allowed_set, &resolved_props);
+					if (EG(exception)) goto cleanup;
+				} else {
+					ZVAL_COPY_DEREF(&resolved_props, sprops);
+				}
+				zend_call_method_with_1_params(Z_OBJ_P(obj_zval), unser_ce,
+					&unser_ce->__unserialize, "__unserialize", NULL, &resolved_props);
+				zval_ptr_dtor(&resolved_props);
+				if (EG(exception)) goto cleanup;
+			} ZEND_HASH_FOREACH_END();
+		}
+		for (uint32_t i = 0; i < num_objects; i++) {
+			if (obj_wakeups[i] < 0 && !early_states[i] && dc_needs_early_state(Z_OBJCE(objects[i]))) {
+				/* The payload gives no valid state to this object: let the
+				 * states loop report why, without running any user code. */
+				states_check_only = true;
+				break;
+			}
+		}
+	}
+
 	/* ── Hydrate properties ────────────────────── */
-	if (zproperties) {
+	if (zproperties && !states_check_only) {
 		zend_string *scope_name;
 		zval *scope_props;
 		ZEND_HASH_FOREACH_STR_KEY_VAL(Z_ARRVAL_P(zproperties), scope_name, scope_props) {
@@ -6455,6 +6524,10 @@ PHP_FUNCTION(deepclone_from_array)
 					/* Deferred into the ghost's initializer. */
 					continue;
 				}
+				if (UNEXPECTED(early_states && (states_check_only || early_states[Z_LVAL_P(zid)]))) {
+					/* Replayed before the properties were hydrated */
+					continue;
+				}
 				zval resolved_props;
 				if (smask) {
 					ZVAL_UNDEF(&resolved_props);
@@ -6480,6 +6553,9 @@ PHP_FUNCTION(deepclone_from_array)
 					/* Deferred into the ghost's initializer. */
 					continue;
 				}
+				if (UNEXPECTED(states_check_only)) {
+					continue;
+				}
 				zval *obj_zval = &objects[Z_LVAL_P(state)];
 				zend_class_entry *wakeup_ce = Z_OBJCE_P(obj_zval);
 				zend_function *wakeup_fn = zend_hash_find_ptr(&wakeup_ce->function_table, ZSTR_KNOWN(ZEND_STR_WAKEUP));
@@ -6502,6 +6578,10 @@ PHP_FUNCTION(deepclone_from_array)
 				DC_INVALID("deepclone_from_array(): Argument #1 ($data) \"objectMeta\" entry %u flags object for state replay but no matching \"states\" entry was found", i);
 			}
 		}
+	}
+	if (UNEXPECTED(states_check_only)) {
+		/* Never reached: one of the checks above reports the object that got no state */
+		DC_INVALID("deepclone_from_array(): Argument #1 ($data) \"objectMeta\" flags an object for state replay but no matching \"states\" entry was found");
 	}
 
 	/* ── Resolve prepared tree ─────────────────── */
@@ -6575,6 +6655,7 @@ cleanup:
 	if (lazy_slot_counts) efree(lazy_slot_counts);
 	if (obj_class_ids) efree(obj_class_ids);
 	if (obj_wakeups) efree(obj_wakeups);
+	if (early_states) efree(early_states);
 	if (class_ces)   efree(class_ces);
 	if (class_names) efree(class_names);
 }
