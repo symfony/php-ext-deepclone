@@ -25,7 +25,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `::getArguments()` cost the same as without the extension for the
   attributes that take literals only. For the others, the extension doesn't
   build the property table of each object of the instance anymore, which
-  tripled the memory they use.
+  tripled the memory they use. It also skips scalars, enum cases and literal
+  arrays, and needs no table to remember the objects it went through:
+  instantiating an attribute that takes two objects costs 10% more than
+  without the extension, down from 37%.
 - `deepclone_to_array()` scans nested arrays once to tell whether they can be
   shared as is. It scanned them again at each level when one held an object:
   400 levels of 200 scalars over an object took 20 ms, and take 3 ms now.

@@ -2396,6 +2396,43 @@ static zend_class_entry *dc_provenance_lookup(zend_class_entry *target_ce, zend_
 	return zend_lookup_class_ex(decl, NULL, ZEND_FETCH_CLASS_NO_AUTOLOAD);
 }
 
+/* The objects that dc_index_closures_rec() went through. Most values hold a
+ * few objects only: the first ones are listed inline, which spares a table. */
+#define DC_SEEN_INLINE 8
+
+typedef struct {
+	zend_object *first[DC_SEEN_INLINE];
+	uint32_t     num;
+	HashTable   *more;
+} dc_seen_objects;
+
+static zend_always_inline bool dc_seen_add(dc_seen_objects *seen, zend_object *obj)
+{
+	for (uint32_t i = 0; i < seen->num; i++) {
+		if (seen->first[i] == obj) {
+			return false;
+		}
+	}
+	if (EXPECTED(seen->num < DC_SEEN_INLINE)) {
+		seen->first[seen->num++] = obj;
+		return true;
+	}
+	if (!seen->more) {
+		ALLOC_HASHTABLE(seen->more);
+		zend_hash_init(seen->more, 32, NULL, NULL, 0);
+	}
+	return zend_hash_index_add_empty_element(seen->more, obj->handle) != NULL;
+}
+
+/* Scalars, literal arrays, which are immutable, and enum cases hold no closure */
+static zend_always_inline bool dc_may_hold_closure(const zval *val)
+{
+	if (Z_TYPE_P(val) < IS_ARRAY || !Z_REFCOUNTED_P(val)) {
+		return false;
+	}
+	return Z_TYPE_P(val) != IS_OBJECT || !(Z_OBJCE_P(val)->ce_flags & ZEND_ACC_ENUM);
+}
+
 /* Walk a value (a getArguments() argument, or a newInstance() attribute object
  * and its properties), recording every cross-class FCC against `scope`. The
  * `seen` set guards cycles: getArguments() values are acyclic constant
@@ -2404,7 +2441,7 @@ static zend_class_entry *dc_provenance_lookup(zend_class_entry *target_ce, zend_
  * This runs inside the methods of ReflectionAttribute, for all their callers:
  * it never throws, and reads the properties of plain objects from their
  * slots, as building their property table would keep it allocated. */
-static void dc_index_closures_rec(HashTable *seen, zval *val, zend_class_entry *scope)
+static void dc_index_closures_rec(dc_seen_objects *seen, zval *val, zend_class_entry *scope)
 {
 #ifdef ZEND_CHECK_STACK_LIMIT
 	if (UNEXPECTED(zend_call_stack_overflowed(EG(stack_limit)))) {
@@ -2428,27 +2465,42 @@ static void dc_index_closures_rec(HashTable *seen, zval *val, zend_class_entry *
 			}
 			return;
 		}
-		if (!zend_hash_index_add_empty_element(seen, obj->handle)) {
+		if (obj->ce->ce_flags & ZEND_ACC_ENUM) {
 			return;
 		}
 		if (EXPECTED(!obj->handlers->get_properties_for
 		 && obj->handlers->get_properties == zend_std_get_properties
 		 && !zend_object_is_lazy(obj))) {
+			/* An object is listed when it holds something to look at: the
+			 * other ones lead to no cycle */
+			bool listed = false;
 			for (int i = 0; i < obj->ce->default_properties_count; i++) {
 				zval *slot = &obj->properties_table[i];
-				if (Z_TYPE_P(slot) != IS_UNDEF) {
+				if (dc_may_hold_closure(slot)) {
+					if (!listed) {
+						if (!dc_seen_add(seen, obj)) {
+							return;
+						}
+						listed = true;
+					}
 					dc_index_closures_rec(seen, slot, scope);
 				}
 			}
 			if (obj->properties) {
+				if (!listed && !dc_seen_add(seen, obj)) {
+					return;
+				}
 				zval *v;
 				ZEND_HASH_FOREACH_VAL(obj->properties, v) {
 					/* Declared properties were read from their slots */
-					if (Z_TYPE_P(v) != IS_INDIRECT) {
+					if (Z_TYPE_P(v) != IS_INDIRECT && dc_may_hold_closure(v)) {
 						dc_index_closures_rec(seen, v, scope);
 					}
 				} ZEND_HASH_FOREACH_END();
 			}
+			return;
+		}
+		if (!dc_seen_add(seen, obj)) {
 			return;
 		}
 		HashTable *props = zend_get_properties_for(val, ZEND_PROP_PURPOSE_ARRAY_CAST);
@@ -2456,7 +2508,7 @@ static void dc_index_closures_rec(HashTable *seen, zval *val, zend_class_entry *
 			zval *v;
 			ZEND_HASH_FOREACH_VAL(props, v) {
 				ZVAL_DEINDIRECT(v);
-				if (Z_TYPE_P(v) != IS_UNDEF) {
+				if (dc_may_hold_closure(v)) {
 					dc_index_closures_rec(seen, v, scope);
 				}
 			} ZEND_HASH_FOREACH_END();
@@ -2465,13 +2517,19 @@ static void dc_index_closures_rec(HashTable *seen, zval *val, zend_class_entry *
 		return;
 	}
 
-	if (Z_TYPE_P(val) == IS_ARRAY && !GC_IS_RECURSIVE(Z_ARRVAL_P(val))) {
-		GC_TRY_PROTECT_RECURSION(Z_ARRVAL_P(val));
+	if (Z_TYPE_P(val) == IS_ARRAY) {
+		HashTable *ht = Z_ARRVAL_P(val);
+		if ((GC_FLAGS(ht) & GC_IMMUTABLE) || GC_IS_RECURSIVE(ht)) {
+			return;
+		}
+		GC_PROTECT_RECURSION(ht);
 		zval *v;
-		ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(val), v) {
-			dc_index_closures_rec(seen, v, scope);
+		ZEND_HASH_FOREACH_VAL(ht, v) {
+			if (dc_may_hold_closure(v)) {
+				dc_index_closures_rec(seen, v, scope);
+			}
 		} ZEND_HASH_FOREACH_END();
-		GC_TRY_UNPROTECT_RECURSION(Z_ARRVAL_P(val));
+		GC_UNPROTECT_RECURSION(ht);
 	}
 }
 
@@ -2496,10 +2554,14 @@ static void dc_index_attr_closures(zval *this_zv, zval *val)
 	if (!has_expr) {
 		return;
 	}
-	HashTable seen;
-	zend_hash_init(&seen, 8, NULL, NULL, 0);
+	dc_seen_objects seen;
+	seen.num = 0;
+	seen.more = NULL;
 	dc_index_closures_rec(&seen, val, ref->scope);
-	zend_hash_destroy(&seen);
+	if (UNEXPECTED(seen.more)) {
+		zend_hash_destroy(seen.more);
+		FREE_HASHTABLE(seen.more);
+	}
 }
 
 /* Instrumented ReflectionAttribute::getArguments(): the FCCs are the returned
