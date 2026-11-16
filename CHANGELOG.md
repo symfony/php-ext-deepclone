@@ -88,6 +88,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `DEEPCLONE_HYDRATE_NO_LAZY_INIT` could corrupt the memory of the next
   request when user code called it while the request shuts down, eg from the
   `stream_close()` of a stream wrapper or from the save handler of a session.
+- `deepclone_from_array()` built a reference that holds itself for `"refs"`
+  that target each other with hard-reference markers in `"refMasks"`, which
+  made the first use of the result loop forever. Such a reference takes the
+  value of its target now, and is rejected when it targets itself, also
+  through another reference.
+- `deepclone_from_array()` throws when the stack limit is reached on deeply
+  nested values and masks, on PHP 8.4+. It crashed before.
+- `deepclone_from_array()` rejects named closures over abstract methods:
+  calling one crashed for the methods of internal interfaces.
+- String keys in `"refs"` are kept apart from reference ids. A string key
+  could take the place of an id that equals its hash.
+- When `deepclone_from_array()` returns lazy ghosts, their properties aren't
+  bound to the `&` references that the payload itself holds anymore, like for
+  other objects.
 
 ## [0.8.10] - 2026-11-15
 
