@@ -16,11 +16,11 @@ ZEND_BEGIN_MODULE_GLOBALS(deepclone)
 	 * the DEEPCLONE_HYDRATE_NO_LAZY_INIT path. */
 	HashTable lazy_init_refl_cache;
 	/* PHP 8.5 cross-class first-class-callable provenance (experimental).
-	 * Maps a const-expr-declared FCC's target op_array.opcodes pointer to the
-	 * class whose constant expression declares it, captured by instrumenting
-	 * ReflectionAttribute::getArguments(). Lazily initialized; request-scoped. */
+	 * Maps the target of a first-class callable declared in a constant
+	 * expression, by name, to the name of the class that declares it, as
+	 * captured from ReflectionAttribute::getArguments() and ::newInstance().
+	 * Lazily initialized, kept across requests. */
 	HashTable attr_provenance;
-	zend_bool capture_attribute_closures;
 ZEND_END_MODULE_GLOBALS(deepclone)
 
 ZEND_EXTERN_MODULE_GLOBALS(deepclone)

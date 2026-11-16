@@ -435,6 +435,9 @@ struct _dc_ctx {
 
 	/* Proto cache: class_name => (array) prototype */
 	HashTable      proto_cache;
+
+	/* Const-expr closures: class => (closure key => payload), built on demand */
+	HashTable     *cexpr_index;
 };
 
 /* ── Class info cache entry ─────────────────────────────────── */
@@ -545,6 +548,7 @@ static void dc_ctx_init(dc_ctx *ctx) {
 	ctx->objects_count = 0;
 	ctx->is_static = 1;
 	ctx->allow_named_closures = false;
+	ctx->cexpr_index = NULL;
 	ctx->allowed_ht = NULL;
 	zend_hash_init(&ctx->scope_cache, 4, NULL, ZVAL_PTR_DTOR, 0);
 	zend_hash_init(&ctx->class_info, 4, NULL, NULL, 0);
@@ -624,6 +628,9 @@ static void dc_ctx_destroy(dc_ctx *ctx) {
 	zend_hash_destroy(&ctx->scope_cache);
 	zend_hash_destroy(&ctx->class_info);
 	zend_hash_destroy(&ctx->proto_cache);
+	if (ctx->cexpr_index) {
+		zend_array_destroy(ctx->cexpr_index);
+	}
 	if (ctx->allowed_ht) {
 		zend_hash_destroy(ctx->allowed_ht);
 		efree(ctx->allowed_ht);
@@ -1738,39 +1745,23 @@ static void dc_mask_cleanup(zval *mask)
  */
 
 typedef struct {
-	const zend_function *needle; /* locate: the target function to identify */
-	uint32_t       want_ord;    /* resolve: ordinal of the closure to extract */
-	uint32_t       ord;         /* running count of closures walked at this site */
-	bool           matched;
-	uint32_t       matched_ord;
+	/* When indexing a class: the closures found are added to its index */
+	HashTable     *index;       /* closure key => payload, or NULL when resolving */
+	zend_class_entry *ce;       /* the class being indexed */
+	zend_string   *site;        /* the site being walked */
+	zend_long      attr_index;  /* its attribute, or -1 */
+	/* When resolving: the closure to extract */
+	uint32_t       want_ord;
 	zval           found;
+	uint32_t       ord;         /* running count of closures walked at this site */
 	HashTable      seen;        /* visited non-closure objects (cycle guard) */
 } dc_cexpr_walk;
 
-/* Identity match between a closure's target and the one being located. User
- * functions (methods, global functions, anonymous closures) share their
- * opcodes across closure instances; internal functions have none, so they are
- * matched by name and scope (a NULL scope is a global function). */
-static bool dc_func_matches(const zend_function *a, const zend_function *b)
+static void dc_cexpr_walk_init(dc_cexpr_walk *w, uint32_t want_ord)
 {
-	if (a->type != b->type) {
-		return false;
-	}
-	if (a->type == ZEND_USER_FUNCTION) {
-		return a->op_array.opcodes == b->op_array.opcodes;
-	}
-	return a->common.scope == b->common.scope
-		&& a->common.function_name && b->common.function_name
-		&& zend_string_equals(a->common.function_name, b->common.function_name);
-}
-
-static void dc_cexpr_walk_init(dc_cexpr_walk *w, const zend_function *needle, uint32_t want_ord)
-{
-	w->needle = needle;
+	w->index = NULL;
 	w->want_ord = want_ord;
 	w->ord = 0;
-	w->matched = false;
-	w->matched_ord = 0;
 	ZVAL_UNDEF(&w->found);
 	zend_hash_init(&w->seen, 0, NULL, NULL, 0);
 }
@@ -1782,8 +1773,12 @@ static void dc_cexpr_walk_dtor(dc_cexpr_walk *w)
 
 static zend_always_inline bool dc_cexpr_walk_done(const dc_cexpr_walk *w)
 {
-	return w->needle ? w->matched : !Z_ISUNDEF(w->found);
+	return !w->index && !Z_ISUNDEF(w->found);
 }
+
+#if PHP_VERSION_ID >= 80500
+static void dc_cexpr_index_add(dc_cexpr_walk *w, zval *closure);
+#endif
 
 /* Depth-first walk counting every Closure instance. The order must match the
  * polyfill's walk exactly or payloads stop being interchangeable. */
@@ -1796,12 +1791,10 @@ static void dc_cexpr_walk_zval(dc_cexpr_walk *w, zval *val)
 
 	if (Z_TYPE_P(val) == IS_OBJECT) {
 		if (Z_OBJCE_P(val) == zend_ce_closure) {
-			if (w->needle) {
-				const zend_function *f = zend_get_closure_method_def(Z_OBJ_P(val));
-				if (!w->matched && dc_func_matches(f, w->needle)) {
-					w->matched = true;
-					w->matched_ord = w->ord;
-				}
+			if (w->index) {
+#if PHP_VERSION_ID >= 80500
+				dc_cexpr_index_add(w, val);
+#endif
 			} else if (w->ord == w->want_ord && Z_ISUNDEF(w->found)) {
 				ZVAL_COPY(&w->found, val);
 			}
@@ -1831,6 +1824,11 @@ static void dc_cexpr_walk_zval(dc_cexpr_walk *w, zval *val)
 	}
 
 	if (Z_TYPE_P(val) == IS_ARRAY) {
+		/* A constructor can build an array that holds itself by reference */
+		if (GC_IS_RECURSIVE(Z_ARRVAL_P(val))) {
+			return;
+		}
+		GC_TRY_PROTECT_RECURSION(Z_ARRVAL_P(val));
 		zval *v;
 		ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(val), v) {
 			dc_cexpr_walk_zval(w, v);
@@ -1838,6 +1836,16 @@ static void dc_cexpr_walk_zval(dc_cexpr_walk *w, zval *val)
 				break;
 			}
 		} ZEND_HASH_FOREACH_END();
+		GC_TRY_UNPROTECT_RECURSION(Z_ARRVAL_P(val));
+	}
+}
+
+/* Forget the exception of a site that fails to evaluate, as the polyfill
+ * does with a try/catch per site. An exit() is not an exception to catch. */
+static zend_always_inline void dc_cexpr_clear_failure(void)
+{
+	if (EG(exception) && !zend_is_unwind_exit(EG(exception)) && !zend_is_graceful_exit(EG(exception))) {
+		zend_clear_exception();
 	}
 }
 
@@ -1854,8 +1862,8 @@ static bool dc_cexpr_walk_attr(dc_cexpr_walk *w, zend_attribute *attr, zend_clas
 	for (; evaluated < argc; evaluated++) {
 		if (FAILURE == zend_get_attribute_value(&vals[evaluated], attr, evaluated, scope)) {
 			ok = false;
-			if (clear_failure && EG(exception)) {
-				zend_clear_exception();
+			if (clear_failure) {
+				dc_cexpr_clear_failure();
 			}
 			break;
 		}
@@ -1880,8 +1888,8 @@ static bool dc_cexpr_walk_const(dc_cexpr_walk *w, zval *src, zend_class_entry *s
 	ZVAL_COPY(&v, src);
 	if (Z_TYPE(v) == IS_CONSTANT_AST && FAILURE == zval_update_constant_ex(&v, scope)) {
 		zval_ptr_dtor(&v);
-		if (clear_failure && EG(exception)) {
-			zend_clear_exception();
+		if (clear_failure) {
+			dc_cexpr_clear_failure();
 		}
 		return false;
 	}
@@ -1942,78 +1950,151 @@ static void dc_cexpr_payload(zval *dst, zend_class_entry *ce, zend_string *site,
 	zend_hash_index_add_new(Z_ARRVAL_P(dst), 4, &tmp);
 }
 
-/* Walk one attribute list (entries matching `offset`) looking for the needle.
- * On match fills *attr_index (ordinal among same-offset entries) and *ord. */
-static bool dc_cexpr_locate_in_attrs(HashTable *attributes, uint32_t offset, zend_class_entry *scope, const zend_function *needle, uint32_t *attr_index, uint32_t *ord)
+/* What tells the closures of a class apart: their target and, for the
+ * first-class callables over a static method, the class they're called on,
+ * as static:: resolves to it, eg B for B::m(...) where A declares m(). User
+ * functions (methods, global functions, anonymous closures) share their
+ * opcodes across closure instances; internal functions have none, so they are
+ * told apart by name and scope (a NULL scope is a global function). */
+typedef struct {
+	uintptr_t target[2];
+	uintptr_t called_scope;
+} dc_cexpr_key;
+
+static void dc_cexpr_key_init(dc_cexpr_key *key, zval *closure)
 {
-	if (!attributes) {
-		return false;
+	const zend_function *f = zend_get_closure_method_def(Z_OBJ_P(closure));
+
+	if (f->type == ZEND_USER_FUNCTION) {
+		key->target[0] = (uintptr_t) f->op_array.opcodes;
+		key->target[1] = 0;
+	} else {
+		key->target[0] = (uintptr_t) f->common.scope;
+		key->target[1] = (uintptr_t) f->common.function_name;
 	}
+	key->called_scope = (f->common.fn_flags & ZEND_ACC_FAKE_CLOSURE) && f->common.scope
+		? (uintptr_t) dc_closure_called_scope(closure) : 0;
+}
+
+/* Record a closure found at the site being walked, unless a site before
+ * declares it too */
+static void dc_cexpr_index_add(dc_cexpr_walk *w, zval *closure)
+{
+	const zend_function *f = zend_get_closure_method_def(Z_OBJ_P(closure));
+	dc_cexpr_key key;
+	dc_cexpr_key_init(&key, closure);
+
+	if (zend_hash_str_exists(w->index, (const char *) &key, sizeof(key))) {
+		return;
+	}
+	/* Internal functions have no line; resolution computes 0 for them, so the
+	 * staleness check matches. */
+	uint32_t line = f->type == ZEND_USER_FUNCTION ? f->op_array.line_start : 0;
+	zval payload;
+	dc_cexpr_payload(&payload, w->ce, zend_string_copy(w->site), w->attr_index, w->ord, line);
+	zend_hash_str_add_new(w->index, (const char *) &key, sizeof(key), &payload);
+}
+
+/* Index the closures of the attributes of one list (entries matching
+ * `offset`). The attribute index is the ordinal among same-offset entries.
+ * Takes ownership of site. */
+static void dc_cexpr_index_attrs(HashTable *index, zend_class_entry *ce, HashTable *attributes, uint32_t offset, zend_string *site)
+{
 	uint32_t idx = 0;
 	zend_attribute *attr;
 	ZEND_HASH_FOREACH_PTR(attributes, attr) {
 		if (attr->offset != offset) {
 			continue;
 		}
-		dc_cexpr_walk w;
-		dc_cexpr_walk_init(&w, needle, 0);
-		dc_cexpr_walk_attr(&w, attr, scope, true);
-		bool matched = w.matched;
-		*ord = w.matched_ord;
-		dc_cexpr_walk_dtor(&w);
-		if (UNEXPECTED(EG(exception))) {
-			return false;
+		/* Only an expression can evaluate to a closure */
+		bool has_expr = false;
+		for (uint32_t i = 0; i < attr->argc && !has_expr; i++) {
+			has_expr = Z_TYPE(attr->args[i].value) == IS_CONSTANT_AST;
 		}
-		if (matched) {
-			*attr_index = idx;
-			return true;
+		if (has_expr) {
+			dc_cexpr_walk w;
+			dc_cexpr_walk_init(&w, 0);
+			w.index = index;
+			w.ce = ce;
+			w.site = site;
+			w.attr_index = (zend_long) idx;
+			dc_cexpr_walk_attr(&w, attr, ce, true);
+			dc_cexpr_walk_dtor(&w);
+			if (UNEXPECTED(EG(exception))) {
+				break;
+			}
 		}
 		idx++;
+	} ZEND_HASH_FOREACH_END();
+	zend_string_release(site);
+}
+
+/* Index the closures of a constant value, or of a property or parameter
+ * default. Takes ownership of site. */
+static void dc_cexpr_index_value(HashTable *index, zend_class_entry *ce, zval *src, zend_class_entry *scope, zend_string *site)
+{
+	dc_cexpr_walk w;
+	dc_cexpr_walk_init(&w, 0);
+	w.index = index;
+	w.ce = ce;
+	w.site = site;
+	w.attr_index = -1;
+	dc_cexpr_walk_const(&w, src, scope, true);
+	dc_cexpr_walk_dtor(&w);
+	zend_string_release(site);
+}
+
+/* Whether attributes are declared for this target of the list */
+static zend_always_inline bool dc_cexpr_has_attrs(HashTable *attributes, uint32_t offset)
+{
+	if (!attributes) {
+		return false;
+	}
+	zend_attribute *attr;
+	ZEND_HASH_FOREACH_PTR(attributes, attr) {
+		if (attr->offset == offset) {
+			return true;
+		}
 	} ZEND_HASH_FOREACH_END();
 	return false;
 }
 
-static bool dc_cexpr_locate_in_value(zval *src, zend_class_entry *scope, const zend_function *needle, uint32_t *ord)
+/* Whether a value can hold a closure once evaluated: scalars don't */
+static zend_always_inline bool dc_cexpr_may_hold_closure(const zval *src)
 {
-	dc_cexpr_walk w;
-	dc_cexpr_walk_init(&w, needle, 0);
-	dc_cexpr_walk_const(&w, src, scope, true);
-	bool matched = w.matched;
-	*ord = w.matched_ord;
-	dc_cexpr_walk_dtor(&w);
-	return matched && !EG(exception);
+	return src && Z_TYPE_P(src) >= IS_ARRAY;
 }
 
-/* Try to express an anonymous closure as a reference to the constant
- * expression that declares it. Identity is exact: the closure's op_array
- * shares its opcodes with the op_array embedded in the declaring AST.
- * Sites are scanned in the same order the polyfill indexes them, so both
- * implementations produce identical payloads. Promoted properties are
- * skipped: their constructor parameter is the canonical surface. */
-/* Locate `target` as a closure declared in the constant expressions of an
- * explicit class `ce`. For an anonymous closure ce is its own scope; for a
- * first-class callable it is the declaring class, which differs from the
- * target's scope on cross-class references. */
-static bool dc_cexpr_locate_ce(const zend_function *target, zend_class_entry *ce, zval *payload)
+/* Index the closures that the constant expressions of a class declare: each
+ * one is a reference to its site. Sites are scanned in the same order the
+ * polyfill indexes them, and the first site that declares a closure wins,
+ * so both implementations produce identical payloads. Promoted properties are
+ * skipped: their constructor parameter is the canonical surface.
+ * The class is scanned once per call: evaluating its sites runs the
+ * constructors of the objects they create. Returns NULL when an exception is
+ * thrown, ie on exit(), as the ones of sites that fail to evaluate are
+ * ignored. */
+static HashTable *dc_cexpr_index(dc_ctx *ctx, zend_class_entry *ce)
 {
-	const zend_function *needle = target;
-	/* Internal functions have no line; resolution computes 0 for them, so the
-	 * staleness check matches. */
-	uint32_t line = target->type == ZEND_USER_FUNCTION ? target->op_array.line_start : 0;
-	uint32_t attr_index, ord;
+	if (!ctx->cexpr_index) {
+		ctx->cexpr_index = zend_new_array(0);
+	}
+	zval *cached = zend_hash_index_find(ctx->cexpr_index, (zend_ulong) (uintptr_t) ce);
+	if (cached) {
+		return Z_ARRVAL_P(cached);
+	}
+
+	zval zindex;
+	array_init(&zindex);
+	HashTable *index = Z_ARRVAL(zindex);
 	zend_string *name;
 
-	if (!ce) {
-		return false;
-	}
-
 	/* class attributes */
-	if (dc_cexpr_locate_in_attrs(ce->attributes, 0, ce, needle, &attr_index, &ord)) {
-		dc_cexpr_payload(payload, ce, ZSTR_EMPTY_ALLOC(), (zend_long) attr_index, ord, line);
-		return true;
-	}
-	if (UNEXPECTED(EG(exception))) {
-		return false;
+	if (dc_cexpr_has_attrs(ce->attributes, 0)) {
+		dc_cexpr_index_attrs(index, ce, ce->attributes, 0, ZSTR_EMPTY_ALLOC());
+		if (UNEXPECTED(EG(exception))) {
+			goto failure;
+		}
 	}
 
 	/* class constants and enum cases: attributes, then the value */
@@ -2022,16 +2103,14 @@ static bool dc_cexpr_locate_ce(const zend_function *target, zend_class_entry *ce
 		if (c->ce != ce) {
 			continue;
 		}
-		if (dc_cexpr_locate_in_attrs(c->attributes, 0, ce, needle, &attr_index, &ord)) {
-			dc_cexpr_payload(payload, ce, zend_string_copy(name), (zend_long) attr_index, ord, line);
-			return true;
+		if (dc_cexpr_has_attrs(c->attributes, 0)) {
+			dc_cexpr_index_attrs(index, ce, c->attributes, 0, zend_string_copy(name));
 		}
-		if (!EG(exception) && dc_cexpr_locate_in_value(&c->value, c->ce, needle, &ord)) {
-			dc_cexpr_payload(payload, ce, zend_string_copy(name), -1, ord, line);
-			return true;
+		if (!EG(exception) && dc_cexpr_may_hold_closure(&c->value)) {
+			dc_cexpr_index_value(index, ce, &c->value, c->ce, zend_string_copy(name));
 		}
 		if (UNEXPECTED(EG(exception))) {
-			return false;
+			goto failure;
 		}
 	} ZEND_HASH_FOREACH_END();
 
@@ -2041,41 +2120,38 @@ static bool dc_cexpr_locate_ce(const zend_function *target, zend_class_entry *ce
 		if (prop->ce != ce || (prop->flags & ZEND_ACC_PROMOTED)) {
 			continue;
 		}
-		if (dc_cexpr_locate_in_attrs(prop->attributes, 0, ce, needle, &attr_index, &ord)) {
-			dc_cexpr_payload(payload, ce, zend_strpprintf(0, "$%s", ZSTR_VAL(name)), (zend_long) attr_index, ord, line);
-			return true;
+		if (dc_cexpr_has_attrs(prop->attributes, 0)) {
+			dc_cexpr_index_attrs(index, ce, prop->attributes, 0, zend_strpprintf(0, "$%s", ZSTR_VAL(name)));
 		}
 		zval *def = dc_cexpr_prop_default(ce, prop);
-		if (!EG(exception) && def && Z_TYPE_P(def) != IS_UNDEF && dc_cexpr_locate_in_value(def, prop->ce, needle, &ord)) {
-			dc_cexpr_payload(payload, ce, zend_strpprintf(0, "$%s", ZSTR_VAL(name)), -1, ord, line);
-			return true;
+		if (!EG(exception) && dc_cexpr_may_hold_closure(def)) {
+			dc_cexpr_index_value(index, ce, def, prop->ce, zend_strpprintf(0, "$%s", ZSTR_VAL(name)));
 		}
 		if (UNEXPECTED(EG(exception))) {
-			return false;
+			goto failure;
 		}
 		/* property hooks: attributes, then per parameter attributes */
 		if (prop->hooks) {
 			for (uint32_t hk = 0; hk < ZEND_PROPERTY_HOOK_COUNT; hk++) {
 				const zend_function *hfn = prop->hooks[hk];
-				if (!hfn || hfn->type != ZEND_USER_FUNCTION) {
+				if (!hfn || hfn->type != ZEND_USER_FUNCTION || !hfn->op_array.attributes) {
 					continue;
 				}
 				const char *hname = hk == ZEND_PROPERTY_HOOK_GET ? "get" : "set";
-				if (dc_cexpr_locate_in_attrs(hfn->op_array.attributes, 0, ce, needle, &attr_index, &ord)) {
-					dc_cexpr_payload(payload, ce, zend_strpprintf(0, "$%s::%s()", ZSTR_VAL(name), hname), (zend_long) attr_index, ord, line);
-					return true;
-				}
-				if (UNEXPECTED(EG(exception))) {
-					return false;
+				if (dc_cexpr_has_attrs(hfn->op_array.attributes, 0)) {
+					dc_cexpr_index_attrs(index, ce, hfn->op_array.attributes, 0, zend_strpprintf(0, "$%s::%s()", ZSTR_VAL(name), hname));
+					if (UNEXPECTED(EG(exception))) {
+						goto failure;
+					}
 				}
 				uint32_t hook_params = hfn->common.num_args + ((hfn->common.fn_flags & ZEND_ACC_VARIADIC) ? 1 : 0);
 				for (uint32_t pi = 0; pi < hook_params; pi++) {
-					if (dc_cexpr_locate_in_attrs(hfn->op_array.attributes, pi + 1, ce, needle, &attr_index, &ord)) {
-						dc_cexpr_payload(payload, ce, zend_strpprintf(0, "$%s::%s()#%u", ZSTR_VAL(name), hname, pi), (zend_long) attr_index, ord, line);
-						return true;
+					if (!dc_cexpr_has_attrs(hfn->op_array.attributes, pi + 1)) {
+						continue;
 					}
+					dc_cexpr_index_attrs(index, ce, hfn->op_array.attributes, pi + 1, zend_strpprintf(0, "$%s::%s()#%u", ZSTR_VAL(name), hname, pi));
 					if (UNEXPECTED(EG(exception))) {
-						return false;
+						goto failure;
 					}
 				}
 			}
@@ -2089,40 +2165,54 @@ static bool dc_cexpr_locate_ce(const zend_function *target, zend_class_entry *ce
 			continue;
 		}
 		const char *fname = ZSTR_VAL(fn->common.function_name);
-		if (dc_cexpr_locate_in_attrs(fn->op_array.attributes, 0, ce, needle, &attr_index, &ord)) {
-			dc_cexpr_payload(payload, ce, zend_strpprintf(0, "%s()", fname), (zend_long) attr_index, ord, line);
-			return true;
-		}
-		if (UNEXPECTED(EG(exception))) {
-			return false;
+		if (dc_cexpr_has_attrs(fn->op_array.attributes, 0)) {
+			dc_cexpr_index_attrs(index, ce, fn->op_array.attributes, 0, zend_strpprintf(0, "%s()", fname));
+			if (UNEXPECTED(EG(exception))) {
+				goto failure;
+			}
 		}
 		uint32_t num_params = fn->common.num_args + ((fn->common.fn_flags & ZEND_ACC_VARIADIC) ? 1 : 0);
 		for (uint32_t pi = 0; pi < num_params; pi++) {
-			if (dc_cexpr_locate_in_attrs(fn->op_array.attributes, pi + 1, ce, needle, &attr_index, &ord)) {
-				dc_cexpr_payload(payload, ce, zend_strpprintf(0, "%s()#%u", fname, pi), (zend_long) attr_index, ord, line);
-				return true;
+			if (dc_cexpr_has_attrs(fn->op_array.attributes, pi + 1)) {
+				dc_cexpr_index_attrs(index, ce, fn->op_array.attributes, pi + 1, zend_strpprintf(0, "%s()#%u", fname, pi));
 			}
 			zval *def = dc_cexpr_param_default(&fn->op_array, pi);
-			if (!EG(exception) && def && dc_cexpr_locate_in_value(def, ce, needle, &ord)) {
-				dc_cexpr_payload(payload, ce, zend_strpprintf(0, "%s()#%u", fname, pi), -1, ord, line);
-				return true;
+			if (!EG(exception) && dc_cexpr_may_hold_closure(def)) {
+				dc_cexpr_index_value(index, ce, def, ce, zend_strpprintf(0, "%s()#%u", fname, pi));
 			}
 			if (UNEXPECTED(EG(exception))) {
-				return false;
+				goto failure;
 			}
 		}
 	} ZEND_HASH_FOREACH_END();
 
-	return false;
+	return Z_ARRVAL_P(zend_hash_index_add_new(ctx->cexpr_index, (zend_ulong) (uintptr_t) ce, &zindex));
+
+failure:
+	zval_ptr_dtor(&zindex);
+	return NULL;
 }
 
-/* Try to express a closure as a reference to the constant expression that
- * declares it, deriving the declaring class from the closure's own scope.
- * Covers anonymous closures and first-class callables over a method of their
- * own declaring class. */
-static bool dc_cexpr_locate(const zend_function *target, zval *payload)
+/* Try to express a closure as a reference to the constant expression of class
+ * `ce` that declares it. For an anonymous closure, or a first-class callable
+ * over a method of its own declaring class, ce is the scope of the closure;
+ * it differs for cross-class callables, whose declaring class comes from
+ * captured provenance. */
+static bool dc_cexpr_locate(dc_ctx *ctx, zval *closure, zend_class_entry *ce, zval *payload)
 {
-	return dc_cexpr_locate_ce(target, target->common.scope, payload);
+	HashTable *index = ce ? dc_cexpr_index(ctx, ce) : NULL;
+	if (!index) {
+		return false;
+	}
+	dc_cexpr_key key;
+	dc_cexpr_key_init(&key, closure);
+	zval *found = zend_hash_str_find(index, (const char *) &key, sizeof(key));
+	if (!found) {
+		return false;
+	}
+	ZVAL_COPY(payload, found);
+
+	return true;
 }
 
 /* ── Cross-class first-class-callable provenance (PHP 8.5, experimental) ──
@@ -2141,6 +2231,11 @@ static bool dc_cexpr_locate(const zend_function *target, zval *payload)
  * match it so the handler swaps type-check under MSVC. */
 static zif_handler dc_orig_attr_get_arguments = NULL;
 static zif_handler dc_orig_attr_new_instance = NULL;
+
+/* Whether the declaring class of first-class callables is captured from
+ * ReflectionAttribute. Decided once at MINIT for the whole process: module
+ * globals are per thread, and only the startup thread runs MINIT. */
+static bool dc_capture_attribute_closures = false;
 
 /* Mirrors ext/reflection's private object layout so we can read a
  * ReflectionAttribute's declaring-class scope. Must track the engine structs;
@@ -2161,12 +2256,12 @@ typedef struct {
 	uint32_t           target;
 } dc_attr_ref_layout;
 
-static zend_class_entry *dc_attr_declaring_scope(zend_object *obj)
+static dc_attr_ref_layout *dc_attr_reference(zend_object *obj)
 {
 	dc_refl_object_layout *ro = (dc_refl_object_layout *)
 		((char *) obj - offsetof(dc_refl_object_layout, zo));
-	dc_attr_ref_layout *ar = (dc_attr_ref_layout *) ro->ptr;
-	return ar ? ar->scope : NULL;
+
+	return (dc_attr_ref_layout *) ro->ptr;
 }
 
 /* The index persists across requests (per worker), so it is keyed and valued
@@ -2204,12 +2299,19 @@ static void dc_provenance_store(zend_class_entry *target_ce, zend_string *method
 		zend_hash_init(idx, 8, NULL, dc_provenance_dtor, 1);
 	}
 	zend_string *key = dc_provenance_key(target_ce, method);
-	/* First declaring site wins; every site for one target is equivalent. */
-	if (!zend_hash_exists(idx, key)) {
+	zend_string *known = zend_hash_find_ptr(idx, key);
+	/* First declaring site wins; every site for one target is equivalent. The
+	 * index outlives the request: a class recorded by another one might not
+	 * be loaded in this one, where the lookup doesn't autoload. This class is. */
+	if (!known) {
 		zend_string *pkey = zend_string_dup(key, 1);
 		zend_string *pval = zend_string_init(ZSTR_VAL(scope->name), ZSTR_LEN(scope->name), 1);
 		zend_hash_add_ptr(idx, pkey, pval);
 		zend_string_release(pkey);   /* the table holds its own reference */
+	} else if (!zend_string_equals(known, scope->name)
+	 && !zend_lookup_class_ex(known, NULL, ZEND_FETCH_CLASS_NO_AUTOLOAD)) {
+		zend_string *pval = zend_string_init(ZSTR_VAL(scope->name), ZSTR_LEN(scope->name), 1);
+		zend_hash_update_ptr(idx, key, pval);
 	}
 	zend_string_release(key);
 }
@@ -2235,17 +2337,23 @@ static zend_class_entry *dc_provenance_lookup(zend_class_entry *target_ce, zend_
  * and its properties), recording every cross-class FCC against `scope`. The
  * `seen` set guards cycles: getArguments() values are acyclic constant
  * expressions, but a newInstance() object is built by an arbitrary attribute
- * constructor and may be cyclic. */
+ * constructor and may be cyclic, like its arrays.
+ * This runs inside the methods of ReflectionAttribute, for all their callers:
+ * it never throws, and reads the properties of plain objects from their
+ * slots, as building their property table would keep it allocated. */
 static void dc_index_closures_rec(HashTable *seen, zval *val, zend_class_entry *scope)
 {
-	if (UNEXPECTED(dc_check_stack_limit())) {
+#ifdef ZEND_CHECK_STACK_LIMIT
+	if (UNEXPECTED(zend_call_stack_overflowed(EG(stack_limit)))) {
 		return;
 	}
+#endif
 	ZVAL_DEREF(val);
 
 	if (Z_TYPE_P(val) == IS_OBJECT) {
-		if (Z_OBJCE_P(val) == zend_ce_closure) {
-			const zend_function *f = zend_get_closure_method_def(Z_OBJ_P(val));
+		zend_object *obj = Z_OBJ_P(val);
+		if (obj->ce == zend_ce_closure) {
+			const zend_function *f = zend_get_closure_method_def(obj);
 			/* Capture first-class callables the scope-based locate cannot find:
 			 * cross-class methods (target scope differs from `scope`) and global
 			 * functions (no scope at all), internal or user. An FCC over a method
@@ -2257,7 +2365,27 @@ static void dc_index_closures_rec(HashTable *seen, zval *val, zend_class_entry *
 			}
 			return;
 		}
-		if (!zend_hash_index_add_empty_element(seen, Z_OBJ_HANDLE_P(val))) {
+		if (!zend_hash_index_add_empty_element(seen, obj->handle)) {
+			return;
+		}
+		if (EXPECTED(!obj->handlers->get_properties_for
+		 && obj->handlers->get_properties == zend_std_get_properties
+		 && !zend_object_is_lazy(obj))) {
+			for (int i = 0; i < obj->ce->default_properties_count; i++) {
+				zval *slot = &obj->properties_table[i];
+				if (Z_TYPE_P(slot) != IS_UNDEF) {
+					dc_index_closures_rec(seen, slot, scope);
+				}
+			}
+			if (obj->properties) {
+				zval *v;
+				ZEND_HASH_FOREACH_VAL(obj->properties, v) {
+					/* Declared properties were read from their slots */
+					if (Z_TYPE_P(v) != IS_INDIRECT) {
+						dc_index_closures_rec(seen, v, scope);
+					}
+				} ZEND_HASH_FOREACH_END();
+			}
 			return;
 		}
 		HashTable *props = zend_get_properties_for(val, ZEND_PROP_PURPOSE_ARRAY_CAST);
@@ -2274,11 +2402,13 @@ static void dc_index_closures_rec(HashTable *seen, zval *val, zend_class_entry *
 		return;
 	}
 
-	if (Z_TYPE_P(val) == IS_ARRAY) {
+	if (Z_TYPE_P(val) == IS_ARRAY && !GC_IS_RECURSIVE(Z_ARRVAL_P(val))) {
+		GC_TRY_PROTECT_RECURSION(Z_ARRVAL_P(val));
 		zval *v;
 		ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(val), v) {
 			dc_index_closures_rec(seen, v, scope);
 		} ZEND_HASH_FOREACH_END();
+		GC_TRY_UNPROTECT_RECURSION(Z_ARRVAL_P(val));
 	}
 }
 
@@ -2286,17 +2416,26 @@ static void dc_index_closures_rec(HashTable *seen, zval *val, zend_class_entry *
  * against the declaring class of the ReflectionAttribute `this`. */
 static void dc_index_attr_closures(zval *this_zv, zval *val)
 {
-	if (!DC_G(capture_attribute_closures) || EG(exception)
+	if (!dc_capture_attribute_closures || EG(exception)
 			|| Z_TYPE_P(this_zv) != IS_OBJECT) {
 		return;
 	}
-	zend_class_entry *scope = dc_attr_declaring_scope(Z_OBJ_P(this_zv));
-	if (!scope) {
+	dc_attr_ref_layout *ref = dc_attr_reference(Z_OBJ_P(this_zv));
+	if (!ref || !ref->scope || !ref->data) {
+		return;
+	}
+	/* Only an expression can evaluate to a first-class callable: there is
+	 * nothing to look for in the attributes that take literals, ie most */
+	bool has_expr = false;
+	for (uint32_t i = 0; i < ref->data->argc && !has_expr; i++) {
+		has_expr = Z_TYPE(ref->data->args[i].value) == IS_CONSTANT_AST;
+	}
+	if (!has_expr) {
 		return;
 	}
 	HashTable seen;
 	zend_hash_init(&seen, 8, NULL, NULL, 0);
-	dc_index_closures_rec(&seen, val, scope);
+	dc_index_closures_rec(&seen, val, ref->scope);
 	zend_hash_destroy(&seen);
 }
 
@@ -2537,7 +2676,7 @@ static void dc_cexpr_resolve(zval *value, HashTable *allowed_set, zval *retval)
 	}
 
 	dc_cexpr_walk w;
-	dc_cexpr_walk_init(&w, NULL, (uint32_t) want_ord);
+	dc_cexpr_walk_init(&w, (uint32_t) want_ord);
 
 	if (attr_site) {
 		zend_attribute *attr = NULL;
@@ -2724,7 +2863,7 @@ static void dc_copy_value(dc_ctx *ctx, zval *src, zval *dst, zval *mask_dst)
 				}
 				zval payload;
 				ZVAL_UNDEF(&payload);
-				if (dc_cexpr_locate(func, &payload)) {
+				if (dc_cexpr_locate(ctx, src, func->common.scope, &payload)) {
 					ZVAL_COPY_VALUE(dst, &payload);
 					DC_MASK_CONSTEXPR_CLOSURE(mask_dst);
 					goto handle_value;
@@ -2737,9 +2876,9 @@ static void dc_copy_value(dc_ctx *ctx, zval *src, zval *dst, zval *mask_dst)
 				 * scope) misses. On 8.5 there is no engine provenance; fall back
 				 * to a declaring class captured from ReflectionAttribute, if
 				 * any, and locate the site there. */
-				if (DC_G(capture_attribute_closures) && func->common.scope && func->common.function_name) {
+				if (dc_capture_attribute_closures && func->common.scope && func->common.function_name) {
 					zend_class_entry *decl = dc_provenance_lookup(func->common.scope, func->common.function_name);
-					if (decl && decl != func->common.scope && dc_cexpr_locate_ce(func, decl, &payload)) {
+					if (decl && decl != func->common.scope && dc_cexpr_locate(ctx, src, decl, &payload)) {
 						ZVAL_COPY_VALUE(dst, &payload);
 						DC_MASK_CONSTEXPR_CLOSURE(mask_dst);
 						goto handle_value;
@@ -2757,7 +2896,7 @@ static void dc_copy_value(dc_ctx *ctx, zval *src, zval *dst, zval *mask_dst)
 		 * ones fall through to the by-name path. */
 		if (func && (func->common.fn_flags & ZEND_ACC_FAKE_CLOSURE)
 				&& !func->common.scope && func->common.function_name
-				&& DC_G(capture_attribute_closures)) {
+				&& dc_capture_attribute_closures) {
 			if (!dc_closure_this(src)) {
 				zend_class_entry *decl = dc_provenance_lookup(NULL, func->common.function_name);
 				if (decl) {
@@ -2767,7 +2906,7 @@ static void dc_copy_value(dc_ctx *ctx, zval *src, zval *dst, zval *mask_dst)
 					}
 					zval payload;
 					ZVAL_UNDEF(&payload);
-					if (dc_cexpr_locate_ce(func, decl, &payload)) {
+					if (dc_cexpr_locate(ctx, src, decl, &payload)) {
 						ZVAL_COPY_VALUE(dst, &payload);
 						DC_MASK_CONSTEXPR_CLOSURE(mask_dst);
 						goto handle_value;
@@ -2840,6 +2979,17 @@ static void dc_copy_value(dc_ctx *ctx, zval *src, zval *dst, zval *mask_dst)
 			 * ZEND_ACC_PRIVATE/PROTECTED (preserved from the original method).
 			 * Check the original-method flags. */
 			bool is_non_public = (func->common.fn_flags & (ZEND_ACC_PRIVATE | ZEND_ACC_PROTECTED)) != 0;
+			if (!is_non_public && func->common.scope) {
+				/* So is a public method that the class of the object, or the
+				 * class it's called on, overrides, eg parent::m(...): looking
+				 * its name up on that class would find the other one */
+				zval *callee = zend_hash_index_find(Z_ARRVAL_P(dst), 0);
+				zend_class_entry *callee_ce = this_obj ? this_obj->ce
+					: (Z_TYPE_P(callee) == IS_STRING ? zend_lookup_class_ex(Z_STR_P(callee), NULL, ZEND_FETCH_CLASS_NO_AUTOLOAD) : NULL);
+				zend_function *found = callee_ce && callee_ce != func->common.scope
+					? zend_hash_find_ptr_lc(&callee_ce->function_table, func->common.function_name) : NULL;
+				is_non_public = found && found->common.scope != func->common.scope;
+			}
 			if (is_non_public && func->common.scope) {
 				zval inner_callable;
 				ZVAL_COPY_VALUE(&inner_callable, dst);
@@ -6777,9 +6927,9 @@ PHP_MINIT_FUNCTION(deepclone)
 		"reflectionfunction", sizeof("reflectionfunction") - 1);
 	bool native_provenance = rf_ce && zend_hash_str_exists(&rf_ce->function_table,
 		"getconstexprclass", sizeof("getconstexprclass") - 1);
-	DC_G(capture_attribute_closures) = !native_provenance;
+	dc_capture_attribute_closures = !native_provenance;
 
-	if (DC_G(capture_attribute_closures)) {
+	if (dc_capture_attribute_closures) {
 		/* reflection is a required dependency, so its classes exist. The
 		 * closures frameworks read travel through getArguments() (raw values)
 		 * or newInstance() (as attribute-instance properties); hook both. */
@@ -6854,10 +7004,8 @@ static PHP_GINIT_FUNCTION(deepclone)
 	 * lazily on first use in RINIT-equivalent flow; cleared in RSHUTDOWN. */
 	memset(&deepclone_globals->lazy_init_refl_cache, 0, sizeof(HashTable));
 	/* attr_provenance is a persistent, cross-request cache initialized lazily
-	 * on first capture and freed in GSHUTDOWN. capture_attribute_closures is
-	 * decided at MINIT by whether the engine exposes native provenance. */
+	 * on first capture and freed in GSHUTDOWN. */
 	memset(&deepclone_globals->attr_provenance, 0, sizeof(HashTable));
-	deepclone_globals->capture_attribute_closures = 0;
 }
 
 static PHP_GSHUTDOWN_FUNCTION(deepclone)

@@ -16,6 +16,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   waits for its state.
 - `deepclone_hydrate()` doesn't create a string anymore for each key that
   names a protected or private property.
+- `deepclone_to_array()` evaluates the constant expressions of a class once
+  per call to find the closures they declare. It did it again for each
+  closure, up to its declaration, running the constructors of attribute
+  arguments each time: exporting 20,000 objects that hold the same attribute
+  closure took 1.6 s, and takes 8 ms now.
+- On PHP 8.5 and 8.6, `ReflectionAttribute::newInstance()` and
+  `::getArguments()` cost the same as without the extension for the
+  attributes that take literals only. For the others, the extension doesn't
+  build the property table of each object of the instance anymore, which
+  tripled the memory they use.
 
 ### Fixed
 
@@ -102,6 +112,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - When `deepclone_from_array()` returns lazy ghosts, their properties aren't
   bound to the `&` references that the payload itself holds anymore, like for
   other objects.
+- On ZTS builds, first-class callables that an attribute declares over a
+  method of another class, or over a function, were only exported as
+  references to their declaration on the thread that started PHP. Other
+  threads, ie all requests with FrankenPHP, required `$allow_named_closures`.
+- The class that declares such a callable was remembered for the lifetime of
+  the process: a request that only loaded another class that declares the
+  same callable failed.
+- A callable over a static method called on a child class, eg `B::m(...)`,
+  was exported as the `self::m(...)` that its parent declares in a constant
+  expression, and restored as a call on the parent.
+- A closure over a method of a parent class, eg `parent::m(...)`, was
+  restored as a closure over the method that overrides it. Such closures are
+  exported with the class that declares the method, like the ones over
+  non-public methods.
+- `exit()` was ignored when called while `deepclone_to_array()` evaluates the
+  constant expressions of a class, eg by the constructor of an attribute
+  argument.
+- With the extension loaded on PHP 8.5 and 8.6,
+  `ReflectionAttribute::newInstance()` threw an `Error`, or didn't return,
+  when the instance holds an array that references itself.
 
 ## [0.8.10] - 2026-11-15
 
