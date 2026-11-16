@@ -126,7 +126,8 @@ calling its constructor. `$vars` uses the keys of `(array) $object`:
 `CALL_HOOKS` and `NO_LAZY_INIT` are mutually exclusive. `PRESERVE_REFS` isn't
 the default because finding references costs more than hydrating most
 objects. `deepclone_from_array()` writes like the default, as `unserialize()`
-does.
+does. Like `unserialize()`, it throws a `TypeError` for an object that doesn't
+fit the type of a property, eg a `Stringable` object in a `string` property.
 
 `deepclone_hydrate()` also forgives what rehydrating often trips on: `null`
 leaves a non-nullable typed property of a user class uninitialized instead of

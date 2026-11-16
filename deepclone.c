@@ -1143,6 +1143,62 @@ static bool dc_set_raw_value_without_lazy_init(zend_object *obj,
 }
 #endif
 
+/* The property that a slot belongs to, for the references bound to it: the
+ * one that the class of the object declares, which can redeclare the one of
+ * the scope that pi comes from. The engine tracks references by that one. */
+static zend_always_inline zend_property_info *dc_slot_property_info(zend_object *obj, zval *slot, zend_property_info *pi)
+{
+	zend_property_info *slot_pi = obj->ce->properties_info_table[slot - obj->properties_table];
+
+	return EXPECTED(slot_pi) ? slot_pi : pi;
+}
+
+/* Check that an object fits the type of a property without converting it */
+static zend_never_inline bool dc_verify_object_property_type(zend_property_info *pi, zval *value)
+{
+	zval tmp;
+	ZVAL_COPY(&tmp, value);
+	bool ok = zend_verify_property_type(pi, &tmp, /* strict */ true);
+	zval_ptr_dtor(&tmp);
+
+	return ok;
+}
+
+/* Store a value in a property table, taking ownership of it. Unlike
+ * zend_hash_update(), the new value is stored before the old one is destroyed:
+ * a destructor can then read or write the table. */
+static zend_always_inline void dc_property_table_update(HashTable *properties, zend_string *name, zval *value)
+{
+	zval *slot = zend_hash_lookup(properties, name);
+
+	if (EXPECTED(Z_TYPE_P(slot) == IS_NULL)) {
+		/* A new property most of the time */
+		ZVAL_COPY_VALUE(slot, value);
+	} else {
+		zval old;
+		ZVAL_COPY_VALUE(&old, slot);
+		ZVAL_COPY_VALUE(slot, value);
+		zval_ptr_dtor(&old);
+	}
+}
+
+/* Write a property of a stdClass object like the engine does, taking
+ * ownership of the value: the property table is separated first when it's
+ * shared, eg with a clone of the object or with the array it was cast from. */
+static zend_always_inline void dc_write_std_property(zend_object *obj, zend_string *name, zval *value)
+{
+	if (UNEXPECTED(!obj->properties)) {
+		rebuild_object_properties_internal(obj);
+	}
+	if (UNEXPECTED(GC_REFCOUNT(obj->properties) > 1)) {
+		if (EXPECTED(!(GC_FLAGS(obj->properties) & IS_ARRAY_IMMUTABLE))) {
+			GC_DELREF(obj->properties);
+		}
+		obj->properties = zend_array_dup(obj->properties);
+	}
+	dc_property_table_update(obj->properties, name, value);
+}
+
 /* Default dispatch matches ReflectionProperty::setRawValue. The non-obvious branch
  * is the hook trampoline path: zend_std_write_property's recursion check sees
  * prop_info on execute_data->func and short-circuits to the backing write,
@@ -1152,27 +1208,16 @@ static bool dc_write_backed_property(zend_object *obj, zend_property_info *pi,
 	zend_string *name, zval *value, zend_long flags)
 {
 	bool call_hooks = (flags & DEEPCLONE_HYDRATE_CALL_HOOKS) != 0;
-
-	/* A hooked property cannot hold a PHP &-reference: write its value. */
-	if (UNEXPECTED(Z_ISREF_P(value)) && DC_PROP_HAS_HOOKS(pi)) {
-		value = Z_REFVAL_P(value);
-	}
+	bool like_unserialize = (flags & DC_WRITE_LIKE_UNSERIALIZE) != 0;
 
 #if PHP_VERSION_ID >= 80400
 	bool no_lazy_init = (flags & DEEPCLONE_HYDRATE_NO_LAZY_INIT) != 0;
 
-	/* Lazy objects: a direct slot write would bypass the engine's realization
-	 * hook and leave the object in a half-initialized state. Route through
-	 * zend_update_property_ex() which triggers realization on first write.
-	 * That writer only takes dereferenced values, so for a reference,
-	 * initialize first and bind it to the slot below, in the real instance
-	 * of a proxy. DEEPCLONE_HYDRATE_NO_LAZY_INIT has its own opt-out fast
-	 * path below. */
-	if (!no_lazy_init && UNEXPECTED(!zend_lazy_object_initialized(obj))) {
-		if (EXPECTED(!Z_ISREF_P(value))) {
-			zend_update_property_ex(pi->ce, obj, name, value);
-			return !EG(exception);
-		}
+	/* Like the engine's writes, initialize a lazy object first, and write to
+	 * the real instance of a proxy: the slots of a proxy are never read.
+	 * DEEPCLONE_HYDRATE_NO_LAZY_INIT has its own path below for the objects
+	 * that aren't initialized yet. */
+	if (UNEXPECTED(zend_object_is_lazy(obj)) && (!no_lazy_init || zend_lazy_object_initialized(obj))) {
 		obj = zend_lazy_object_init(obj);
 		if (UNEXPECTED(!obj)) {
 			return false;
@@ -1180,6 +1225,13 @@ static bool dc_write_backed_property(zend_object *obj, zend_property_info *pi,
 	}
 #endif
 	zval *slot = OBJ_PROP(obj, pi->offset);
+
+	/* A hooked property cannot hold a PHP &-reference, and neither can a
+	 * readonly one outside of unserialize(): write its value. */
+	if (UNEXPECTED(Z_ISREF_P(value))
+	 && (DC_PROP_HAS_HOOKS(pi) || ((pi->flags & ZEND_ACC_READONLY) && !like_unserialize))) {
+		value = Z_REFVAL_P(value);
+	}
 
 	/* Idempotent readonly write — readonly and hooks are XOR, so no trampoline concern. */
 	if ((pi->flags & ZEND_ACC_READONLY)
@@ -1190,65 +1242,98 @@ static bool dc_write_backed_property(zend_object *obj, zend_property_info *pi,
 		return true;
 	}
 
-	/* null → uninitialized for non-nullable typed slots; hooked props excluded
-	 * (no backing slot to "unset", and the set hook may handle null itself).
-	 * Skip the shortcut on lazy objects — a direct slot write would bypass
-	 * the lazy-props bookkeeping. On NO_LAZY_INIT + lazy we fall through to
-	 * the Reflection-based path below, which enforces type semantics.
-	 * Properties of internal classes are excluded too: their methods expect
-	 * them initialized, eg Exception::getTraceAsString() crashes otherwise. */
-	if (Z_TYPE_P(value) == IS_NULL
-		&& !(flags & DC_WRITE_LIKE_UNSERIALIZE)
-		&& ZEND_TYPE_IS_SET(pi->type)
-		&& !ZEND_TYPE_ALLOW_NULL(pi->type)
-		&& !DC_PROP_HAS_HOOKS(pi)
-		&& pi->ce->type == ZEND_USER_CLASS
-#if PHP_VERSION_ID >= 80400
-		&& zend_lazy_object_initialized(obj)
-#endif
-	) {
-		if (Z_TYPE_P(slot) != IS_UNDEF) {
-			zval old;
-			ZVAL_COPY_VALUE(&old, slot);
-			ZVAL_UNDEF(slot);
-			Z_PROP_FLAG_P(slot) |= IS_PROP_UNINIT;
-			zval_ptr_dtor(&old);
-		} else {
-			Z_PROP_FLAG_P(slot) |= IS_PROP_UNINIT;
-		}
-		return true;
-	}
-
 #if PHP_VERSION_ID >= 80100
-	/* Property-type-only decision: hook presence and CALL_HOOKS don't influence it. */
 	zval enum_holder;
 	bool enum_holder_used = false;
-	if ((Z_TYPE_P(value) == IS_LONG || Z_TYPE_P(value) == IS_STRING)
-		&& !(flags & DC_WRITE_LIKE_UNSERIALIZE)
-		&& ZEND_TYPE_HAS_NAME(pi->type)
-		&& !ZEND_TYPE_HAS_LIST(pi->type)
-		/* Only cast for types of the form `Enum` or `?Enum` — unions like
-		 * `Enum|string|int` already accept the scalar literally, so casting
-		 * it to an enum case would be surprising. */
-		&& (ZEND_TYPE_PURE_MASK(pi->type) & ~MAY_BE_NULL) == 0)
-	{
-		zend_class_entry *type_ce = zend_lookup_class_ex(
-			ZEND_TYPE_NAME(pi->type), NULL, ZEND_FETCH_CLASS_NO_AUTOLOAD);
-		if (type_ce && (type_ce->ce_flags & ZEND_ACC_ENUM)
-			&& type_ce->enum_backing_type != IS_UNDEF)
+#endif
+
+	/* The conveniences of deepclone_hydrate(), which apply to the value of a
+	 * reference too */
+	if (!like_unserialize) {
+		zval *deref = value;
+		ZVAL_DEREF(deref);
+
+		/* null → uninitialized for non-nullable typed slots; hooked props excluded
+		 * (no backing slot to "unset", and the set hook may handle null itself).
+		 * Skip the shortcut on lazy objects: a direct slot write would bypass
+		 * the lazy-props bookkeeping. On NO_LAZY_INIT + lazy we fall through to
+		 * the Reflection-based path below, which enforces type semantics.
+		 * Properties of internal classes are excluded too: their methods expect
+		 * them initialized, eg Exception::getTraceAsString() crashes otherwise. */
+		if (Z_TYPE_P(deref) == IS_NULL
+			&& ZEND_TYPE_IS_SET(pi->type)
+			&& !ZEND_TYPE_ALLOW_NULL(pi->type)
+			&& !DC_PROP_HAS_HOOKS(pi)
+			&& pi->ce->type == ZEND_USER_CLASS
+#if PHP_VERSION_ID >= 80400
+			&& zend_lazy_object_initialized(obj)
+#endif
+		) {
+			if (Z_TYPE_P(slot) != IS_UNDEF) {
+				if (UNEXPECTED(pi->flags & ZEND_ACC_READONLY)) {
+					zend_readonly_property_modification_error(pi);
+					return false;
+				}
+				/* Like zend_std_unset_property() */
+				zval old;
+				ZVAL_COPY_VALUE(&old, slot);
+				if (UNEXPECTED(Z_ISREF(old))) {
+					ZEND_REF_DEL_TYPE_SOURCE(Z_REF(old), dc_slot_property_info(obj, slot, pi));
+				}
+				ZVAL_UNDEF(slot);
+				Z_PROP_FLAG_P(slot) |= IS_PROP_UNINIT;
+				if (obj->properties) {
+					HT_FLAGS(obj->properties) |= HASH_FLAG_HAS_EMPTY_IND;
+				}
+				zval_ptr_dtor(&old);
+			} else {
+				Z_PROP_FLAG_P(slot) |= IS_PROP_UNINIT;
+			}
+			return true;
+		}
+
+#if PHP_VERSION_ID >= 80100
+		/* Property-type-only decision: hook presence and CALL_HOOKS don't influence it. */
+		if ((Z_TYPE_P(deref) == IS_LONG || Z_TYPE_P(deref) == IS_STRING)
+			&& ZEND_TYPE_HAS_NAME(pi->type)
+			&& !ZEND_TYPE_HAS_LIST(pi->type)
+			/* Only cast for types of the form `Enum` or `?Enum`: unions like
+			 * `Enum|string|int` already accept the scalar literally, so casting
+			 * it to an enum case would be surprising. */
+			&& (ZEND_TYPE_PURE_MASK(pi->type) & ~MAY_BE_NULL) == 0
+			/* An enum declares no property, so these are never one */
+			&& !zend_string_equals_literal_ci(ZEND_TYPE_NAME(pi->type), "self")
+			&& !zend_string_equals_literal_ci(ZEND_TYPE_NAME(pi->type), "parent"))
 		{
-			/* Enum::from() for parity with polyfill: standard TypeError/ValueError, scalar coercion. */
-			ZVAL_UNDEF(&enum_holder);
-			zend_call_method_with_1_params(NULL, type_ce, NULL, "from",
-				&enum_holder, value);
+			/* The enum is loaded when needed, like the engine does to check
+			 * the type of the value */
+			zend_class_entry *type_ce = zend_lookup_class(ZEND_TYPE_NAME(pi->type));
 			if (UNEXPECTED(EG(exception))) {
 				return false;
 			}
-			value = &enum_holder;
-			enum_holder_used = true;
+			if (type_ce && (type_ce->ce_flags & ZEND_ACC_ENUM)
+				&& type_ce->enum_backing_type != IS_UNDEF)
+			{
+				/* Enum::from() for parity with polyfill: standard TypeError/ValueError, scalar coercion. */
+				ZVAL_UNDEF(&enum_holder);
+				zend_call_method_with_1_params(NULL, type_ce, NULL, "from",
+					&enum_holder, deref);
+				if (UNEXPECTED(EG(exception))) {
+					return false;
+				}
+				if (UNEXPECTED(Z_ISREF_P(value))) {
+					/* Write the case through the reference, which is bound below */
+					if (zend_try_assign_typed_ref_ex(Z_REF_P(value), &enum_holder, false) != SUCCESS) {
+						return false;
+					}
+				} else {
+					value = &enum_holder;
+					enum_holder_used = true;
+				}
+			}
 		}
-	}
 #endif
+	}
 
 #if PHP_VERSION_ID >= 80400
 	/* Skip the Reflection round-trip when there's no lazy-init to skip. */
@@ -1271,7 +1356,15 @@ static bool dc_write_backed_property(zend_object *obj, zend_property_info *pi,
 	}
 #endif
 
-	if (!ZEND_TYPE_IS_SET(pi->type) && !DC_PROP_HAS_HOOKS(pi) && !call_hooks) {
+	bool typed = ZEND_TYPE_IS_SET(pi->type);
+
+	if (!typed && !DC_PROP_HAS_HOOKS(pi) && !call_hooks
+		&& (like_unserialize
+			/* A value is written through the reference that the slot holds,
+			 * and __set() is called for a property that was unset */
+			|| ((Z_ISREF_P(value) || Z_TYPE_P(slot) != IS_REFERENCE)
+				&& (Z_TYPE_P(slot) != IS_UNDEF || !obj->ce->__set))))
+	{
 		/* Move the old value out before running its destructor: a __destruct
 		 * on the old value can legitimately read (or reassign) this same slot.
 		 * Install the new value first so reentrant reads see a valid slot. */
@@ -1280,7 +1373,7 @@ static bool dc_write_backed_property(zend_object *obj, zend_property_info *pi,
 		ZVAL_COPY(slot, value);
 		zval_ptr_dtor(&old);
 	}
-	else if (!DC_PROP_HAS_HOOKS(pi) && !call_hooks && !Z_ISREF_P(value)
+	else if (typed && !DC_PROP_HAS_HOOKS(pi) && !call_hooks && !Z_ISREF_P(value)
 		&& Z_TYPE_P(slot) != IS_REFERENCE
 		&& (Z_TYPE_P(slot) != IS_UNDEF ? !(pi->flags & ZEND_ACC_READONLY) : (Z_PROP_FLAG_P(slot) & IS_PROP_UNINIT))
 		&& obj->handlers->write_property == zend_std_write_property)
@@ -1293,8 +1386,14 @@ static bool dc_write_backed_property(zend_object *obj, zend_property_info *pi,
 		zval tmp;
 		ZVAL_COPY(&tmp, value);
 		/* Not strict, as zend_std_write_property() decides from the frame of
-		 * this internal function */
-		if (UNEXPECTED(!zend_verify_property_type(pi, &tmp, false))) {
+		 * this internal function. Objects are checked strictly when writing
+		 * like unserialize(): converting one to a string would call its
+		 * __toString(), maybe before it's hydrated. */
+		if (UNEXPECTED(!zend_verify_property_type(pi, &tmp, like_unserialize && Z_TYPE(tmp) == IS_OBJECT))) {
+			zval_ptr_dtor(&tmp);
+		} else if (UNEXPECTED(Z_TYPE_P(slot) == IS_REFERENCE)) {
+			/* __toString() bound a reference to the property */
+			zend_update_property_ex(pi->ce, obj, name, &tmp);
 			zval_ptr_dtor(&tmp);
 		} else {
 			zval old;
@@ -1311,9 +1410,10 @@ static bool dc_write_backed_property(zend_object *obj, zend_property_info *pi,
 		 * unserialize(): verify the current referenced value against the
 		 * property type, install the reference itself in the slot, and
 		 * record the property as a type source so later writes through the
-		 * reference keep being type-checked. */
-		bool typed = ZEND_TYPE_IS_SET(pi->type);
-		if (typed && UNEXPECTED(!zend_verify_prop_assignable_by_ref(pi, value, /* strict */ 1))) {
+		 * reference keep being type-checked. Like the values, references are
+		 * checked strictly when writing like unserialize() only. */
+		zend_property_info *slot_pi = dc_slot_property_info(obj, slot, pi);
+		if (typed && UNEXPECTED(!zend_verify_prop_assignable_by_ref(slot_pi, value, like_unserialize))) {
 			return false;
 		}
 		zval old;
@@ -1321,15 +1421,19 @@ static bool dc_write_backed_property(zend_object *obj, zend_property_info *pi,
 		ZVAL_COPY(slot, value);
 		Z_PROP_FLAG_P(slot) &= ~(IS_PROP_UNINIT | IS_PROP_REINITABLE);
 		if (typed) {
-			ZEND_REF_ADD_TYPE_SOURCE(Z_REF_P(value), pi);
+			ZEND_REF_ADD_TYPE_SOURCE(Z_REF_P(value), slot_pi);
 		}
 		if (typed && UNEXPECTED(Z_ISREF(old))) {
 			/* The replaced reference was necessarily bound to this property
 			 * (every path that stores a reference in a typed slot adds the
 			 * type source); unbind it before releasing. */
-			ZEND_REF_DEL_TYPE_SOURCE(Z_REF(old), pi);
+			ZEND_REF_DEL_TYPE_SOURCE(Z_REF(old), slot_pi);
 		}
 		zval_ptr_dtor(&old);
+	}
+	else if (like_unserialize && typed && Z_TYPE_P(value) == IS_OBJECT
+		&& UNEXPECTED(!dc_verify_object_property_type(pi, value))) {
+		/* Checked strictly, as above */
 	}
 #if PHP_VERSION_ID >= 80600
 	else if (!call_hooks) {
@@ -1369,11 +1473,12 @@ static bool dc_can_bind_dynamic_property_ref(zend_object *obj, zend_string *name
 
 /* Bind a PHP &-reference to a dynamic property. zend_std_write_property()
  * only accepts dereferenced values, so write the properties table directly,
- * as unserialize() does. The graph being restored already had the property,
- * so its creation deprecation was reported when the origin was built; only
- * classes that forbid dynamic properties reject it. Callers check
- * dc_can_bind_dynamic_property_ref() first. */
-static bool dc_bind_dynamic_property_ref(zend_object *obj, zend_string *name, zval *ref)
+ * as unserialize() does. Classes that forbid dynamic properties reject it.
+ * `deprecate` reports the creation of the property like the engine does:
+ * deepclone_hydrate() needs it, while a graph being restored already had the
+ * property, so its deprecation was reported when the origin was built.
+ * Callers check dc_can_bind_dynamic_property_ref() first. */
+static bool dc_bind_dynamic_property_ref_ex(zend_object *obj, zend_string *name, zval *ref, bool deprecate)
 {
 #if PHP_VERSION_ID >= 80400
 	/* Like the engine's writes, go through a lazy object to its initialized
@@ -1395,6 +1500,15 @@ static bool dc_bind_dynamic_property_ref(zend_object *obj, zend_string *name, zv
 		return false;
 	}
 
+	if (deprecate && UNEXPECTED(!(obj->ce->ce_flags & ZEND_ACC_ALLOW_DYNAMIC_PROPERTIES))
+	 && !zend_hash_exists(properties, name)) {
+		zend_error(E_DEPRECATED, "Creation of dynamic property %s::$%s is deprecated",
+			ZSTR_VAL(obj->ce->name), ZSTR_VAL(name));
+		/* Like the engine, create the property even when an error handler
+		 * throws. The handler can also replace the table. */
+		properties = zend_std_get_properties(obj);
+	}
+
 	if (UNEXPECTED(GC_REFCOUNT(properties) > 1)) {
 		if (EXPECTED(!(GC_FLAGS(properties) & IS_ARRAY_IMMUTABLE))) {
 			GC_DELREF(properties);
@@ -1402,10 +1516,16 @@ static bool dc_bind_dynamic_property_ref(zend_object *obj, zend_string *name, zv
 		obj->properties = properties = zend_array_dup(properties);
 	}
 
-	Z_ADDREF_P(ref);
-	zend_hash_update(properties, name, ref);
+	zval copy;
+	ZVAL_COPY(&copy, ref);
+	dc_property_table_update(properties, name, &copy);
 
 	return true;
+}
+
+static zend_always_inline bool dc_bind_dynamic_property_ref(zend_object *obj, zend_string *name, zval *ref)
+{
+	return dc_bind_dynamic_property_ref_ex(obj, name, ref, false);
 }
 
 /* ── Core traversal ─────────────────────────────────────────── */
@@ -5997,10 +6117,7 @@ PHP_FUNCTION(deepclone_from_array)
 							goto cleanup;
 						}
 					} else if (scope_is_std && obj->ce == zend_standard_class_def) {
-						if (UNEXPECTED(!obj->properties)) {
-							rebuild_object_properties_internal(obj);
-						}
-						zend_hash_update(obj->properties, prop_name, &final_val);
+						dc_write_std_property(obj, prop_name, &final_val);
 					} else {
 						/* Dynamic property on a non-stdClass object. Routed
 						 * through zend_update_property_ex() so any overridden
@@ -6366,11 +6483,6 @@ PHP_FUNCTION(deepclone_hydrate)
 	zend_object *obj = Z_OBJ(obj_zval);
 	zend_class_entry *obj_ce = obj->ce;
 
-	/* One-time rebuild for stdClass — avoids the check inside the write loop. */
-	if (obj_ce == zend_standard_class_def && UNEXPECTED(!obj->properties)) {
-		rebuild_object_properties_internal(obj);
-	}
-
 	/* $vars keys are interpreted in the same shape `(array) $obj` produces:
 	 *   "propName"              → public, or private declared on obj_ce
 	 *   "\0*\0propName"         → protected (declaring class resolved via obj_ce)
@@ -6466,8 +6578,9 @@ PHP_FUNCTION(deepclone_hydrate)
 			/* Matches unserialize(): NUL-in-middle names are stored as-is on the
 			 * stdClass dynamic properties table; NUL-prefix names are rejected
 			 * by the engine on read. */
-			Z_TRY_ADDREF_P(v);
-			zend_hash_update(obj->properties, real_name, v);
+			zval copy;
+			ZVAL_COPY(&copy, v);
+			dc_write_std_property(obj, real_name, &copy);
 		} else {
 			zend_property_info *pi = NULL;
 			zval *zv = zend_hash_find(&scope_ce->properties_info, real_name);
@@ -6500,7 +6613,7 @@ PHP_FUNCTION(deepclone_hydrate)
 				 * bound to the properties table where the object allows it,
 				 * and written by value otherwise. */
 				if (Z_ISREF_P(v) && dc_can_bind_dynamic_property_ref(obj, real_name)) {
-					dc_bind_dynamic_property_ref(obj, real_name, v);
+					dc_bind_dynamic_property_ref_ex(obj, real_name, v, true);
 				} else {
 					zend_update_property_ex(scope_ce, obj, real_name, Z_ISREF_P(v) ? Z_REFVAL_P(v) : v);
 				}
