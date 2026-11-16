@@ -76,6 +76,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   other classes: `"\0*\0foo"` created a public `foo` property.
 - `$allowed_classes` can hold `&` references, eg after a `foreach` by
   reference on the list, like the `allowed_classes` option of `unserialize()`.
+- Called from `Serializable::unserialize()`, `deepclone_from_array()` could
+  corrupt memory when the payload held an object exported as a serialized
+  string: unserializing it joined the context of the outer `unserialize()`
+  call. Such strings are now unserialized in a context of their own.
+- Called from `Serializable::serialize()`, `deepclone_to_array()` exported
+  `Serializable` objects as back-references to the stream of the outer
+  `serialize()` call, eg `r:2;`, which nothing else can restore. They're
+  serialized in a context of their own too.
 
 ## [0.8.10] - 2026-11-15
 
