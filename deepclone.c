@@ -403,6 +403,7 @@ struct _dc_ctx {
 	uint32_t       refs_count;
 	uint32_t       refs_cap;
 	HashTable      ref_map;        /* zend_reference* => index in refs[] */
+	HashTable     *non_static_arrays; /* nested arrays known to need a walk, or NULL */
 	uint32_t       next_obj_id;
 	uint32_t       objects_count;
 	bool           is_static;
@@ -544,6 +545,7 @@ static void dc_ctx_init(dc_ctx *ctx) {
 	ctx->pending_cap = DC_PENDING_INLINE;
 	zend_hash_init(&ctx->class_map, 4, NULL, NULL, 0);
 	zend_hash_init(&ctx->ref_map, 8, NULL, NULL, 0);
+	ctx->non_static_arrays = NULL;
 	ctx->next_obj_id = 0;
 	ctx->objects_count = 0;
 	ctx->is_static = 1;
@@ -594,7 +596,7 @@ static void dc_ctx_destroy(dc_ctx *ctx) {
 			dc_pool_entry *e = ctx->entries[id];
 			if (!e) continue;
 			if (e->props) {
-				zend_array_destroy(e->props);
+				zend_array_release(e->props);
 			}
 			if (e->prop_mask) {
 				zend_array_destroy(e->prop_mask);
@@ -625,6 +627,9 @@ static void dc_ctx_destroy(dc_ctx *ctx) {
 		efree(ctx->refs);
 	}
 	zend_hash_destroy(&ctx->ref_map);
+	if (ctx->non_static_arrays) {
+		zend_array_destroy(ctx->non_static_arrays);
+	}
 	zend_hash_destroy(&ctx->scope_cache);
 	zend_hash_destroy(&ctx->class_info);
 	zend_hash_destroy(&ctx->proto_cache);
@@ -874,11 +879,18 @@ static HashTable *dc_get_proto(dc_ctx *ctx, zend_class_entry *ce) {
 }
 
 /* Check if an array contains only scalars/enums (no objects, no refs, no
- * resources). If so, the walker can COW-share it without recursing. */
-static bool dc_array_is_static(HashTable *ht)
+ * resources). If so, the walker can COW-share it without recursing.
+ * The nested arrays found not to be static are remembered: the walk reaches
+ * them next, and would otherwise scan each one again, level after level.
+ * Returns false when the stack limit is reached, with an exception set. */
+static bool dc_array_is_static(dc_ctx *ctx, HashTable *ht)
 {
 	if (UNEXPECTED(GC_FLAGS(ht) & GC_IMMUTABLE)) {
 		return true;
+	}
+	if (UNEXPECTED(ctx->non_static_arrays)
+	 && zend_hash_index_exists(ctx->non_static_arrays, (zend_ulong) (uintptr_t) ht)) {
+		return false;
 	}
 	if (UNEXPECTED(dc_check_stack_limit())) {
 		return false;
@@ -893,7 +905,11 @@ static bool dc_array_is_static(HashTable *ht)
 		}
 		if (Z_TYPE_P(val) == IS_ARRAY) {
 			if (zend_hash_num_elements(Z_ARRVAL_P(val)) > 0
-			 && !dc_array_is_static(Z_ARRVAL_P(val))) {
+			 && !dc_array_is_static(ctx, Z_ARRVAL_P(val))) {
+				if (!ctx->non_static_arrays) {
+					ctx->non_static_arrays = zend_new_array(0);
+				}
+				zend_hash_index_add_empty_element(ctx->non_static_arrays, (zend_ulong) (uintptr_t) Z_ARRVAL_P(val));
 				return false;
 			}
 		} else if (Z_TYPE_P(val) == IS_OBJECT) {
@@ -2801,10 +2817,14 @@ static void dc_copy_value(dc_ctx *ctx, zval *src, zval *dst, zval *mask_dst)
 		uint32_t n = zend_hash_num_elements(src_ht);
 		if (n == 0
 		 || (GC_FLAGS(src_ht) & GC_IMMUTABLE)
-		 || dc_array_is_static(src_ht)) {
+		 || dc_array_is_static(ctx, src_ht)) {
 			/* Static array — just COW-share */
 			ZVAL_COPY(dst, src);
 			goto handle_value;
+		}
+		/* The check stops at the stack limit */
+		if (UNEXPECTED(EG(exception))) {
+			return;
 		}
 		/* Recurse — dc_copy_array writes mask_dst directly (lazy init) */
 		dc_copy_array(ctx, src_ht, dst, mask_dst);
@@ -3707,16 +3727,28 @@ prepare_props:
 
 	if (has_unserialize) {
 		/* For __unserialize objects: prepare a flat array as the state argument */
-		zval prepared_zval, prop_mask;
-		ZVAL_UNDEF(&prepared_zval);
-		ZVAL_UNDEF(&prop_mask);
-		dc_copy_array(ctx, Z_ARRVAL(props_zval), &prepared_zval, &prop_mask);
-		zval_ptr_dtor(&props_zval);
-		ZVAL_COPY_VALUE(&props_zval, &prepared_zval);
-		dc_mask_cleanup(&prop_mask);
+		HashTable *state = Z_ARRVAL(props_zval);
+		if (!(GC_FLAGS(state) & GC_IMMUTABLE) && zend_hash_num_elements(state) > 0 && dc_array_is_static(ctx, state)) {
+			/* Nothing to prepare: share the state, like any static array */
+			entry->props = state;
+			entry->prop_mask = NULL;
+		} else {
+			/* The check stops at the stack limit */
+			if (UNEXPECTED(EG(exception))) {
+				zval_ptr_dtor(&props_zval);
+				return;
+			}
+			zval prepared_zval, prop_mask;
+			ZVAL_UNDEF(&prepared_zval);
+			ZVAL_UNDEF(&prop_mask);
+			dc_copy_array(ctx, state, &prepared_zval, &prop_mask);
+			zval_ptr_dtor(&props_zval);
+			ZVAL_COPY_VALUE(&props_zval, &prepared_zval);
+			dc_mask_cleanup(&prop_mask);
 
-		entry->props = Z_ARRVAL(props_zval);
-		entry->prop_mask = (Z_TYPE(prop_mask) == IS_ARRAY) ? Z_ARRVAL(prop_mask) : NULL;
+			entry->props = Z_ARRVAL(props_zval);
+			entry->prop_mask = (Z_TYPE(prop_mask) == IS_ARRAY) ? Z_ARRVAL(prop_mask) : NULL;
+		}
 	} else {
 		/* For normal objects: transpose directly into ctx->properties[scope][name][id]
 		 * during the walk, and log the markers for ctx->resolve[scope][name][id].
@@ -3758,7 +3790,7 @@ prepare_props:
 				 * arrays treat UNDEF as a tombstone in zend_hash_index_find). */
 				zval copy;
 				if (EXPECTED(Z_TYPE_P(raw_val) <= IS_STRING)
-				 || (Z_TYPE_P(raw_val) == IS_ARRAY && (zend_hash_num_elements(Z_ARRVAL_P(raw_val)) == 0 || dc_array_is_static(Z_ARRVAL_P(raw_val))))
+				 || (Z_TYPE_P(raw_val) == IS_ARRAY && (zend_hash_num_elements(Z_ARRVAL_P(raw_val)) == 0 || dc_array_is_static(ctx, Z_ARRVAL_P(raw_val))))
 				 || (Z_TYPE_P(raw_val) == IS_OBJECT && (Z_OBJCE_P(raw_val)->ce_flags & ZEND_ACC_ENUM))) {
 					ZVAL_COPY(&copy, raw_val);
 				} else {
@@ -3780,6 +3812,13 @@ prepare_props:
 				zend_hash_index_add_new(Z_ARRVAL_P(out_name), entry_id, &copy);
 			} ZEND_HASH_FOREACH_END();
 		} ZEND_HASH_FOREACH_END();
+
+		/* The static check above stops at the stack limit */
+		if (UNEXPECTED(EG(exception))) {
+			ctx->pending_count = pending_base;
+			zval_ptr_dtor(&props_zval);
+			return;
+		}
 
 		/* The walk pushes the values of nested objects past pending_end, and
 		 * pops them before returning, but can move ctx->pending */
