@@ -2,6 +2,7 @@
 deepclone round-trips BcMath\Number, refuses to hydrate it, and rejects a payload that would create an uninitialized one (symfony/symfony#64323)
 --EXTENSIONS--
 deepclone
+bcmath
 --SKIPIF--
 <?php if (!class_exists('BcMath\Number')) die('skip requires BcMath\Number (PHP 8.4+ with ext/bcmath)'); ?>
 --FILE--
