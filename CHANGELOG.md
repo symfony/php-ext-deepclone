@@ -17,6 +17,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `deepclone_to_array()` stops at the exception that an error handler throws
   while it reads the state of an object. It went on before, and could replace
   the exception with a `NotInstantiableException`.
+- `deepclone_to_array()` ran the destructor of the instances it creates to
+  read the default values of a class. This happened for objects that have
+  dynamic properties or that were cast to array, eg by `foreach`, and made
+  the call fail when the destructor needed what the constructor sets.
+- `deepclone_to_array()` merged the `&` references that `__serialize()` or
+  `__sleep()` create and release while the graph is walked, as their addresses
+  got reused: references are kept alive until the payload is built, like
+  objects.
+- The cycles of objects that `__serialize()` creates were never collected
+  when the cycle collector ran during `deepclone_to_array()`.
+- For classes cached by OPcache, `deepclone_to_array()` exported the
+  properties that hold a default value declared with a global constant or an
+  enum case, unlike without OPcache.
+- `deepclone_to_array()` finds the private properties of anonymous classes
+  when `__sleep()` returns them by their mangled name.
 
 ## [0.8.10] - 2026-11-15
 
