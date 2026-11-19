@@ -106,7 +106,7 @@ bool(true)
 bool(true)
 bool(true)
 
-%s: serialize(): "" is returned from __sleep() multiple times in %s on line %d
+%s: serialize(): "%S" is returned from __sleep() multiple times in %s on line %d
 bool(true)
 bool(true)
 bool(true)

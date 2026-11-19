@@ -5,6 +5,15 @@ All notable changes to this extension will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- On PHP 8.6, `deepclone_to_array()` prints the full names in the warnings
+  it shares with `serialize()`, like `serialize()` does since PHP 8.6.0. The
+  names returned by `__sleep()` and the names of anonymous classes aren't cut
+  at their first NUL byte anymore.
+
 ## [0.8.11] - 2026-11-16
 
 ### Changed
