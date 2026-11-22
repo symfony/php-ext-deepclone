@@ -5,6 +5,16 @@ All notable changes to this extension will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.13] - 2026-11-22
+
+### Fixed
+
+- `deepclone_hydrate()` failed on Symfony's `LazyGhostTrait` objects since
+  0.8.11, with "Cannot access protected property". It calls `__set()` for the
+  untyped properties that were unset, and `__set()` didn't see the class that
+  declares the property in `debug_backtrace()`. It sees it now, like when a
+  closure bound to that class writes the property.
+
 ## [0.8.12] - 2026-11-19
 
 ### Changed

@@ -10,11 +10,11 @@
   <email>p@tchwork.com</email>
   <active>yes</active>
  </lead>
- <date>2026-11-19</date>
- <time>23:35:52</time>
+ <date>2026-11-22</date>
+ <time>20:06:08</time>
  <version>
-  <release>0.8.12</release>
-  <api>0.8.12</api>
+  <release>0.8.13</release>
+  <api>0.8.13</api>
  </version>
  <stability>
   <release>beta</release>
@@ -22,7 +22,7 @@
  </stability>
  <license uri="https://opensource.org/licenses/MIT">MIT</license>
  <notes>
-Changed: on PHP 8.6, the warnings shared with serialize() print names in full, like serialize() does. See CHANGELOG.md for details.
+Fixed: deepclone_hydrate() on Symfony lazy ghosts, broken since 0.8.11. See CHANGELOG.md for details.
  </notes>
  <contents>
   <dir name="/">
@@ -51,11 +51,11 @@ Changed: on PHP 8.6, the warnings shared with serialize() print names in full, l
  <extsrcrelease />
  <changelog>
   <release>
-   <date>2026-11-19</date>
-   <time>23:35:52</time>
+   <date>2026-11-22</date>
+   <time>20:06:08</time>
    <version>
-    <release>0.8.12</release>
-    <api>0.8.12</api>
+    <release>0.8.13</release>
+    <api>0.8.13</api>
    </version>
    <stability>
     <release>beta</release>
