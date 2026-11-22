@@ -1313,6 +1313,57 @@ static zend_always_inline void dc_write_std_property(zend_object *obj, zend_stri
 	dc_property_table_update(obj->properties, name, value);
 }
 
+/* An internal function frame scoped to the property's declaring class. Calling
+ * __set() from C via zend_update_property_ex() leaves no PHP frame between the
+ * __set() method and deepclone_hydrate(), so a __set() implementation that
+ * recovers its write scope from debug_backtrace() sees no class at all. Route
+ * that one write through a real internal function frame whose common.scope is
+ * the declaring class; debug_backtrace() then reports the expected scope while
+ * __set() is still invoked with the same arguments. */
+static zend_internal_function dc_scoped_write_fn;
+
+/* zend_call_function() reads common.arg_info for each positional argument
+ * through ARG_SHOULD_BE_SENT_BY_REF()/zend_check_arg_send_type(). Since PHP 8.6,
+ * get_function_arg_name() also reads these entries as zend_arg_info with
+ * zend_string names, so MINIT converts this array instead of casting it. */
+static zend_internal_arg_info dc_scoped_write_arg_info[] = {
+	ZEND_ARG_INFO(0, object)
+	ZEND_ARG_INFO(0, name)
+	ZEND_ARG_INFO(0, value)
+};
+#if PHP_VERSION_ID >= 80600
+static zend_arg_info dc_scoped_write_arg_info_86[3];
+#endif
+
+static void ZEND_FASTCALL dc_scoped_write_handler(INTERNAL_FUNCTION_PARAMETERS)
+{
+	zval *object, *value;
+	zend_string *name;
+
+	ZEND_PARSE_PARAMETERS_START(3, 3)
+		Z_PARAM_OBJECT(object)
+		Z_PARAM_STR(name)
+		Z_PARAM_ZVAL(value)
+	ZEND_PARSE_PARAMETERS_END();
+
+	zend_update_property_ex(EX(func)->common.scope, Z_OBJ_P(object), name, value);
+}
+
+static void dc_write_with_magic_scope(zend_object *obj, zend_class_entry *scope,
+	zend_string *name, zval *value)
+{
+	zend_internal_function fn = dc_scoped_write_fn;
+	zval params[3];
+
+	fn.scope = scope;
+
+	ZVAL_OBJ(&params[0], obj);
+	ZVAL_STR(&params[1], name);
+	ZVAL_COPY_VALUE(&params[2], value);
+
+	zend_call_known_function((zend_function *) &fn, NULL, scope, NULL, 3, params, NULL);
+}
+
 /* Default dispatch matches ReflectionProperty::setRawValue. The non-obvious branch
  * is the hook trampoline path: zend_std_write_property's recursion check sees
  * prop_info on execute_data->func and short-circuits to the backing write,
@@ -1548,6 +1599,16 @@ static bool dc_write_backed_property(zend_object *obj, zend_property_info *pi,
 	else if (like_unserialize && typed && Z_TYPE_P(value) == IS_OBJECT
 		&& UNEXPECTED(!dc_verify_object_property_type(pi, value))) {
 		/* Checked strictly, as above */
+	}
+	else if (!typed && !DC_PROP_HAS_HOOKS(pi)
+		&& Z_TYPE_P(slot) == IS_UNDEF && obj->ce->__set) {
+		/* For an untyped property whose slot was unset, this write dispatches
+		 * to __set(). Give it a PHP frame scoped to the class that declares
+		 * the property: implementations that infer their write scope from
+		 * debug_backtrace() (eg Symfony's LazyGhostTrait) otherwise fall back
+		 * to a scope that cannot access protected/private properties. PHP 8.6
+		 * otherwise handles this case through its setRawValue() branch below. */
+		dc_write_with_magic_scope(obj, pi->ce, name, value);
 	}
 #if PHP_VERSION_ID >= 80600
 	else if (!call_hooks) {
@@ -7128,6 +7189,25 @@ PHP_MINIT_FUNCTION(deepclone)
 	dc_key_states      = zend_string_init_interned(ZEND_STRL("states"), 1);
 	dc_key_refs        = zend_string_init_interned(ZEND_STRL("refs"), 1);
 	dc_key_ref_masks   = zend_string_init_interned(ZEND_STRL("refMasks"), 1);
+
+	/* Template for the scoped __set() call frame; dc_write_with_magic_scope()
+	 * copies it and substitutes the declaring class as common.scope. */
+	dc_scoped_write_fn.type = ZEND_INTERNAL_FUNCTION;
+	dc_scoped_write_fn.function_name = zend_string_init_interned(
+		ZEND_STRL("deepcloneScopedWrite"), 1);
+	dc_scoped_write_fn.fn_flags = ZEND_ACC_PUBLIC | ZEND_ACC_STATIC;
+	dc_scoped_write_fn.num_args = 3;
+	dc_scoped_write_fn.required_num_args = 3;
+#if PHP_VERSION_ID >= 80600
+	for (uint32_t i = 0; i < 3; i++) {
+		zend_convert_internal_arg_info(&dc_scoped_write_arg_info_86[i],
+			&dc_scoped_write_arg_info[i], false, 1);
+	}
+	dc_scoped_write_fn.arg_info = dc_scoped_write_arg_info_86;
+#else
+	dc_scoped_write_fn.arg_info = dc_scoped_write_arg_info;
+#endif
+	dc_scoped_write_fn.handler = dc_scoped_write_handler;
 
 	dc_str_trace                    = zend_string_init_interned(ZEND_STRL("trace"), 1);
 	dc_str_error_trace_mangled      = zend_string_init_interned("\0Error\0trace", sizeof("\0Error\0trace") - 1, 1);
