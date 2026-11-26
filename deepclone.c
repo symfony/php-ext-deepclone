@@ -7126,7 +7126,11 @@ PHP_FUNCTION(deepclone_hydrate)
 			dc_write_std_property(obj, real_name, &copy);
 		} else {
 			zend_property_info *pi = NULL;
-			zval *zv = zend_hash_find(&scope_ce->properties_info, real_name);
+			/* Names taken from either hash table already have a hash.
+			 * Only integer keys converted to strings may need hashing. */
+			zval *zv = prop_key_owned
+				? zend_hash_find(&scope_ce->properties_info, real_name)
+				: zend_hash_find_known_hash(&scope_ce->properties_info, real_name);
 			if (zv) pi = Z_PTR_P(zv);
 
 			if (dc_is_backed_declared_property(pi)) {
