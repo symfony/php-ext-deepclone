@@ -7172,6 +7172,128 @@ PHP_FUNCTION(deepclone_hydrate)
 	ZVAL_COPY_VALUE(return_value, &obj_zval);
 }
 
+typedef struct {
+	zend_string *name;
+	uint32_t offset;
+} dc_dirty_property;
+
+/* Confirm only equal values that can be compared without traversing an array
+ * graph. A different array storage can still be strictly equal; leave it to
+ * the caller, which also owns the policy for recursive arrays and references. */
+static zend_always_inline bool dc_dirty_values_match(zval *before, zval *after)
+{
+	if (!before || Z_ISUNDEF_P(after) || Z_ISREF_P(before) || Z_ISREF_P(after)) {
+		return false;
+	}
+	if (Z_TYPE_P(before) == IS_ARRAY && Z_TYPE_P(after) == IS_ARRAY) {
+		return Z_ARRVAL_P(before) == Z_ARRVAL_P(after);
+	}
+	return fast_is_identical_function(before, after);
+}
+
+PHP_FUNCTION(deepclone_dirty_candidates)
+{
+	zend_string *class_name;
+	HashTable *properties, *objects, *snapshots;
+	ZEND_PARSE_PARAMETERS_START(4, 4)
+		Z_PARAM_STR(class_name)
+		Z_PARAM_ARRAY_HT(properties)
+		Z_PARAM_ARRAY_HT(objects)
+		Z_PARAM_ARRAY_HT(snapshots)
+	ZEND_PARSE_PARAMETERS_END();
+
+	if (UNEXPECTED(!zend_array_is_list(properties))) {
+		zend_argument_value_error(2, "must be a list of property names");
+		RETURN_THROWS();
+	}
+
+	zend_class_entry *ce = zend_lookup_class(class_name);
+	if (UNEXPECTED(!ce)) {
+		if (!EG(exception)) {
+			zend_throw_exception_ex(dc_ce_class_not_found_exception, 0,
+				"Class \"%s\" not found.", ZSTR_VAL(class_name));
+		}
+		RETURN_THROWS();
+	}
+	if (UNEXPECTED(ce->type != ZEND_USER_CLASS || ce->create_object || (ce->ce_flags & ZEND_ACC_UNINSTANTIABLE))) {
+		zend_argument_value_error(1, "must name an instantiable userland class with standard object storage");
+		RETURN_THROWS();
+	}
+
+	uint32_t count = zend_hash_num_elements(properties);
+	dc_dirty_property *plan = count ? safe_emalloc(count, sizeof(dc_dirty_property), 0) : NULL;
+	HashTable seen;
+	zend_hash_init(&seen, count, NULL, NULL, 0);
+	uint32_t planned = 0;
+	zval *property;
+	ZEND_HASH_FOREACH_VAL(properties, property) {
+		ZVAL_DEREF(property);
+		if (UNEXPECTED(Z_TYPE_P(property) != IS_STRING)) {
+			zend_argument_value_error(2, "must contain only property names");
+			goto invalid_plan;
+		}
+		zend_string *name = Z_STR_P(property);
+		zend_property_info *info = zend_hash_find_ptr(&ce->properties_info, name);
+		if (UNEXPECTED(memchr(ZSTR_VAL(name), '\0', ZSTR_LEN(name))
+			|| !dc_is_backed_declared_property(info) || DC_PROP_HAS_HOOKS(info)
+			|| ((info->flags & ZEND_ACC_PRIVATE) && info->ce != ce))) {
+			zend_argument_value_error(2, "must target declared instance properties by their unmangled names, without hooks");
+			goto invalid_plan;
+		}
+		if (UNEXPECTED(!zend_hash_index_add_empty_element(&seen, info->offset))) {
+			zend_argument_value_error(2, "contains a duplicate property target");
+			goto invalid_plan;
+		}
+		plan[planned++] = (dc_dirty_property) {name, info->offset};
+	} ZEND_HASH_FOREACH_END();
+	zend_hash_destroy(&seen);
+
+	zval result;
+	array_init(&result);
+	zval *value;
+	ZEND_HASH_FOREACH_VAL(objects, value) {
+		ZVAL_DEREF(value);
+		if (UNEXPECTED(Z_TYPE_P(value) != IS_OBJECT)) {
+			zend_argument_type_error(3, "must contain only objects");
+			zval_ptr_dtor(&result);
+			if (plan) efree(plan);
+			RETURN_THROWS();
+		}
+		zend_object *obj = Z_OBJ_P(value);
+		if (obj->ce != ce) {
+			goto candidate;
+		}
+#if PHP_VERSION_ID >= 80400
+		if (zend_object_is_lazy(obj)) {
+			goto candidate;
+		}
+#endif
+		zval *snapshot = zend_hash_index_find(snapshots, obj->handle);
+		if (!snapshot || Z_TYPE_P(snapshot) != IS_ARRAY) {
+			goto candidate;
+		}
+		for (uint32_t i = 0; i < count; ++i) {
+			zval *before = zend_hash_find(Z_ARRVAL_P(snapshot), plan[i].name);
+			zval *after = OBJ_PROP(obj, plan[i].offset);
+			if (!dc_dirty_values_match(before, after)) {
+				goto candidate;
+			}
+		}
+		continue;
+
+candidate:
+		Z_ADDREF_P(value);
+		add_next_index_zval(&result, value);
+	} ZEND_HASH_FOREACH_END();
+	if (plan) efree(plan);
+	RETURN_COPY_VALUE(&result);
+
+invalid_plan:
+	zend_hash_destroy(&seen);
+	if (plan) efree(plan);
+	RETURN_THROWS();
+}
+
 /* ── Module boilerplate ─────────────────────────────────────── */
 
 /* Function arginfo and ext_functions[] are generated from deepclone.stub.php

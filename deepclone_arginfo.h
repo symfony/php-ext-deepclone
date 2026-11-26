@@ -1,5 +1,5 @@
-/* This is a generated file, edit deepclone.stub.php instead.
- * Stub hash: ec11b6f3b9b69f77cbddece18176eab2ffd1007a */
+/* This is a generated file, edit the .stub.php file instead.
+ * Stub hash: d0f75be0544dbeef0a088be75d4a656041642ef9 */
 
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_deepclone_to_array, 0, 1, IS_ARRAY, 0)
 	ZEND_ARG_TYPE_INFO(0, value, IS_MIXED, 0)
@@ -19,6 +19,13 @@ ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_deepclone_hydrate, 0, 1, IS_OBJE
 	ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, flags, IS_LONG, 0, "0")
 ZEND_END_ARG_INFO()
 
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_deepclone_dirty_candidates, 0, 4, IS_ARRAY, 0)
+	ZEND_ARG_TYPE_INFO(0, class, IS_STRING, 0)
+	ZEND_ARG_TYPE_INFO(0, properties, IS_ARRAY, 0)
+	ZEND_ARG_TYPE_INFO(0, objects, IS_ARRAY, 0)
+	ZEND_ARG_TYPE_INFO(0, snapshots, IS_ARRAY, 0)
+ZEND_END_ARG_INFO()
+
 ZEND_BEGIN_ARG_INFO_EX(arginfo_class_DeepClone_HydrationContext___construct, 0, 0, 0)
 ZEND_END_ARG_INFO()
 
@@ -29,6 +36,7 @@ ZEND_END_ARG_INFO()
 ZEND_FUNCTION(deepclone_to_array);
 ZEND_FUNCTION(deepclone_from_array);
 ZEND_FUNCTION(deepclone_hydrate);
+ZEND_FUNCTION(deepclone_dirty_candidates);
 ZEND_METHOD(DeepClone_HydrationContext, __construct);
 ZEND_METHOD(DeepClone_HydrationContext, hydrate);
 
@@ -36,6 +44,7 @@ static const zend_function_entry ext_functions[] = {
 	ZEND_FE(deepclone_to_array, arginfo_deepclone_to_array)
 	ZEND_FE(deepclone_from_array, arginfo_deepclone_from_array)
 	ZEND_FE(deepclone_hydrate, arginfo_deepclone_hydrate)
+	ZEND_FE(deepclone_dirty_candidates, arginfo_deepclone_dirty_candidates)
 	ZEND_FE_END
 };
 

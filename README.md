@@ -62,6 +62,7 @@ deepclone_hydrate($user, ['name' => 'Bob']);
 function deepclone_to_array(mixed $value, ?array $allowed_classes = null, bool $allow_named_closures = false): array;
 function deepclone_from_array(array $data, ?array $allowed_classes = null, bool $allow_named_closures = false): mixed;
 function deepclone_hydrate(object|string $object_or_class, array $vars = [], int $flags = 0): object;
+function deepclone_dirty_candidates(string $class, array $properties, array $objects, array $snapshots): array;
 ```
 
 `$allowed_classes` works like the `allowed_classes` option of `unserialize()`,
@@ -74,6 +75,35 @@ such a payload can create a closure over any function or method of that name,
 Closures declared in constant expressions don't need it, eg
 `#[When(self::isStrict(...))]`: they're encoded as a reference to their
 declaration site, which resolves only to what the class itself declares.
+
+## Finding dirty-check candidates
+
+`deepclone_dirty_candidates()` compares properties of objects against snapshots
+indexed by `spl_object_id()`. It returns a list in input order containing every
+object whose selected properties could not be confirmed unchanged.
+
+```php
+$candidates = deepclone_dirty_candidates(
+    Product::class,
+    ['id', 'price', 'payload'],
+    $products,
+    $snapshotsByObjectId,
+);
+```
+
+The property list uses unmangled names that also identify snapshot keys.
+Properties must have declared backing storage and no hooks. The plan is
+validated before scanning. Each eligible object must have exactly the requested
+class. Missing snapshots and keys, uninitialized properties, PHP references
+and lazy objects remain candidates. An explicit null can compare equal to an
+explicit null. Objects compare by identity. Arrays with shared storage can be
+confirmed unchanged. Separately stored arrays remain candidates, including
+equal arrays and recursive arrays.
+
+Callers own snapshot lifetimes and must discard snapshots for objects they
+stop tracking. ORMs can process candidates with their existing change tracker
+after verifying that skipping property reads preserves their mapping and
+lifecycle semantics.
 
 ## Lazy hydration
 
