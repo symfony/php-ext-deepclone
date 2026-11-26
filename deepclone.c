@@ -1554,7 +1554,8 @@ static bool dc_write_backed_property(zend_object *obj, zend_property_info *pi,
 		 * this internal function. Objects are checked strictly when writing
 		 * like unserialize(): converting one to a string would call its
 		 * __toString(), maybe before it's hydrated. */
-		if (UNEXPECTED(!zend_verify_property_type(pi, &tmp, like_unserialize && Z_TYPE(tmp) == IS_OBJECT))) {
+		if (!ZEND_TYPE_CONTAINS_CODE(pi->type, Z_TYPE(tmp))
+			&& UNEXPECTED(!zend_verify_property_type(pi, &tmp, like_unserialize && Z_TYPE(tmp) == IS_OBJECT))) {
 			zval_ptr_dtor(&tmp);
 		} else if (UNEXPECTED(Z_TYPE_P(slot) == IS_REFERENCE)) {
 			/* __toString() bound a reference to the property */
@@ -7046,6 +7047,7 @@ PHP_FUNCTION(deepclone_hydrate)
 		zend_class_entry *scope_ce = obj_ce;
 		zend_string *real_name = prop_key;
 		bool is_mangled = false;
+		zval *declared = NULL;
 
 		if (key_len > 0 && key[0] == '\0') {
 			is_mangled = true;
@@ -7099,7 +7101,7 @@ PHP_FUNCTION(deepclone_hydrate)
 			/* A mangled key targets a declared property, never a dynamic one,
 			 * so a stdClass object has none. The name is taken from the
 			 * properties of the scope, which spares creating a string. */
-			zval *declared = zend_hash_str_find(&scope_ce->properties_info, name, name_len);
+			declared = zend_hash_str_find(&scope_ce->properties_info, name, name_len);
 			if (UNEXPECTED(!declared)) {
 				zend_value_error("deepclone_hydrate(): Argument #2 ($vars) key scope \"%s\" does not declare a \"%.*s\" property",
 					ZSTR_VAL(scope_ce->name), (int) name_len, name);
@@ -7126,7 +7128,7 @@ PHP_FUNCTION(deepclone_hydrate)
 			dc_write_std_property(obj, real_name, &copy);
 		} else {
 			zend_property_info *pi = NULL;
-			zval *zv = zend_hash_find(&scope_ce->properties_info, real_name);
+			zval *zv = is_mangled ? declared : zend_hash_find(&scope_ce->properties_info, real_name);
 			if (zv) pi = Z_PTR_P(zv);
 
 			if (dc_is_backed_declared_property(pi)) {
