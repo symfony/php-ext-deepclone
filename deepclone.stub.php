@@ -52,4 +52,6 @@ namespace {
     function deepclone_from_array(array $data, ?array $allowed_classes = null, bool $allow_named_closures = false): mixed {}
 
     function deepclone_hydrate(object|string $object_or_class, array $vars = [], int $flags = 0): object {}
+
+    function deepclone_dirty_candidates(string $class, array $properties, array $objects, array $snapshots): array {}
 }
