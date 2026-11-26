@@ -7051,30 +7051,29 @@ PHP_FUNCTION(deepclone_hydrate)
 			is_mangled = true;
 			const char *sep = NULL;
 
-			/* "\0ClassName\0propName": the scope must be obj_ce or a parent,
-			 * no autoloader is triggered. The name of an anonymous class
-			 * contains a NUL, so look for these names before cutting the key
-			 * at its second NUL. */
-			for (zend_class_entry *p = obj_ce; p; p = p->parent) {
-				size_t class_len = ZSTR_LEN(p->name);
-				if (key_len > class_len + 1 && key[class_len + 1] == '\0'
-				 && !memcmp(key + 1, ZSTR_VAL(p->name), class_len)) {
-					scope_ce = p;
-					sep = key + class_len + 1;
-					break;
+			if (key_len >= 3 && key[1] == '*' && key[2] == '\0') {
+				sep = key + 2;
+			} else {
+				/* A private scope must be obj_ce or a parent. Anonymous class
+				 * names contain a NUL, so match them before looking for the
+				 * second NUL in the key. */
+				for (zend_class_entry *p = obj_ce; p; p = p->parent) {
+					size_t class_len = ZSTR_LEN(p->name);
+					if (key_len > class_len + 1 && key[class_len + 1] == '\0'
+					 && !memcmp(key + 1, ZSTR_VAL(p->name), class_len)) {
+						scope_ce = p;
+						sep = key + class_len + 1;
+						break;
+					}
 				}
-			}
-			if (!sep) {
-				sep = memchr(key + 1, '\0', key_len - 1);
-				if (UNEXPECTED(!sep || sep == key + 1)) {
-					zend_value_error("deepclone_hydrate(): Argument #2 ($vars) contains an invalid mangled key");
-					if (prop_key_owned) zend_string_release(prop_key);
-					zval_ptr_dtor(&obj_zval);
-					RETURN_THROWS();
-				}
-				/* "\0*\0propName" keeps scope_ce = obj_ce: protected properties
-				 * are inherited under their bare name */
-				if (sep != key + 2 || key[1] != '*') {
+				if (!sep) {
+					sep = memchr(key + 1, '\0', key_len - 1);
+					if (UNEXPECTED(!sep || sep == key + 1)) {
+						zend_value_error("deepclone_hydrate(): Argument #2 ($vars) contains an invalid mangled key");
+						if (prop_key_owned) zend_string_release(prop_key);
+						zval_ptr_dtor(&obj_zval);
+						RETURN_THROWS();
+					}
 					scope_ce = NULL;
 				}
 			}
